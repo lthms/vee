@@ -11,7 +11,7 @@ Vee is a modal code assistant. It implements a vi-inspired modal system where th
 
 - **`cmd/vee/system_prompt.md`** — Defines Vee's identity, conversational rules, modal behavior, and the default "normal" mode (read-only, indicator `🦊`).
 - **`plugins/vee/commands/`** — Slash commands that switch modes:
-  - `do.md` — "do" mode (`⚡`): allows side-effects, used for performing tasks.
+  - `vibe.md` — "vibe" mode (`⚡`): allows side-effects, used for performing tasks.
   - `normal.md` — switches back to normal mode.
   - `contradictor.md` — "contradictor" mode (`😈`): devil's advocate posture.
 

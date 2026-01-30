@@ -2,7 +2,7 @@
 description: Trust Vee to perform a task on your behalf
 ---
 
-<mode name="do">
+<mode name="vibe">
 <indicator value="⚡" />
 
 <authorizations>
@@ -34,4 +34,4 @@ description: Trust Vee to perform a task on your behalf
 </on-abort>
 </mode>
 
-Switch to mode: do
+Switch to mode: vibe

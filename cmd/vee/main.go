@@ -27,6 +27,9 @@ type Mode struct {
 	NoPrompt    bool     // skip --append-system-prompt entirely (vanilla claude)
 }
 
+// veeLogFile is the fixed log path for the Vee daemon.
+const veeLogFile = "/tmp/vee.log"
+
 // modeRegistry holds all known modes, keyed by name.
 var modeRegistry map[string]Mode
 
@@ -109,7 +112,6 @@ type CLI struct {
 type StartCmd struct {
 	VeePath      string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 	Zettelkasten bool   `short:"z" help:"Enable the vee-zettelkasten plugin." name:"zettelkasten"`
-	Port         int    `short:"p" help:"Port for the daemon dashboard." default:"2700" name:"port"`
 }
 
 // Run starts the Vee tmux session with an in-process HTTP/MCP server.
@@ -127,12 +129,11 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 
 	// Redirect slog to a file so it can be viewed in the logs window
-	logFile := fmt.Sprintf("/tmp/vee-%d.log", cmd.Port)
-	setupFileLogger(logFile)
+	setupFileLogger(veeLogFile)
 
 	app := newApp()
 
-	srv, err := startHTTPServerInBackground(app, cmd.Port, cmd.Zettelkasten)
+	srv, port, err := startHTTPServerInBackground(app, cmd.Zettelkasten)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
@@ -147,14 +148,14 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	// Store config so _new-pane can fetch it via /api/config
 	app.SetConfig(&AppConfig{
 		VeePath:       cmd.VeePath,
-		Port:          cmd.Port,
+		Port:          port,
 		Zettelkasten:  cmd.Zettelkasten,
 		Passthrough:   []string(args),
 		ProjectConfig: projectConfig,
 	})
 
 	// Build the dashboard command
-	dashboardShellCmd := fmt.Sprintf("%s _dashboard --port %d", shelljoin(veeBinary), cmd.Port)
+	dashboardShellCmd := fmt.Sprintf("%s _dashboard --port %d", shelljoin(veeBinary), port)
 
 	// Create or reuse tmux session
 	if tmuxSessionExists() {
@@ -166,7 +167,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 
 	// Apply tmux configuration (idempotent)
-	if err := tmuxConfigure(veeBinary, cmd.Port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
+	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
 		return fmt.Errorf("failed to configure tmux: %w", err)
 	}
 
@@ -212,11 +213,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	sessionID := newUUID()
 
 	// Build claude args
-	sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, &StartCmd{
-		VeePath:      cmd.VeePath,
-		Zettelkasten: cmd.Zettelkasten,
-		Port:         cmd.Port,
-	}, []string(args), veeBinary)
+	sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -390,11 +387,7 @@ func (cmd *ResumeSessionCmd) Run() error {
 	}
 
 	// Build claude args with --resume
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, &StartCmd{
-		VeePath:      cfg.VeePath,
-		Zettelkasten: cfg.Zettelkasten,
-		Port:         cfg.Port,
-	}, cfg.Passthrough, veeBinary)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -450,7 +443,7 @@ type SessionEndedCmd struct {
 
 // Run notifies the daemon that a Claude process has exited and cleans up temp files.
 func (cmd *SessionEndedCmd) Run() error {
-	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	setupFileLogger(veeLogFile)
 	// Clean up per-session temp directory
 	dir := sessionTempDir(cmd.SessionID)
 	if err := os.RemoveAll(dir); err != nil {
@@ -481,7 +474,7 @@ type ShutdownCmd struct {
 }
 
 func (cmd *ShutdownCmd) Run() error {
-	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	setupFileLogger(veeLogFile)
 	slog.Debug("shutdown: starting graceful shutdown")
 
 	// Fetch all active sessions from the daemon
@@ -530,7 +523,7 @@ type UpdatePreviewCmd struct {
 
 // Run reads the hook JSON from stdin, extracts the prompt, and POSTs it to the daemon.
 func (cmd *UpdatePreviewCmd) Run() error {
-	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	setupFileLogger(veeLogFile)
 	var hookData struct {
 		Prompt string `json:"prompt"`
 	}
@@ -832,7 +825,7 @@ func stripSystemPrompt(args []string) []string {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string, veeBinary string) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, port int, veePath string, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
@@ -849,7 +842,7 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 	}
 
 	// MCP config — always provided (needed for request_suspend and self_drop)
-	mcpConfigFile, err := writeMCPConfig(cmd.Port, sessionID)
+	mcpConfigFile, err := writeMCPConfig(port, sessionID)
 	if err != nil {
 		slog.Error("failed to write MCP config", "error", err)
 	} else {
@@ -857,7 +850,7 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 	}
 
 	// Settings (includes per-session UserPromptSubmit hook)
-	settingsFile, err := writeSettings(sessionID, cmd.Port, veeBinary)
+	settingsFile, err := writeSettings(sessionID, port, veeBinary)
 	if err != nil {
 		slog.Error("failed to write settings", "error", err)
 	} else {
@@ -865,11 +858,11 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 	}
 
 	// Always include plugins/vee for the suspend command
-	args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee"))
+	args = append(args, "--plugin-dir", filepath.Join(veePath, "plugins", "vee"))
 
 	// Mode-specific plugin dirs
 	for _, dir := range mode.PluginDirs {
-		args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, dir))
+		args = append(args, "--plugin-dir", filepath.Join(veePath, dir))
 	}
 
 	return args

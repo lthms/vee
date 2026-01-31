@@ -138,7 +138,7 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 	}
 
 	// Ctrl-b l: show logs in a popup (Esc or q to dismiss)
-	logPopupCmd := fmt.Sprintf("%s _log-viewer --port %d", shelljoin(veeBinary), port)
+	logPopupCmd := fmt.Sprintf("%s _log-viewer", shelljoin(veeBinary))
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "l", "display-popup", "-E", "-w", "90%", "-h", "80%", logPopupCmd); err != nil {
 		return fmt.Errorf("tmux bind-key l: %w", err)
 	}

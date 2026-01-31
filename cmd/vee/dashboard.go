@@ -220,14 +220,10 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 }
 
 // LogViewerCmd tails the log file in a popup, exiting on Esc or q.
-type LogViewerCmd struct {
-	Port int `short:"p" default:"2700" name:"port"`
-}
+type LogViewerCmd struct{}
 
 func (cmd *LogViewerCmd) Run() error {
-	logFile := fmt.Sprintf("/tmp/vee-%d.log", cmd.Port)
-
-	f, err := os.Open(logFile)
+	f, err := os.Open(veeLogFile)
 	if err != nil {
 		return err
 	}

@@ -4,11 +4,12 @@ import (
 	_ "embed"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
@@ -23,27 +24,49 @@ type claudeArgs []string
 // CLI is the top-level command structure for vee.
 type CLI struct {
 	Debug bool   `env:"VEE_DEBUG" help:"Enable debug logging."`
-	Start StartCmd `cmd:"" help:"Start an interactive Vee session."`
-	MCP   MCPCmd `cmd:"" help:"Run the built-in MCP server."`
+	Start  StartCmd  `cmd:"" help:"Start an interactive Vee session."`
+	Daemon DaemonCmd `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
 }
 
-// StartCmd is the default command that execs into claude.
+// StartCmd supervises the daemon and claude processes.
 type StartCmd struct {
 	VeePath      string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 	Zettelkasten bool   `short:"z" help:"Enable the vee-zettelkasten plugin." name:"zettelkasten"`
+	Port         int    `short:"p" help:"Port for the daemon dashboard." default:"2700" name:"port"`
 }
 
-// Run starts a Vee session by exec-ing into claude with the composed system prompt.
+// Run starts a Vee session: forks the daemon, starts claude as a child, and
+// supervises both. When claude exits, the daemon is killed.
 func (cmd *StartCmd) Run(args claudeArgs) error {
-	claudePath, err := exec.LookPath("claude")
+	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("claude not found in PATH: %w", err)
+		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	if err := ensureMCPServer(cmd.Zettelkasten); err != nil {
-		return fmt.Errorf("MCP server check failed: %w", err)
+	// 1. Fork the daemon
+	daemonArgs := []string{"daemon", "-p", fmt.Sprintf("%d", cmd.Port)}
+	if cmd.Zettelkasten {
+		daemonArgs = append(daemonArgs, "-z")
+	}
+	daemon := exec.Command(self, daemonArgs...)
+	daemon.Stdout = nil
+	daemon.Stderr = nil
+	if err := daemon.Start(); err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+	defer func() {
+		slog.Debug("killing daemon", "pid", daemon.Process.Pid)
+		_ = daemon.Process.Kill()
+		_ = daemon.Wait()
+	}()
+	slog.Debug("daemon started", "pid", daemon.Process.Pid)
+
+	// 2. Wait for the daemon to be ready
+	if err := waitForDaemon(cmd.Port); err != nil {
+		return fmt.Errorf("daemon not ready: %w", err)
 	}
 
+	// 3. Build claude args
 	projectConfig, err := readProjectConfig()
 	if err != nil {
 		return fmt.Errorf("failed to read project config: %w", err)
@@ -57,19 +80,44 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	if cmd.Zettelkasten {
 		finalArgs = append(finalArgs, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee-zettelkasten"))
 	}
+
+	mcpConfig := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, cmd.Port)
+	finalArgs = append(finalArgs, "--mcp-config", mcpConfig)
+
 	slog.Debug("built args", "argCount", len(finalArgs))
 
-	return syscall.Exec(claudePath, append([]string{"claude"}, finalArgs...), os.Environ())
+	// 4. Start claude with terminal passthrough
+	claude := exec.Command("claude", finalArgs...)
+	claude.Stdin = os.Stdin
+	claude.Stdout = os.Stdout
+	claude.Stderr = os.Stderr
+
+	if err := claude.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return fmt.Errorf("claude failed: %w", err)
+	}
+
+	return nil
 }
 
-// MCPCmd runs the built-in MCP server.
-type MCPCmd struct {
-	Zettelkasten bool `short:"z" help:"Enable the vee-zettelkasten tools." name:"zettelkasten"`
-}
+// waitForDaemon polls the daemon's API until it responds or a timeout is reached.
+func waitForDaemon(port int) error {
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/state", port)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 
-// Run starts the MCP server.
-func (cmd *MCPCmd) Run() error {
-	return runMCPServer(cmd.Zettelkasten)
+	for range 50 {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			slog.Debug("daemon ready")
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("daemon did not respond on port %d", port)
 }
 
 // splitAtDashDash splits args at the first "--".

@@ -83,6 +83,12 @@ ALWAYS execute the <exit-conditions> and <on-abort> as operating in the current
 mode.
 THEN ALWAYS switch to normal mode
 THEN ALWAYS ask the user what they want to do next.
+
+ALWAYS call the `report_mode_change` MCP tool when switching to a new mode,
+including when switching back to normal mode. This is how the Vee daemon tracks
+your current state. Do this BEFORE your first message in the new mode.
+ALWAYS pass both the mode name AND the indicator emoji defined in the mode's
+`<indicator>` tag (e.g. mode="normal", indicator="🦊").
 </rule>
 
 <rule object="Online platforms">

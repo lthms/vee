@@ -7,27 +7,52 @@ import (
 	"time"
 )
 
+// AppConfig stores configuration that _new-pane fetches via /api/config.
+type AppConfig struct {
+	VeePath       string   `json:"vee_path"`
+	Port          int      `json:"port"`
+	Zettelkasten  bool     `json:"zettelkasten"`
+	Passthrough   []string `json:"passthrough"`
+	ProjectConfig string   `json:"project_config"`
+}
+
 // App holds the shared application state passed to all subsystems.
 type App struct {
 	Sessions *sessionStore
-	Control  *sessionControl
+
+	mu     sync.RWMutex
+	config *AppConfig
 }
 
 func newApp() *App {
 	return &App{
 		Sessions: newSessionStore(),
-		Control:  newSessionControl(),
 	}
+}
+
+// SetConfig stores the project configuration for retrieval by _new-pane.
+func (a *App) SetConfig(cfg *AppConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.config = cfg
+}
+
+// Config returns the stored project configuration.
+func (a *App) Config() *AppConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.config
 }
 
 // Session represents a Claude Code session (active or suspended).
 type Session struct {
-	ID        string    `json:"id"`
-	Mode      string    `json:"mode"`
-	Indicator string    `json:"indicator"`
-	StartedAt time.Time `json:"started_at"`
-	Preview   string    `json:"preview"`
-	Status    string    `json:"status"` // "active", "suspended", or "completed"
+	ID           string    `json:"id"`
+	Mode         string    `json:"mode"`
+	Indicator    string    `json:"indicator"`
+	StartedAt    time.Time `json:"started_at"`
+	Preview      string    `json:"preview"`
+	Status       string    `json:"status"`        // "active", "suspended", or "completed"
+	WindowTarget string    `json:"window_target"` // tmux window ID (e.g. "@3")
 }
 
 // sessionStore is an in-memory store of sessions keyed by ID.
@@ -42,16 +67,17 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create(id, mode, indicator, preview string) *Session {
+func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &Session{
-		ID:        id,
-		Mode:      mode,
-		Indicator: indicator,
-		StartedAt: time.Now(),
-		Preview:   preview,
-		Status:    "active",
+		ID:           id,
+		Mode:         mode,
+		Indicator:    indicator,
+		StartedAt:    time.Now(),
+		Preview:      preview,
+		Status:       "active",
+		WindowTarget: windowTarget,
 	}
 	s.sessions[id] = sess
 	return sess
@@ -127,111 +153,25 @@ func (s *sessionStore) active() []*Session {
 	return result
 }
 
-// sessionChannels holds the suspend and self-drop channels for a single session.
-type sessionChannels struct {
-	suspendCh  chan struct{}
-	selfDropCh chan struct{}
-}
-
-// sessionControl manages suspend and self-drop signaling for multiple sessions.
-type sessionControl struct {
-	mu       sync.Mutex
-	sessions map[string]*sessionChannels
-}
-
-func newSessionControl() *sessionControl {
-	return &sessionControl{
-		sessions: make(map[string]*sessionChannels),
-	}
-}
-
-// newSessionFor creates buffered(1) channels for a session.
-func (c *sessionControl) newSessionFor(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sessions[id] = &sessionChannels{
-		suspendCh:  make(chan struct{}, 1),
-		selfDropCh: make(chan struct{}, 1),
-	}
-}
-
-// channelsFor returns the suspend and self-drop channels for a session.
-func (c *sessionControl) channelsFor(id string) (suspend, selfDrop chan struct{}) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch, ok := c.sessions[id]
-	if !ok {
-		return nil, nil
-	}
-	return ch.suspendCh, ch.selfDropCh
-}
-
-// requestSuspendFor sends on the suspend channel for a specific session.
-func (c *sessionControl) requestSuspendFor(id string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch, ok := c.sessions[id]
-	if !ok {
-		return false
-	}
-	select {
-	case ch.suspendCh <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-// requestSelfDropFor sends on the self-drop channel for a specific session.
-func (c *sessionControl) requestSelfDropFor(id string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch, ok := c.sessions[id]
-	if !ok {
-		return false
-	}
-	select {
-	case ch.selfDropCh <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-// clearSessionFor removes the channels for a session.
-func (c *sessionControl) clearSessionFor(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.sessions, id)
-}
-
-// requestSuspendAny sends on the suspend channel for any active session (used by MCP).
-// Returns the session ID that was suspended, or empty string if none.
-func (c *sessionControl) requestSuspendAny() (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, ch := range c.sessions {
-		select {
-		case ch.suspendCh <- struct{}{}:
-			return id, true
-		default:
+// findByWindowTarget returns the first active session matching a tmux window ID.
+func (s *sessionStore) findByWindowTarget(target string) *Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, sess := range s.sessions {
+		if sess.WindowTarget == target {
+			return sess
 		}
 	}
-	return "", false
+	return nil
 }
 
-// requestSelfDropAny sends on the self-drop channel for any active session (used by MCP).
-func (c *sessionControl) requestSelfDropAny() (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, ch := range c.sessions {
-		select {
-		case ch.selfDropCh <- struct{}{}:
-			return id, true
-		default:
-		}
+// setWindowTarget updates the tmux window ID for a session.
+func (s *sessionStore) setWindowTarget(id, target string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess, ok := s.sessions[id]; ok {
+		sess.WindowTarget = target
 	}
-	return "", false
 }
 
 // newUUID generates a v4 UUID using crypto/rand.

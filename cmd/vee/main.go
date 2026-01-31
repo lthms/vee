@@ -2,13 +2,14 @@ package main
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/alecthomas/kong"
 )
 
@@ -89,19 +90,25 @@ type claudeArgs []string
 
 // CLI is the top-level command structure for vee.
 type CLI struct {
-	Debug  bool      `env:"VEE_DEBUG" help:"Enable debug logging."`
-	Start  StartCmd  `cmd:"" help:"Start an interactive Vee session."`
-	Daemon DaemonCmd `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
+	Debug         bool             `env:"VEE_DEBUG" help:"Enable debug logging."`
+	Start         StartCmd         `cmd:"" help:"Start an interactive Vee session."`
+	Daemon        DaemonCmd        `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
+	NewPane       NewPaneCmd       `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
+	Dashboard     DashboardCmd     `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
+	SuspendWindow SuspendWindowCmd `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
+	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
+	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
+	SessionEnded  SessionEndedCmd  `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
 }
 
-// StartCmd runs the in-process server and the TUI loop.
+// StartCmd runs the in-process server and manages the tmux session.
 type StartCmd struct {
 	VeePath      string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 	Zettelkasten bool   `short:"z" help:"Enable the vee-zettelkasten plugin." name:"zettelkasten"`
 	Port         int    `short:"p" help:"Port for the daemon dashboard." default:"2700" name:"port"`
 }
 
-// Run starts the Vee TUI with an in-process HTTP/MCP server.
+// Run starts the Vee tmux session with an in-process HTTP/MCP server.
 func (cmd *StartCmd) Run(args claudeArgs) error {
 	if err := initModeRegistry(); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
@@ -112,11 +119,6 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to read project config: %w", err)
 	}
 
-	// Set up log ring buffer for the log viewer pane and redirect slog to it
-	logBuf := newRingBuffer(10000)
-	ringHandler := newSlogRingHandler(logBuf, slog.LevelDebug)
-	slog.SetDefault(slog.New(ringHandler))
-
 	app := newApp()
 
 	srv, err := startHTTPServerInBackground(app, cmd.Port, cmd.Zettelkasten)
@@ -125,13 +127,315 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer srv.Close()
 
-	m := newModel(app, projectConfig, cmd, []string(args), logBuf)
+	// Resolve own binary path for _new-pane invocations
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	m.program = p
+	// Store config so _new-pane can fetch it via /api/config
+	app.SetConfig(&AppConfig{
+		VeePath:       cmd.VeePath,
+		Port:          cmd.Port,
+		Zettelkasten:  cmd.Zettelkasten,
+		Passthrough:   []string(args),
+		ProjectConfig: projectConfig,
+	})
 
-	_, err = p.Run()
+	// Build the dashboard command
+	dashboardShellCmd := fmt.Sprintf("%s _dashboard --port %d", shelljoin(veeBinary), cmd.Port)
+
+	// Create or reuse tmux session
+	if !tmuxSessionExists() {
+		if err := tmuxCreateSession(dashboardShellCmd); err != nil {
+			return fmt.Errorf("failed to create tmux session: %w", err)
+		}
+	}
+
+	// Apply tmux configuration (idempotent)
+	if err := tmuxConfigure(veeBinary, cmd.Port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
+		return fmt.Errorf("failed to configure tmux: %w", err)
+	}
+
+	// Attach to tmux — blocks until detach or session end
+	return tmuxAttach()
+}
+
+// NewPaneCmd is the internal subcommand called by tmux display-menu entries.
+type NewPaneCmd struct {
+	VeePath      string `required:"" type:"path" name:"vee-path"`
+	Zettelkasten bool   `short:"z" name:"zettelkasten"`
+	Port         int    `short:"p" default:"2700" name:"port"`
+	Mode         string `required:"" name:"mode"`
+}
+
+// Run creates a new tmux window with a Claude session for the given mode.
+func (cmd *NewPaneCmd) Run(args claudeArgs) error {
+	if err := initModeRegistry(); err != nil {
+		return fmt.Errorf("failed to init mode registry: %w", err)
+	}
+
+	mode, ok := modeRegistry[cmd.Mode]
+	if !ok {
+		return fmt.Errorf("unknown mode: %s", cmd.Mode)
+	}
+
+	// Fetch project config from the running daemon
+	projectConfig, err := fetchProjectConfig(cmd.Port)
+	if err != nil {
+		slog.Warn("failed to fetch project config from daemon, proceeding without", "error", err)
+	}
+
+	// Generate session ID
+	sessionID := newUUID()
+
+	// Build claude args
+	sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, &StartCmd{
+		VeePath:      cmd.VeePath,
+		Zettelkasten: cmd.Zettelkasten,
+		Port:         cmd.Port,
+	}, []string(args))
+
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
+	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs)
+	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
+
+	// Create the tmux window first so we have the window ID
+	windowID, err := tmuxNewWindow(windowName, shellCmd)
+	if err != nil {
+		return fmt.Errorf("failed to create tmux window: %w", err)
+	}
+
+	// Register session with daemon, including the window target
+	if err := registerSession(cmd.Port, sessionID, mode, windowID); err != nil {
+		slog.Warn("failed to register session with daemon", "error", err)
+	}
+
+	return nil
+}
+
+// fetchProjectConfig fetches the project config from the running daemon.
+func fetchProjectConfig(port int) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/config", port))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("daemon returned %d", resp.StatusCode)
+	}
+
+	var cfg AppConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return "", err
+	}
+
+	return cfg.ProjectConfig, nil
+}
+
+// registerSession registers a new session with the running daemon.
+func registerSession(port int, sessionID string, mode Mode, windowTarget string) error {
+	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q}`,
+		sessionID, mode.Name, mode.Indicator, windowTarget)
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port),
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("daemon returned %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// SuspendWindowCmd suspends the session running in a given tmux window.
+type SuspendWindowCmd struct {
+	Port     int    `short:"p" default:"2700" name:"port"`
+	WindowID string `required:"" name:"window-id"`
+}
+
+// Run suspends the session by its tmux window ID.
+func (cmd *SuspendWindowCmd) Run() error {
+	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// No session in this window (e.g. dashboard) — show a tmux message
+		tmuxRun("display-message", "No session to suspend in this window")
+		return nil
+	}
+
+	return nil
+}
+
+// ResumeMenuCmd shows a tmux display-menu of suspended sessions.
+type ResumeMenuCmd struct {
+	Port int `short:"p" default:"2700" name:"port"`
+}
+
+// Run fetches suspended sessions and shows a tmux picker.
+func (cmd *ResumeMenuCmd) Run() error {
+	// Fetch state from daemon
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var state struct {
+		Suspended []*Session `json:"suspended_sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return err
+	}
+
+	if len(state.Suspended) == 0 {
+		tmuxRun("display-message", "No suspended sessions")
+		return nil
+	}
+
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	// Build display-menu command
+	args := []string{"display-menu", "-T", "Resume Session"}
+
+	for _, sess := range state.Suspended {
+		label := fmt.Sprintf("%s %s", sess.Indicator, sess.Mode)
+
+		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --mode %s",
+			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Mode)
+
+		args = append(args, label, "", "run-shell "+shelljoin(resumeCmd))
+	}
+
+	_, err = tmuxRun(args...)
 	return err
+}
+
+// ResumeSessionCmd resumes a suspended session in a new tmux window.
+type ResumeSessionCmd struct {
+	Port      int    `short:"p" default:"2700" name:"port"`
+	SessionID string `required:"" name:"session-id"`
+	Mode      string `required:"" name:"mode"`
+}
+
+// Run resumes a suspended session.
+func (cmd *ResumeSessionCmd) Run() error {
+	if err := initModeRegistry(); err != nil {
+		return fmt.Errorf("failed to init mode registry: %w", err)
+	}
+
+	mode, ok := modeRegistry[cmd.Mode]
+	if !ok {
+		return fmt.Errorf("unknown mode: %s", cmd.Mode)
+	}
+
+	// Fetch config from daemon
+	cfg, err := fetchAppConfig(cmd.Port)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config from daemon: %w", err)
+	}
+
+	// Build claude args with --resume
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, &StartCmd{
+		VeePath:      cfg.VeePath,
+		Zettelkasten: cfg.Zettelkasten,
+		Port:         cfg.Port,
+	}, cfg.Passthrough)
+
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
+	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs)
+	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
+
+	windowID, err := tmuxNewWindow(windowName, shellCmd)
+	if err != nil {
+		return fmt.Errorf("failed to create tmux window: %w", err)
+	}
+
+	// Activate the session with the new window target
+	activateBody := fmt.Sprintf(`{"session_id":%q,"window_target":%q}`, cmd.SessionID, windowID)
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/activate", cfg.Port),
+		"application/json",
+		strings.NewReader(activateBody),
+	)
+	if err != nil {
+		slog.Warn("failed to activate session", "error", err)
+	} else {
+		resp.Body.Close()
+	}
+
+	return nil
+}
+
+// buildWindowShellCmd constructs the shell command for a tmux window:
+//
+//	claude <args>; vee _session-ended --port <port> --session-id <id>
+//
+// The cleanup tail ensures the daemon is notified when Claude exits for any reason.
+func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArgs []string) string {
+	var cmdParts []string
+	cmdParts = append(cmdParts, "claude")
+	for _, arg := range claudeArgs {
+		cmdParts = append(cmdParts, shelljoin(arg))
+	}
+
+	claudeCmd := strings.Join(cmdParts, " ")
+	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --session-id %s",
+		shelljoin(veeBinary), port, sessionID)
+
+	return claudeCmd + "; " + cleanupCmd
+}
+
+// SessionEndedCmd is called when Claude exits to clean up stale sessions.
+type SessionEndedCmd struct {
+	Port      int    `short:"p" default:"2700" name:"port"`
+	SessionID string `required:"" name:"session-id"`
+}
+
+// Run notifies the daemon that a Claude process has exited.
+func (cmd *SessionEndedCmd) Run() error {
+	body := fmt.Sprintf(`{"session_id":%q}`, cmd.SessionID)
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/session-ended", cmd.Port),
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		// Daemon might already be gone (e.g. Ctrl-b q killed everything)
+		return nil
+	}
+	defer resp.Body.Close()
+	return nil
 }
 
 // splitAtDashDash splits args at the first "--".
@@ -289,19 +593,61 @@ func buildArgs(originalArgs []string, systemPromptContent string) []string {
 	return args
 }
 
+// fetchAppConfig fetches the full AppConfig from the running daemon.
+func fetchAppConfig(port int) (*AppConfig, error) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/config", port))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("daemon returned %d", resp.StatusCode)
+	}
+
+	var cfg AppConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+// stripSystemPrompt removes --append-system-prompt and its value from args.
+func stripSystemPrompt(args []string) []string {
+	var out []string
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "--append-system-prompt" && i+1 < len(args) {
+			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(arg, "--append-system-prompt=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
 // buildSessionArgs constructs the claude CLI arguments for a session.
 func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
 	var args []string
-	if mode.NoPrompt {
-		args = append(args, passthrough...)
-	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
-		args = buildArgs(passthrough, fullPrompt)
-	}
 
 	if resume {
+		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
+		if mode.NoPrompt {
+			args = append(args, passthrough...)
+		} else {
+			fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
+			args = buildArgs(passthrough, fullPrompt)
+		}
 		args = append(args, "--session-id", sessionID)
 	}
 

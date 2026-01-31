@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -40,11 +41,21 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		Description: "Request that the current Vee session be suspended so it can be resumed later.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args requestSuspendArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("request_suspend called")
-		if id, ok := app.Control.requestSuspendAny(); ok {
-			slog.Debug("suspend routed to session", "session", id)
+		activeSessions := app.Sessions.active()
+		if len(activeSessions) > 0 {
+			sess := activeSessions[0]
+			app.Sessions.setStatus(sess.ID, "suspended")
+			slog.Debug("session suspended", "session", sess.ID)
+			if sess.WindowTarget != "" {
+				go func() {
+					// Delay so the MCP response reaches Claude before we interrupt
+					time.Sleep(2 * time.Second)
+					tmuxGracefulClose(sess.WindowTarget)
+				}()
+			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: "Suspend requested."},
+					&mcp.TextContent{Text: "Session suspended."},
 				},
 			}, nil, nil
 		}
@@ -60,8 +71,18 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		Description: "Signal that the current task is done. Call this when your work is complete to end the session.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args selfDropArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("self_drop called")
-		if id, ok := app.Control.requestSelfDropAny(); ok {
-			slog.Debug("self-drop routed to session", "session", id)
+		activeSessions := app.Sessions.active()
+		if len(activeSessions) > 0 {
+			sess := activeSessions[0]
+			app.Sessions.setStatus(sess.ID, "completed")
+			slog.Debug("session completed", "session", sess.ID)
+			if sess.WindowTarget != "" {
+				go func() {
+					// Delay so the MCP response reaches Claude before we interrupt
+					time.Sleep(2 * time.Second)
+					tmuxGracefulClose(sess.WindowTarget)
+				}()
+			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: "Session ending."},
@@ -95,6 +116,11 @@ func setupHTTPMux(app *App, zettelkasten bool) *http.ServeMux {
 	mux.Handle("/sse", sseHandler)
 	mux.HandleFunc("/", handleDashboard)
 	mux.HandleFunc("/api/state", handleState(app))
+	mux.HandleFunc("/api/sessions", handleSessions(app))
+	mux.HandleFunc("/api/config", handleConfig(app))
+	mux.HandleFunc("/api/suspend", handleSuspend(app))
+	mux.HandleFunc("/api/activate", handleActivate(app))
+	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	return mux
 }
 
@@ -115,6 +141,161 @@ func handleState(app *App) http.HandlerFunc {
 			"suspended_sessions": suspendedSessions,
 			"completed_sessions": completedSessions,
 		})
+	}
+}
+
+// handleSessions handles POST /api/sessions to register a new session.
+func handleSessions(app *App) http.HandlerFunc {
+	type createReq struct {
+		ID           string `json:"id"`
+		Mode         string `json:"mode"`
+		Indicator    string `json:"indicator"`
+		Preview      string `json:"preview"`
+		WindowTarget string `json:"window_target"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req createReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget)
+		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"status": "created"})
+	}
+}
+
+// handleConfig handles GET /api/config to return the stored AppConfig.
+func handleConfig(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		cfg := app.Config()
+		if cfg == nil {
+			http.Error(w, "config not set", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cfg)
+	}
+}
+
+// handleSuspend handles POST /api/suspend to suspend a session by its tmux window target.
+func handleSuspend(app *App) http.HandlerFunc {
+	type suspendReq struct {
+		WindowTarget string `json:"window_target"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req suspendReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.findByWindowTarget(req.WindowTarget)
+		if sess == nil || sess.Status != "active" {
+			http.Error(w, "no active session for this window", http.StatusNotFound)
+			return
+		}
+
+		app.Sessions.setStatus(sess.ID, "suspended")
+		slog.Debug("session suspended via API", "id", sess.ID, "window", req.WindowTarget)
+
+		if req.WindowTarget != "" {
+			go tmuxGracefulClose(req.WindowTarget)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "suspended", "session_id": sess.ID})
+	}
+}
+
+// handleActivate handles POST /api/activate to reactivate a suspended session with a new window.
+func handleActivate(app *App) http.HandlerFunc {
+	type activateReq struct {
+		SessionID    string `json:"session_id"`
+		WindowTarget string `json:"window_target"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req activateReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.get(req.SessionID)
+		if sess == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+
+		app.Sessions.setStatus(req.SessionID, "active")
+		app.Sessions.setWindowTarget(req.SessionID, req.WindowTarget)
+		slog.Debug("session activated via API", "id", req.SessionID, "window", req.WindowTarget)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "active"})
+	}
+}
+
+// handleSessionEnded handles POST /api/session-ended, called when a Claude process exits.
+// If the session is still "active", marks it "completed". Leaves "suspended" sessions alone.
+func handleSessionEnded(app *App) http.HandlerFunc {
+	type endedReq struct {
+		SessionID string `json:"session_id"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req endedReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.get(req.SessionID)
+		if sess == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if sess.Status == "active" {
+			app.Sessions.setStatus(req.SessionID, "completed")
+			slog.Debug("session ended (process exited)", "id", req.SessionID)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": sess.Status})
 	}
 }
 

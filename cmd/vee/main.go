@@ -27,13 +27,14 @@ type Mode struct {
 	Prompt      string   // embedded mode prompt content
 	PluginDirs  []string // plugin dirs to pass to claude (relative to vee-path)
 	NeedsMCP    bool     // whether this mode needs zettelkasten MCP tools
+	NoPrompt    bool     // skip --append-system-prompt entirely (vanilla claude)
 }
 
 // modeRegistry holds all known modes, keyed by name.
 var modeRegistry map[string]Mode
 
 // modeOrder defines the display order for help output.
-var modeOrder = []string{"normal", "vibe", "contradictor", "query", "record"}
+var modeOrder = []string{"normal", "vibe", "contradictor", "query", "record", "claude"}
 
 func initModeRegistry() error {
 	basePrompt, err := promptFS.ReadFile("prompts/base.md")
@@ -56,7 +57,7 @@ func initModeRegistry() error {
 		{"record", "prompts/zettelkasten_record.md", "📚", "Record into the knowledge base", []string{"plugins/vee-zettelkasten"}, true},
 	}
 
-	modeRegistry = make(map[string]Mode, len(modes))
+	modeRegistry = make(map[string]Mode, len(modes)+1)
 	for _, m := range modes {
 		modeContent, err := promptFS.ReadFile(m.file)
 		if err != nil {
@@ -74,6 +75,14 @@ func initModeRegistry() error {
 			PluginDirs:  m.pluginDirs,
 			NeedsMCP:    m.needsMCP,
 		}
+	}
+
+	// Vanilla Claude mode — no system prompt injection
+	modeRegistry["claude"] = Mode{
+		Name:        "claude",
+		Indicator:   "🤖",
+		Description: "Vanilla Claude Code session",
+		NoPrompt:    true,
 	}
 
 	return nil
@@ -313,10 +322,13 @@ func resumeSession(app *App, mode Mode, sessionID, projectConfig string, cmd *St
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
 func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
-	fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
-
 	var args []string
-	args = buildArgs(passthrough, fullPrompt)
+	if mode.NoPrompt {
+		args = append(args, passthrough...)
+	} else {
+		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
+		args = buildArgs(passthrough, fullPrompt)
+	}
 
 	if resume {
 		args = append(args, "--resume", sessionID)

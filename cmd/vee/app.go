@@ -165,6 +165,15 @@ func (s *sessionStore) findByWindowTarget(target string) *Session {
 	return nil
 }
 
+// setPreview updates the preview text for a session.
+func (s *sessionStore) setPreview(id, preview string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess, ok := s.sessions[id]; ok {
+		sess.Preview = preview
+	}
+}
+
 // setWindowTarget updates the tmux window ID for a session.
 func (s *sessionStore) setWindowTarget(id, target string) {
 	s.mu.Lock()

@@ -55,6 +55,9 @@ func (cmd *DashboardCmd) Run() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	winchCh := make(chan os.Signal, 1)
+	signal.Notify(winchCh, syscall.SIGWINCH)
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -66,6 +69,8 @@ func (cmd *DashboardCmd) Run() error {
 		case <-sigCh:
 			fmt.Print("\033[?25h") // show cursor
 			return nil
+		case <-winchCh:
+			cmd.render(cmd.fetchState())
 		case <-ticker.C:
 			cmd.render(cmd.fetchState())
 		}
@@ -87,6 +92,11 @@ func (cmd *DashboardCmd) fetchState() *dashboardState {
 }
 
 func (cmd *DashboardCmd) render(state *dashboardState) {
+	termWidth, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || termWidth < 40 {
+		termWidth = 80
+	}
+
 	var sb strings.Builder
 
 	// Clear screen and move cursor to top-left, hide cursor
@@ -112,11 +122,11 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 		sb.WriteString("\r\n")
 	} else {
 		// Active sessions
-		cmd.renderSection(&sb, "ACTIVE", state.Active, ansiGreen)
+		cmd.renderSection(&sb, "ACTIVE", state.Active, ansiGreen, termWidth)
 		// Suspended sessions
-		cmd.renderSection(&sb, "SUSPENDED", state.Suspended, ansiYellow)
+		cmd.renderSection(&sb, "SUSPENDED", state.Suspended, ansiYellow, termWidth)
 		// Completed sessions
-		cmd.renderSection(&sb, "COMPLETED", state.Completed, ansiMuted)
+		cmd.renderSection(&sb, "COMPLETED", state.Completed, ansiMuted, termWidth)
 	}
 
 	// Keybindings footer
@@ -139,7 +149,7 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	fmt.Print(sb.String())
 }
 
-func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessions []*Session, color string) {
+func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessions []*Session, color string, termWidth int) {
 	sb.WriteString("  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString(title)
@@ -157,6 +167,15 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 	}
 
 	for _, sess := range sessions {
+		age := formatAge(time.Since(sess.StartedAt))
+
+		// Visible widths: indent(4) + emoji(2) + space(1) + mode + age
+		const indent = 4
+		const emojiWidth = 2
+		leftFixed := indent + emojiWidth + 1 + len(sess.Mode)
+		rightFixed := len(age) + 2 // +2 for right margin
+
+		// Write left part: indicator + mode
 		sb.WriteString("    ")
 		sb.WriteString(color)
 		sb.WriteString(sess.Indicator)
@@ -165,29 +184,99 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 		sb.WriteString(sess.Mode)
 		sb.WriteString(ansiReset)
 
-		// Age
-		age := formatAge(time.Since(sess.StartedAt))
-		sb.WriteString("  ")
+		usedWidth := leftFixed
+
+		// Preview (between mode and age)
+		if sess.Preview != "" {
+			// 2 chars gap before preview, 2 chars min gap before age
+			maxPreview := termWidth - leftFixed - rightFixed - 4
+			if maxPreview > 3 {
+				preview := sess.Preview
+				if len(preview) > maxPreview {
+					preview = preview[:maxPreview-3] + "..."
+				}
+				sb.WriteString("  ")
+				sb.WriteString(ansiDim)
+				sb.WriteString(ansiItalic)
+				sb.WriteString(preview)
+				sb.WriteString(ansiReset)
+				usedWidth += 2 + len(preview)
+			}
+		}
+
+		// Right-align age
+		padding := termWidth - usedWidth - rightFixed
+		if padding < 2 {
+			padding = 2
+		}
+		sb.WriteString(strings.Repeat(" ", padding))
 		sb.WriteString(ansiMuted)
 		sb.WriteString(age)
 		sb.WriteString(ansiReset)
 
-		// Preview
-		if sess.Preview != "" {
-			sb.WriteString("  ")
-			sb.WriteString(ansiDim)
-			sb.WriteString(ansiItalic)
-			preview := sess.Preview
-			if len(preview) > 60 {
-				preview = preview[:60] + "..."
-			}
-			sb.WriteString(preview)
-			sb.WriteString(ansiReset)
-		}
-
 		sb.WriteString("\r\n")
 	}
 	sb.WriteString("\r\n")
+}
+
+// LogViewerCmd tails the log file in a popup, exiting on Esc or q.
+type LogViewerCmd struct {
+	Port int `short:"p" default:"2700" name:"port"`
+}
+
+func (cmd *LogViewerCmd) Run() error {
+	logFile := fmt.Sprintf("/tmp/vee-%d.log", cmd.Port)
+
+	f, err := os.Open(logFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return err
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h")
+
+	// Show last 16KB of existing content, then follow
+	if info, err := f.Stat(); err == nil && info.Size() > 16384 {
+		f.Seek(-16384, 2)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				n, _ := f.Read(buf)
+				if n > 0 {
+					// Raw mode: convert \n to \r\n
+					output := strings.ReplaceAll(string(buf[:n]), "\n", "\r\n")
+					fmt.Print(output)
+				} else {
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+		}
+	}()
+
+	// Wait for Esc or q
+	key := make([]byte, 1)
+	for {
+		os.Stdin.Read(key)
+		if key[0] == 27 || key[0] == 'q' {
+			close(done)
+			return nil
+		}
+	}
 }
 
 func formatAge(d time.Duration) string {

@@ -31,7 +31,7 @@ type Mode struct {
 var modeRegistry map[string]Mode
 
 // modeOrder defines the display order for help output.
-var modeOrder = []string{"normal", "vibe", "contradictor", "query", "record", "claude"}
+var modeOrder = []string{"claude", "normal", "vibe", "contradictor", "query", "record"}
 
 func initModeRegistry() error {
 	basePrompt, err := promptFS.ReadFile("prompts/base.md")
@@ -100,6 +100,9 @@ type CLI struct {
 	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
 	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
 	SessionEnded  SessionEndedCmd  `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
+	UpdatePreview UpdatePreviewCmd `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
+	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
+	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
 }
 
 // StartCmd runs the in-process server and manages the tmux session.
@@ -111,6 +114,9 @@ type StartCmd struct {
 
 // Run starts the Vee tmux session with an in-process HTTP/MCP server.
 func (cmd *StartCmd) Run(args claudeArgs) error {
+	// Clean up stale temp directories and old-style temp files from previous runs
+	cleanStaleTempFiles()
+
 	if err := initModeRegistry(); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
 	}
@@ -159,10 +165,6 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to create tmux session: %w", err)
 	}
 
-	// Create a logs window tailing the log file
-	tmuxNewWindow("logs", fmt.Sprintf("tail -f %s", logFile))
-	tmuxRun("select-window", "-t", "vee:0")
-
 	// Apply tmux configuration (idempotent)
 	if err := tmuxConfigure(veeBinary, cmd.Port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
 		return fmt.Errorf("failed to configure tmux: %w", err)
@@ -195,6 +197,11 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("unknown mode: %s", cmd.Mode)
 	}
 
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
 	// Fetch project config from the running daemon
 	projectConfig, err := fetchProjectConfig(cmd.Port)
 	if err != nil {
@@ -209,12 +216,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		VeePath:      cmd.VeePath,
 		Zettelkasten: cmd.Zettelkasten,
 		Port:         cmd.Port,
-	}, []string(args))
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
+	}, []string(args), veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -340,6 +342,13 @@ func (cmd *ResumeMenuCmd) Run() error {
 
 	for _, sess := range state.Suspended {
 		label := fmt.Sprintf("%s %s", sess.Indicator, sess.Mode)
+		if sess.Preview != "" {
+			preview := sess.Preview
+			if len(preview) > 40 {
+				preview = preview[:40] + "..."
+			}
+			label += "  " + preview
+		}
 
 		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --mode %s",
 			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Mode)
@@ -369,6 +378,11 @@ func (cmd *ResumeSessionCmd) Run() error {
 		return fmt.Errorf("unknown mode: %s", cmd.Mode)
 	}
 
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
 	// Fetch config from daemon
 	cfg, err := fetchAppConfig(cmd.Port)
 	if err != nil {
@@ -380,12 +394,7 @@ func (cmd *ResumeSessionCmd) Run() error {
 		VeePath:      cfg.VeePath,
 		Zettelkasten: cfg.Zettelkasten,
 		Port:         cfg.Port,
-	}, cfg.Passthrough)
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
+	}, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -439,8 +448,17 @@ type SessionEndedCmd struct {
 	SessionID string `required:"" name:"session-id"`
 }
 
-// Run notifies the daemon that a Claude process has exited.
+// Run notifies the daemon that a Claude process has exited and cleans up temp files.
 func (cmd *SessionEndedCmd) Run() error {
+	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	// Clean up per-session temp directory
+	dir := sessionTempDir(cmd.SessionID)
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("session-ended: failed to remove temp dir", "dir", dir, "error", err)
+	} else {
+		slog.Debug("session-ended: cleaned up temp dir", "dir", dir)
+	}
+
 	body := fmt.Sprintf(`{"session_id":%q}`, cmd.SessionID)
 
 	resp, err := http.Post(
@@ -454,6 +472,134 @@ func (cmd *SessionEndedCmd) Run() error {
 	}
 	defer resp.Body.Close()
 	return nil
+}
+
+// ShutdownCmd gracefully shuts down the Vee session: suspends all active
+// sessions so they can be resumed later, cleans up temp files, then kills tmux.
+type ShutdownCmd struct {
+	Port int `short:"p" default:"2700" name:"port"`
+}
+
+func (cmd *ShutdownCmd) Run() error {
+	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	slog.Debug("shutdown: starting graceful shutdown")
+
+	// Fetch all active sessions from the daemon
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
+	if err == nil {
+		defer resp.Body.Close()
+
+		var state struct {
+			Active []*Session `json:"active_sessions"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&state); err == nil {
+			slog.Debug("shutdown: suspending active sessions", "count", len(state.Active))
+			for _, sess := range state.Active {
+				slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
+				body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
+				r, err := http.Post(
+					fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
+					"application/json",
+					strings.NewReader(body),
+				)
+				if err == nil {
+					r.Body.Close()
+				}
+			}
+		}
+	} else {
+		slog.Warn("shutdown: failed to fetch state from daemon", "error", err)
+	}
+
+	// Clean up all temp dirs
+	slog.Debug("shutdown: cleaning stale temp files")
+	cleanStaleTempFiles()
+
+	// Kill the tmux session
+	slog.Debug("shutdown: killing tmux session")
+	tmuxRun("kill-session", "-t", "vee")
+	return nil
+}
+
+// UpdatePreviewCmd is the hook handler that reads the user prompt from stdin
+// and updates the session preview via the daemon API.
+type UpdatePreviewCmd struct {
+	Port      int    `short:"p" default:"2700" name:"port"`
+	SessionID string `required:"" name:"session-id"`
+}
+
+// Run reads the hook JSON from stdin, extracts the prompt, and POSTs it to the daemon.
+func (cmd *UpdatePreviewCmd) Run() error {
+	setupFileLogger(fmt.Sprintf("/tmp/vee-%d.log", cmd.Port))
+	var hookData struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&hookData); err != nil {
+		slog.Debug("update-preview: failed to decode hook stdin", "error", err)
+		return nil
+	}
+
+	if hookData.Prompt == "" {
+		slog.Debug("update-preview: empty prompt, skipping")
+		return nil
+	}
+
+	preview := hookData.Prompt
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
+
+	slog.Debug("update-preview: posting preview", "session", cmd.SessionID, "preview", preview)
+
+	body, _ := json.Marshal(map[string]string{
+		"session_id": cmd.SessionID,
+		"preview":    preview,
+	})
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/preview", cmd.Port),
+		"application/json",
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		slog.Debug("update-preview: failed to post preview", "error", err)
+		return nil
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// sessionTempDir returns the per-session temp directory path.
+func sessionTempDir(sessionID string) string {
+	return filepath.Join(os.TempDir(), "vee-"+sessionID)
+}
+
+// cleanStaleTempFiles removes leftover session temp dirs and old-style temp files.
+func cleanStaleTempFiles() {
+	tmpDir := os.TempDir()
+
+	// Session temp directories: /tmp/vee-UUID/
+	entries, _ := os.ReadDir(tmpDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, "vee-") && len(name) > 10 {
+			path := filepath.Join(tmpDir, name)
+			slog.Debug("cleanup: removing stale temp dir", "path", path)
+			os.RemoveAll(path)
+		}
+	}
+
+	// Old-style temp files from before the per-session dir refactor
+	for _, pattern := range []string{"vee-mcp-*.json", "vee-settings-*.json"} {
+		matches, _ := filepath.Glob(filepath.Join(tmpDir, pattern))
+		for _, m := range matches {
+			slog.Debug("cleanup: removing old-style temp file", "path", m)
+			os.Remove(m)
+		}
+	}
 }
 
 // splitAtDashDash splits args at the first "--".
@@ -508,7 +654,7 @@ func setupLogger(debug bool) {
 
 // setupFileLogger redirects slog to a file at debug level.
 func setupFileLogger(path string) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		slog.Warn("failed to open log file, keeping stderr", "path", path, "error", err)
 		return
@@ -544,50 +690,70 @@ func composeSystemPrompt(base, projectConfig string) string {
 	return sb.String()
 }
 
-func writeMCPConfig(port int) (string, error) {
+func writeMCPConfig(port int, sessionID string) (string, error) {
+	dir := sessionTempDir(sessionID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+
+	path := filepath.Join(dir, "mcp.json")
 	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, port)
 
-	f, err := os.CreateTemp("", "vee-mcp-*.json")
-	if err != nil {
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return "", err
 	}
 
-	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return "", err
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-
-	return f.Name(), nil
+	slog.Debug("wrote mcp config", "path", path, "session", sessionID)
+	return path, nil
 }
 
-func writeSettings() (string, error) {
-	content := `{
-  "hooks": {}
-}`
+func writeSettings(sessionID string, port int, veeBinary string) (string, error) {
+	dir := sessionTempDir(sessionID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
 
-	f, err := os.CreateTemp("", "vee-settings-*.json")
+	previewCmd := fmt.Sprintf("%s _update-preview --port %d --session-id %s",
+		veeBinary, port, sessionID)
+	cleanupCmd := fmt.Sprintf("rm -rf %s", shelljoin(dir))
+
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": cleanupCmd,
+						},
+					},
+				},
+			},
+			"UserPromptSubmit": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": previewCmd,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	content, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return "", err
 	}
 
-	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(f.Name())
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, content, 0600); err != nil {
 		return "", err
 	}
 
-	if err := f.Close(); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-
-	return f.Name(), nil
+	slog.Debug("wrote settings", "path", path, "session", sessionID, "hooks", "SessionStart,UserPromptSubmit")
+	return path, nil
 }
 
 func buildArgs(originalArgs []string, systemPromptContent string) []string {
@@ -666,7 +832,7 @@ func stripSystemPrompt(args []string) []string {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
@@ -683,15 +849,15 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 	}
 
 	// MCP config — always provided (needed for request_suspend and self_drop)
-	mcpConfigFile, err := writeMCPConfig(cmd.Port)
+	mcpConfigFile, err := writeMCPConfig(cmd.Port, sessionID)
 	if err != nil {
 		slog.Error("failed to write MCP config", "error", err)
 	} else {
 		args = append(args, "--mcp-config", mcpConfigFile)
 	}
 
-	// Settings
-	settingsFile, err := writeSettings()
+	// Settings (includes per-session UserPromptSubmit hook)
+	settingsFile, err := writeSettings(sessionID, cmd.Port, veeBinary)
 	if err != nil {
 		slog.Error("failed to write settings", "error", err)
 	} else {

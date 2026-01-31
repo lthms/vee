@@ -100,7 +100,7 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 
 		// Window behavior
 		{"set-option", "-t", "vee", "-g", "allow-rename", "off"},
-		{"set-option", "-t", "vee", "-g", "mouse", "on"},
+		{"set-option", "-t", "vee", "-g", "mouse", "off"},
 		{"set-option", "-t", "vee", "-g", "history-limit", "50000"},
 
 		// Renumber windows on close so indices stay compact
@@ -119,8 +119,9 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 		return fmt.Errorf("tmux bind-key picker: %w", err)
 	}
 
-	// Ctrl-b q: kill the vee session
-	if _, err := tmuxRun("bind-key", "-T", "prefix", "q", "kill-session", "-t", "vee"); err != nil {
+	// Ctrl-b q: graceful shutdown (suspend all sessions, clean up, kill tmux)
+	shutdownCmd := fmt.Sprintf("%s _shutdown --port %d", shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "q", "run-shell", shutdownCmd); err != nil {
 		return fmt.Errorf("tmux bind-key q: %w", err)
 	}
 
@@ -136,8 +137,9 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 		return fmt.Errorf("tmux bind-key r: %w", err)
 	}
 
-	// Ctrl-b l: jump to logs window
-	if _, err := tmuxRun("bind-key", "-T", "prefix", "l", "select-window", "-t", "vee:logs"); err != nil {
+	// Ctrl-b l: show logs in a popup (Esc or q to dismiss)
+	logPopupCmd := fmt.Sprintf("%s _log-viewer --port %d", shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "l", "display-popup", "-E", "-w", "90%", "-h", "80%", logPopupCmd); err != nil {
 		return fmt.Errorf("tmux bind-key l: %w", err)
 	}
 

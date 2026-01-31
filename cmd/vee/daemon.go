@@ -120,6 +120,7 @@ func setupHTTPMux(app *App, zettelkasten bool) *http.ServeMux {
 	mux.HandleFunc("/api/config", handleConfig(app))
 	mux.HandleFunc("/api/suspend", handleSuspend(app))
 	mux.HandleFunc("/api/activate", handleActivate(app))
+	mux.HandleFunc("/api/preview", handlePreview(app))
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	return mux
 }
@@ -261,6 +262,33 @@ func handleActivate(app *App) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "active"})
+	}
+}
+
+// handlePreview handles POST /api/preview to update a session's preview text.
+func handlePreview(app *App) http.HandlerFunc {
+	type previewReq struct {
+		SessionID string `json:"session_id"`
+		Preview   string `json:"preview"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req previewReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		app.Sessions.setPreview(req.SessionID, req.Preview)
+		slog.Debug("preview updated", "session", req.SessionID, "preview", req.Preview)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
 

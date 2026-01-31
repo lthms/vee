@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -109,9 +110,11 @@ type reportModeChangeArgs struct {
 	Indicator string `json:"indicator" jsonschema:"The emoji indicator for the mode (e.g. 🦊, ⚡, 😈)"`
 }
 
-// newServer creates a fresh MCP server with all tools registered.
+type requestSuspendArgs struct{}
+
+// newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
-func (cmd *DaemonCmd) newServer(tracker *modeTracker) *mcp.Server {
+func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
 		Version: "1.0.0",
@@ -122,7 +125,7 @@ func (cmd *DaemonCmd) newServer(tracker *modeTracker) *mcp.Server {
 		Description: "Report a mode transition. Call this every time you switch modes.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args reportModeChangeArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("report_mode_change called", "mode", args.Mode, "indicator", args.Indicator)
-		tracker.record(args.Mode, args.Indicator)
+		app.Tracker.record(args.Mode, args.Indicator)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: fmt.Sprintf("Mode changed to %s.", args.Mode)},
@@ -130,7 +133,26 @@ func (cmd *DaemonCmd) newServer(tracker *modeTracker) *mcp.Server {
 		}, nil, nil
 	})
 
-	if cmd.Zettelkasten {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "request_suspend",
+		Description: "Request that the current Vee session be suspended so it can be resumed later.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args requestSuspendArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("request_suspend called")
+		if app.Control.requestSuspend() {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "Suspend requested."},
+				},
+			}, nil, nil
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "No active session to suspend."},
+			},
+		}, nil, nil
+	})
+
+	if zettelkasten {
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "kb_traverse",
 			Description: "Traverse a knowledge base index tree to find notes relevant to a topic. Returns a JSON array of {path, summary} pairs.",
@@ -140,33 +162,51 @@ func (cmd *DaemonCmd) newServer(tracker *modeTracker) *mcp.Server {
 	return server
 }
 
-// Run starts the daemon: MCP server (SSE) + dashboard on the same HTTP port.
-func (cmd *DaemonCmd) Run() error {
-	tracker := newModeTracker()
-	tracer := newToolTracer()
-
+// setupHTTPMux creates an http.ServeMux with all routes registered.
+func setupHTTPMux(app *App, zettelkasten bool) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
-		return cmd.newServer(tracker)
+		return newMCPServer(app, zettelkasten)
 	}, nil)
 
 	mux := http.NewServeMux()
 	mux.Handle("/sse", sseHandler)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(dashboardHTML))
-	})
-	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		currentMode, currentIndicator, transitions := tracker.snapshot()
-		traces := tracer.snapshot()
+	mux.HandleFunc("/", handleDashboard)
+	mux.HandleFunc("/api/state", handleState(app))
+	mux.HandleFunc("/api/mode", handleModeChange(app))
+	mux.HandleFunc("/api/tool-trace", handleToolTrace(app))
+	return mux
+}
+
+func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(dashboardHTML))
+}
+
+func handleState(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		currentMode, currentIndicator, transitions := app.Tracker.snapshot()
+		traces := app.Tracer.snapshot()
+
+		var activeSession *Session
+		if s := app.Sessions.active(); s != nil {
+			activeSession = s
+		}
+		suspendedSessions := app.Sessions.suspended()
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"current_mode":      currentMode,
-			"current_indicator": currentIndicator,
-			"transitions":       transitions,
-			"tool_traces":       traces,
+			"current_mode":       currentMode,
+			"current_indicator":  currentIndicator,
+			"transitions":        transitions,
+			"tool_traces":        traces,
+			"active_session":     activeSession,
+			"suspended_sessions": suspendedSessions,
 		})
-	})
-	mux.HandleFunc("/api/mode", func(w http.ResponseWriter, r *http.Request) {
+	}
+}
+
+func handleModeChange(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -179,11 +219,14 @@ func (cmd *DaemonCmd) Run() error {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		tracker.record(body.Mode, body.Indicator)
+		app.Tracker.record(body.Mode, body.Indicator)
 		slog.Debug("mode change via HTTP", "mode", body.Mode, "indicator", body.Indicator)
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/tool-trace", func(w http.ResponseWriter, r *http.Request) {
+	}
+}
+
+func handleToolTrace(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -196,11 +239,38 @@ func (cmd *DaemonCmd) Run() error {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		tracer.record(body.Tool, body.Input)
+		app.Tracer.record(body.Tool, body.Input)
 		slog.Debug("tool-trace recorded", "tool", body.Tool)
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}
+}
 
+// startHTTPServerInBackground starts the HTTP server on the given port in a
+// goroutine and returns the *http.Server for later shutdown.
+func startHTTPServerInBackground(app *App, port int, zettelkasten bool) (*http.Server, error) {
+	mux := setupHTTPMux(app, zettelkasten)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	srv := &http.Server{Handler: mux}
+	go func() {
+		slog.Info("http server listening", "addr", addr)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			slog.Error("http server error", "error", err)
+		}
+	}()
+
+	return srv, nil
+}
+
+// Run starts the daemon: MCP server (SSE) + dashboard on the same HTTP port.
+func (cmd *DaemonCmd) Run() error {
+	app := newApp()
+	mux := setupHTTPMux(app, cmd.Zettelkasten)
 	addr := fmt.Sprintf("127.0.0.1:%d", cmd.Port)
 	slog.Info("daemon listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
@@ -231,6 +301,7 @@ const dashboardHTML = `<!DOCTYPE html>
   :root {
     --bg: #1a1b26; --fg: #a9b1d6; --accent: #7aa2f7;
     --card-bg: #24283b; --border: #414868;
+    --green: #9ece6a; --yellow: #e0af68;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -245,6 +316,23 @@ const dashboardHTML = `<!DOCTYPE html>
   }
   .current-mode .label { font-size: 0.85rem; color: #565f89; text-transform: uppercase; letter-spacing: 0.1em; }
   .current-mode .mode { font-size: 2rem; margin-top: 0.5rem; }
+  .session-card {
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1rem;
+  }
+  .session-card .session-header {
+    display: flex; align-items: center; gap: 0.75rem; font-size: 1.1rem;
+  }
+  .session-card .session-meta {
+    font-size: 0.8rem; color: #565f89; margin-top: 0.4rem;
+  }
+  .session-card .session-preview {
+    font-size: 0.85rem; color: var(--fg); margin-top: 0.3rem;
+    opacity: 0.8; font-style: italic;
+  }
+  .session-card.active { border-color: var(--green); }
+  .session-card.suspended { border-color: var(--yellow); }
+  .empty-state { color: #565f89; font-size: 0.85rem; font-style: italic; margin-bottom: 1rem; }
   .timeline { list-style: none; }
   .timeline li {
     display: flex; align-items: center; gap: 1rem;
@@ -271,14 +359,46 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="label">Current Mode</div>
     <div class="mode" id="current"></div>
   </div>
-  <h2>Tool Traces</h2>
+  <h2>Active Session</h2>
+  <div id="active-session"></div>
+  <h2>Suspended Sessions</h2>
+  <div id="suspended-sessions"></div>
+  <h2 style="margin-top: 1rem;">Tool Traces</h2>
   <ul class="tool-traces" id="traces"></ul>
   <h2 style="margin-top: 2rem;">Mode History</h2>
   <ul class="timeline" id="timeline"></ul>
   <script>
+    function age(ts) {
+      const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s/60) + "m";
+      return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
+    }
+    function sessionCard(s, cls) {
+      return '<div class="session-card ' + cls + '">' +
+        '<div class="session-header"><span>' + s.indicator + '</span><span>' + s.mode + '</span></div>' +
+        (s.preview ? '<div class="session-preview">' + s.preview + '</div>' : '') +
+        '<div class="session-meta">' + age(s.started_at) + ' ago</div>' +
+        '</div>';
+    }
     function render(data) {
-      const ind = data.current_indicator || "❓";
+      const ind = data.current_indicator || "?";
       document.getElementById("current").textContent = ind + " " + data.current_mode;
+
+      const aDiv = document.getElementById("active-session");
+      if (data.active_session) {
+        aDiv.innerHTML = sessionCard(data.active_session, "active");
+      } else {
+        aDiv.innerHTML = '<div class="empty-state">No active session</div>';
+      }
+
+      const sDiv = document.getElementById("suspended-sessions");
+      const suspended = data.suspended_sessions || [];
+      if (suspended.length === 0) {
+        sDiv.innerHTML = '<div class="empty-state">No suspended sessions</div>';
+      } else {
+        sDiv.innerHTML = suspended.map(function(s) { return sessionCard(s, "suspended"); }).join("");
+      }
 
       const tul = document.getElementById("traces");
       tul.innerHTML = "";
@@ -296,7 +416,7 @@ const dashboardHTML = `<!DOCTYPE html>
       for (const t of items) {
         const li = document.createElement("li");
         const ti = new Date(t.timestamp).toLocaleTimeString();
-        const mInd = t.indicator || "❓";
+        const mInd = t.indicator || "?";
         li.innerHTML = '<span class="time">' + ti + '</span><span class="indicator">' + mInd + '</span><span class="mode-name">' + t.mode + '</span>';
         ul.appendChild(li);
       }
@@ -312,4 +432,3 @@ const dashboardHTML = `<!DOCTYPE html>
   </script>
 </body>
 </html>`
-

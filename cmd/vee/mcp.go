@@ -16,18 +16,20 @@ type traverseArgs struct {
 	Topic  string `json:"topic" jsonschema:"The subject to search for"`
 }
 
-func runMCPServer() error {
+func runMCPServer(zettelkasten bool) error {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "vee-zettelkasten",
+		Name:    "vee",
 		Version: "1.0.0",
 	}, nil)
 
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "kb_traverse",
-		Description: "Traverse a knowledge base index tree to find notes relevant to a topic. Returns a JSON array of {path, summary} pairs.",
-	}, handleTraverse)
+	if zettelkasten {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "kb_traverse",
+			Description: "Traverse a knowledge base index tree to find notes relevant to a topic. Returns a JSON array of {path, summary} pairs.",
+		}, handleTraverse)
+	}
 
-	slog.Debug("starting MCP server")
+	slog.Debug("starting MCP server", "zettelkasten", zettelkasten)
 	return server.Run(context.Background(), &mcp.StdioTransport{})
 }
 
@@ -46,14 +48,21 @@ func handleTraverse(ctx context.Context, req *mcp.CallToolRequest, args traverse
 	}, nil, nil
 }
 
-func ensureMCPServer() error {
+func ensureMCPServer(zettelkasten bool) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
+	// Build the expected command line for the MCP server
+	mcpArgs := []string{"mcp"}
+	if zettelkasten {
+		mcpArgs = append(mcpArgs, "-z")
+	}
+	expectedCmd := self
+
 	// Check if already configured with the correct binary path
-	cmd := exec.Command("claude", "mcp", "get", "vee-zettelkasten")
+	cmd := exec.Command("claude", "mcp", "get", "vee")
 	output, err := cmd.Output()
 	if err == nil {
 		// Parse the Command: line from the output
@@ -61,13 +70,13 @@ func ensureMCPServer() error {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "Command:") {
 				registered := strings.TrimSpace(strings.TrimPrefix(line, "Command:"))
-				if registered == self {
-					slog.Debug("MCP server already configured", "command", self)
+				if registered == expectedCmd {
+					slog.Debug("MCP server already configured", "command", expectedCmd)
 					return nil
 				}
-				slog.Debug("MCP server command mismatch, re-registering", "registered", registered, "expected", self)
+				slog.Debug("MCP server command mismatch, re-registering", "registered", registered, "expected", expectedCmd)
 				// Remove stale config before re-adding
-				rmCmd := exec.Command("claude", "mcp", "remove", "vee-zettelkasten", "-s", "local")
+				rmCmd := exec.Command("claude", "mcp", "remove", "vee", "-s", "local")
 				_ = rmCmd.Run()
 				break
 			}
@@ -75,7 +84,8 @@ func ensureMCPServer() error {
 	}
 
 	fmt.Printf("Configuring Vee MCP server...\n")
-	addCmd := exec.Command("claude", "mcp", "add", "vee-zettelkasten", self, "mcp")
+	addArgs := append([]string{"mcp", "add", "vee", self}, mcpArgs...)
+	addCmd := exec.Command("claude", addArgs...)
 	if err := addCmd.Run(); err != nil {
 		return fmt.Errorf("failed to configure MCP server: %w", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -18,24 +19,28 @@ var systemPrompt string
 // claudeArgs holds the arguments after "--" that are forwarded to claude.
 type claudeArgs []string
 
+
 // CLI is the top-level command structure for vee.
 type CLI struct {
 	Debug bool   `env:"VEE_DEBUG" help:"Enable debug logging."`
-	Run   RunCmd `cmd:"" default:"1" hidden:"" help:"Start an interactive Vee session."`
+	Start StartCmd `cmd:"" help:"Start an interactive Vee session."`
 	MCP   MCPCmd `cmd:"" help:"Run the built-in MCP server."`
 }
 
-// RunCmd is the default command that execs into claude.
-type RunCmd struct{}
+// StartCmd is the default command that execs into claude.
+type StartCmd struct {
+	VeePath      string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
+	Zettelkasten bool   `short:"z" help:"Enable the vee-zettelkasten plugin." name:"zettelkasten"`
+}
 
 // Run starts a Vee session by exec-ing into claude with the composed system prompt.
-func (cmd *RunCmd) Run(args claudeArgs) error {
+func (cmd *StartCmd) Run(args claudeArgs) error {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude not found in PATH: %w", err)
 	}
 
-	if err := ensureMCPServer(); err != nil {
+	if err := ensureMCPServer(cmd.Zettelkasten); err != nil {
 		return fmt.Errorf("MCP server check failed: %w", err)
 	}
 
@@ -48,17 +53,23 @@ func (cmd *RunCmd) Run(args claudeArgs) error {
 	slog.Debug("composed system prompt", "content", fullPrompt)
 
 	finalArgs := buildArgs([]string(args), fullPrompt)
+	finalArgs = append(finalArgs, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee"))
+	if cmd.Zettelkasten {
+		finalArgs = append(finalArgs, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee-zettelkasten"))
+	}
 	slog.Debug("built args", "argCount", len(finalArgs))
 
 	return syscall.Exec(claudePath, append([]string{"claude"}, finalArgs...), os.Environ())
 }
 
 // MCPCmd runs the built-in MCP server.
-type MCPCmd struct{}
+type MCPCmd struct {
+	Zettelkasten bool `short:"z" help:"Enable the vee-zettelkasten tools." name:"zettelkasten"`
+}
 
 // Run starts the MCP server.
 func (cmd *MCPCmd) Run() error {
-	return runMCPServer()
+	return runMCPServer(cmd.Zettelkasten)
 }
 
 // splitAtDashDash splits args at the first "--".
@@ -80,7 +91,6 @@ func main() {
 		kong.Name("vee"),
 		kong.Description("A modal code assistant built on top of Claude Code."),
 		kong.UsageOnError(),
-		kong.Bind(claudeArgs(claudePassthrough)),
 		kong.Exit(func(code int) {
 			os.Exit(code)
 		}),
@@ -93,6 +103,8 @@ func main() {
 	parser.FatalIfErrorf(err)
 
 	setupLogger(cli.Debug)
+
+	ctx.Bind(claudeArgs(claudePassthrough))
 
 	err = ctx.Run()
 	ctx.FatalIfErrorf(err)

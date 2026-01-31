@@ -95,6 +95,7 @@ type CLI struct {
 	Daemon        DaemonCmd        `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
 	NewPane       NewPaneCmd       `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
 	Dashboard     DashboardCmd     `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
+	SessionPicker SessionPickerCmd `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive mode picker."`
 	SuspendWindow SuspendWindowCmd `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
 	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
 	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
@@ -118,6 +119,10 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	if err != nil {
 		return fmt.Errorf("failed to read project config: %w", err)
 	}
+
+	// Redirect slog to a file so it can be viewed in the logs window
+	logFile := fmt.Sprintf("/tmp/vee-%d.log", cmd.Port)
+	setupFileLogger(logFile)
 
 	app := newApp()
 
@@ -146,11 +151,17 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	dashboardShellCmd := fmt.Sprintf("%s _dashboard --port %d", shelljoin(veeBinary), cmd.Port)
 
 	// Create or reuse tmux session
-	if !tmuxSessionExists() {
-		if err := tmuxCreateSession(dashboardShellCmd); err != nil {
-			return fmt.Errorf("failed to create tmux session: %w", err)
-		}
+	if tmuxSessionExists() {
+		// Kill the stale session so we start fresh with a dashboard
+		tmuxRun("kill-session", "-t", "vee")
 	}
+	if err := tmuxCreateSession(dashboardShellCmd); err != nil {
+		return fmt.Errorf("failed to create tmux session: %w", err)
+	}
+
+	// Create a logs window tailing the log file
+	tmuxNewWindow("logs", fmt.Sprintf("tail -f %s", logFile))
+	tmuxRun("select-window", "-t", "vee:0")
 
 	// Apply tmux configuration (idempotent)
 	if err := tmuxConfigure(veeBinary, cmd.Port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
@@ -158,7 +169,10 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 
 	// Attach to tmux — blocks until detach or session end
-	return tmuxAttach()
+	err = tmuxAttach()
+	// Clear the terminal to suppress tmux's [exited] message
+	fmt.Print("\033[H\033[2J")
+	return err
 }
 
 // NewPaneCmd is the internal subcommand called by tmux display-menu entries.
@@ -167,6 +181,7 @@ type NewPaneCmd struct {
 	Zettelkasten bool   `short:"z" name:"zettelkasten"`
 	Port         int    `short:"p" default:"2700" name:"port"`
 	Mode         string `required:"" name:"mode"`
+	Prompt       string `name:"prompt" help:"Initial prompt for the session."`
 }
 
 // Run creates a new tmux window with a Claude session for the given mode.
@@ -201,7 +216,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs)
+	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
 
 	// Create the tmux window first so we have the window ID
@@ -372,7 +387,7 @@ func (cmd *ResumeSessionCmd) Run() error {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs)
+	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
 
 	windowID, err := tmuxNewWindow(windowName, shellCmd)
@@ -398,12 +413,15 @@ func (cmd *ResumeSessionCmd) Run() error {
 
 // buildWindowShellCmd constructs the shell command for a tmux window:
 //
-//	claude <args>; vee _session-ended --port <port> --session-id <id>
+//	claude <args> [prompt]; vee _session-ended --port <port> --session-id <id>
 //
 // The cleanup tail ensures the daemon is notified when Claude exits for any reason.
-func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArgs []string) string {
+func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArgs []string, prompt string) string {
 	var cmdParts []string
 	cmdParts = append(cmdParts, "claude")
+	if prompt != "" {
+		cmdParts = append(cmdParts, shelljoin(prompt))
+	}
 	for _, arg := range claudeArgs {
 		cmdParts = append(cmdParts, shelljoin(arg))
 	}
@@ -484,6 +502,19 @@ func setupLogger(debug bool) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
+	}))
+	slog.SetDefault(logger)
+}
+
+// setupFileLogger redirects slog to a file at debug level.
+func setupFileLogger(path string) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		slog.Warn("failed to open log file, keeping stderr", "path", path, "error", err)
+		return
+	}
+	logger := slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
 	}))
 	slog.SetDefault(logger)
 }

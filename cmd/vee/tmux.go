@@ -113,10 +113,10 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 		}
 	}
 
-	// Rebind Ctrl-b c to the mode picker menu
-	menuArgs := buildModeMenuArgs(veeBinary, port, veePath, zettelkasten, passthrough)
-	if _, err := tmuxRun(menuArgs...); err != nil {
-		return fmt.Errorf("tmux bind-key menu: %w", err)
+	// Rebind Ctrl-b c to the session picker popup
+	pickerCmd := buildPickerPopupCmd(veeBinary, port, veePath, zettelkasten, passthrough)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "c", "display-popup", "-E", "-w", "80", "-h", "20", pickerCmd); err != nil {
+		return fmt.Errorf("tmux bind-key picker: %w", err)
 	}
 
 	// Ctrl-b q: kill the vee session
@@ -136,50 +136,33 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 		return fmt.Errorf("tmux bind-key r: %w", err)
 	}
 
+	// Ctrl-b l: jump to logs window
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "l", "select-window", "-t", "vee:logs"); err != nil {
+		return fmt.Errorf("tmux bind-key l: %w", err)
+	}
+
 	return nil
 }
 
-// buildModeMenuArgs constructs the tmux bind-key command that opens a
-// display-menu with one entry per Vee mode. Each entry runs:
-//
-//	vee _new-pane --vee-path=... --port=... --mode=<mode> [-- claude-args]
-func buildModeMenuArgs(veeBinary string, port int, veePath string, zettelkasten bool, passthrough []string) []string {
-	args := []string{"bind-key", "-T", "prefix", "c", "display-menu", "-T", "New Session"}
-
-	for _, name := range modeOrder {
-		mode, ok := modeRegistry[name]
-		if !ok {
-			continue
-		}
-
-		label := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
-
-		// Build the vee _new-pane command
-		var cmdParts []string
-		cmdParts = append(cmdParts, shelljoin(veeBinary))
-		cmdParts = append(cmdParts, "_new-pane")
-		cmdParts = append(cmdParts, "--vee-path", shelljoin(veePath))
-		cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", port))
-		if zettelkasten {
-			cmdParts = append(cmdParts, "-z")
-		}
-		cmdParts = append(cmdParts, "--mode", name)
-
-		if len(passthrough) > 0 {
-			cmdParts = append(cmdParts, "--")
-			for _, p := range passthrough {
-				cmdParts = append(cmdParts, shelljoin(p))
-			}
-		}
-
-		shellCmd := strings.Join(cmdParts, " ")
-
-		// display-menu format: label, key-shortcut, action
-		// Use empty string for key shortcut (no accelerator)
-		args = append(args, label, "", "run-shell "+shelljoin(shellCmd))
+// buildPickerPopupCmd constructs the shell command for the session picker popup.
+func buildPickerPopupCmd(veeBinary string, port int, veePath string, zettelkasten bool, passthrough []string) string {
+	var cmdParts []string
+	cmdParts = append(cmdParts, shelljoin(veeBinary))
+	cmdParts = append(cmdParts, "_session-picker")
+	cmdParts = append(cmdParts, "--vee-path", shelljoin(veePath))
+	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", port))
+	if zettelkasten {
+		cmdParts = append(cmdParts, "-z")
 	}
 
-	return args
+	if len(passthrough) > 0 {
+		cmdParts = append(cmdParts, "--")
+		for _, p := range passthrough {
+			cmdParts = append(cmdParts, shelljoin(p))
+		}
+	}
+
+	return strings.Join(cmdParts, " ")
 }
 
 // shelljoin quotes a string for safe use in a shell command if it contains

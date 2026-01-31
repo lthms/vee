@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // DashboardCmd is the internal subcommand that renders a session dashboard in the terminal.
@@ -37,6 +39,19 @@ type dashboardState struct {
 
 // Run starts the dashboard TUI loop.
 func (cmd *DashboardCmd) Run() error {
+	// Raw mode so keystrokes don't echo on screen
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err == nil {
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+		// Drain stdin in background so keypresses are silently consumed
+		go func() {
+			buf := make([]byte, 64)
+			for {
+				os.Stdin.Read(buf)
+			}
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -78,7 +93,7 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString("\033[2J\033[H\033[?25l")
 
 	// Header
-	sb.WriteString("\n")
+	sb.WriteString("\r\n")
 	sb.WriteString("  ")
 	sb.WriteString(ansiAccent)
 	sb.WriteString(ansiBold)
@@ -87,14 +102,14 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString(ansiDim)
 	sb.WriteString(" — Modal Code Assistant")
 	sb.WriteString(ansiReset)
-	sb.WriteString("\n\n")
+	sb.WriteString("\r\n\r\n")
 
 	if state == nil {
 		sb.WriteString("  ")
 		sb.WriteString(ansiMuted)
 		sb.WriteString("Connecting to daemon...")
 		sb.WriteString(ansiReset)
-		sb.WriteString("\n")
+		sb.WriteString("\r\n")
 	} else {
 		// Active sessions
 		cmd.renderSection(&sb, "ACTIVE", state.Active, ansiGreen)
@@ -105,7 +120,7 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	}
 
 	// Keybindings footer
-	sb.WriteString("\n")
+	sb.WriteString("\r\n")
 	sb.WriteString("  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("Ctrl-b c")
@@ -119,7 +134,7 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString("Ctrl-b d")
 	sb.WriteString(ansiReset)
 	sb.WriteString(" detach")
-	sb.WriteString("\n")
+	sb.WriteString("\r\n")
 
 	fmt.Print(sb.String())
 }
@@ -129,7 +144,7 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 	sb.WriteString(ansiMuted)
 	sb.WriteString(title)
 	sb.WriteString(ansiReset)
-	sb.WriteString("\n")
+	sb.WriteString("\r\n")
 
 	if len(sessions) == 0 {
 		sb.WriteString("    ")
@@ -137,7 +152,7 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 		sb.WriteString(ansiItalic)
 		sb.WriteString("none")
 		sb.WriteString(ansiReset)
-		sb.WriteString("\n\n")
+		sb.WriteString("\r\n\r\n")
 		return
 	}
 
@@ -170,9 +185,9 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 			sb.WriteString(ansiReset)
 		}
 
-		sb.WriteString("\n")
+		sb.WriteString("\r\n")
 	}
-	sb.WriteString("\n")
+	sb.WriteString("\r\n")
 }
 
 func formatAge(d time.Duration) string {

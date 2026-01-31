@@ -87,7 +87,14 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer os.Remove(mcpConfigFile)
 
+	settingsFile, err := writeSettings(cmd.Port)
+	if err != nil {
+		return fmt.Errorf("failed to write settings: %w", err)
+	}
+	defer os.Remove(settingsFile)
+
 	finalArgs = append(finalArgs, "--mcp-config", mcpConfigFile)
+	finalArgs = append(finalArgs, "--settings", settingsFile)
 
 	slog.Debug("built args", "argCount", len(finalArgs))
 
@@ -204,6 +211,42 @@ func writeMCPConfig(port int) (string, error) {
 	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, port)
 
 	f, err := os.CreateTemp("", "vee-mcp-*.json")
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	return f.Name(), nil
+}
+
+func writeSettings(port int) (string, error) {
+	content := fmt.Sprintf(`{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat | curl -s -X POST -H 'Content-Type: application/json' -d @- http://127.0.0.1:%d/api/tool-trace"
+          }
+        ]
+      }
+    ]
+  }
+}`, port)
+
+	f, err := os.CreateTemp("", "vee-settings-*.json")
 	if err != nil {
 		return "", err
 	}

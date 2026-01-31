@@ -33,6 +33,41 @@ type modeTracker struct {
 	transitions      []modeTransition
 }
 
+// toolTrace records a single tool call received from a hook.
+type toolTrace struct {
+	Tool      string    `json:"tool"`
+	Input     any       `json:"input,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// toolTracer keeps an in-memory log of tool calls.
+type toolTracer struct {
+	mu     sync.RWMutex
+	traces []toolTrace
+}
+
+func newToolTracer() *toolTracer {
+	return &toolTracer{}
+}
+
+func (t *toolTracer) record(tool string, input any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.traces = append(t.traces, toolTrace{
+		Tool:      tool,
+		Input:     input,
+		Timestamp: time.Now(),
+	})
+}
+
+func (t *toolTracer) snapshot() []toolTrace {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cp := make([]toolTrace, len(t.traces))
+	copy(cp, t.traces)
+	return cp
+}
+
 func newModeTracker() *modeTracker {
 	initial := modeTransition{Mode: "normal", Indicator: "🦊", Timestamp: time.Now()}
 	return &modeTracker{
@@ -108,6 +143,7 @@ func (cmd *DaemonCmd) newServer(tracker *modeTracker) *mcp.Server {
 // Run starts the daemon: MCP server (SSE) + dashboard on the same HTTP port.
 func (cmd *DaemonCmd) Run() error {
 	tracker := newModeTracker()
+	tracer := newToolTracer()
 
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		return cmd.newServer(tracker)
@@ -121,12 +157,31 @@ func (cmd *DaemonCmd) Run() error {
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		currentMode, currentIndicator, transitions := tracker.snapshot()
+		traces := tracer.snapshot()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"current_mode":      currentMode,
 			"current_indicator": currentIndicator,
 			"transitions":       transitions,
+			"tool_traces":       traces,
 		})
+	})
+	mux.HandleFunc("/api/tool-trace", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Tool  string `json:"tool_name"`
+			Input any    `json:"tool_input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		tracer.record(body.Tool, body.Input)
+		slog.Debug("tool-trace recorded", "tool", body.Tool)
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cmd.Port)
@@ -182,6 +237,15 @@ const dashboardHTML = `<!DOCTYPE html>
   .timeline .time { color: #565f89; font-size: 0.8rem; min-width: 8rem; }
   .timeline .mode-name { color: var(--fg); }
   .timeline .indicator { font-size: 1.2rem; }
+  h2 { color: #565f89; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.75rem; }
+  .tool-traces { list-style: none; }
+  .tool-traces li {
+    display: flex; align-items: center; gap: 1rem;
+    padding: 0.5rem 0; border-bottom: 1px solid var(--border);
+  }
+  .tool-traces li:last-child { border-bottom: none; }
+  .tool-traces .time { color: #565f89; font-size: 0.8rem; min-width: 8rem; }
+  .tool-traces .tool-name { color: var(--accent); font-weight: bold; }
 </style>
 </head>
 <body>
@@ -190,12 +254,25 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="label">Current Mode</div>
     <div class="mode" id="current"></div>
   </div>
-  <h2 style="color: #565f89; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.75rem;">Mode History</h2>
+  <h2>Tool Traces</h2>
+  <ul class="tool-traces" id="traces"></ul>
+  <h2 style="margin-top: 2rem;">Mode History</h2>
   <ul class="timeline" id="timeline"></ul>
   <script>
     function render(data) {
       const ind = data.current_indicator || "❓";
       document.getElementById("current").textContent = ind + " " + data.current_mode;
+
+      const tul = document.getElementById("traces");
+      tul.innerHTML = "";
+      const traces = [...(data.tool_traces || [])].reverse();
+      for (const t of traces) {
+        const li = document.createElement("li");
+        const ti = new Date(t.timestamp).toLocaleTimeString();
+        li.innerHTML = '<span class="time">' + ti + '</span><span class="tool-name">' + t.tool + '</span>';
+        tul.appendChild(li);
+      }
+
       const ul = document.getElementById("timeline");
       ul.innerHTML = "";
       const items = [...data.transitions].reverse();

@@ -81,8 +81,13 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		finalArgs = append(finalArgs, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee-zettelkasten"))
 	}
 
-	mcpConfig := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, cmd.Port)
-	finalArgs = append(finalArgs, "--mcp-config", mcpConfig)
+	mcpConfigFile, err := writeMCPConfig(cmd.Port)
+	if err != nil {
+		return fmt.Errorf("failed to write MCP config: %w", err)
+	}
+	defer os.Remove(mcpConfigFile)
+
+	finalArgs = append(finalArgs, "--mcp-config", mcpConfigFile)
 
 	slog.Debug("built args", "argCount", len(finalArgs))
 
@@ -193,6 +198,28 @@ func composeSystemPrompt(base, projectConfig string) string {
 	sb.WriteString(projectConfig)
 	sb.WriteString("\n</project_setup>\n")
 	return sb.String()
+}
+
+func writeMCPConfig(port int) (string, error) {
+	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, port)
+
+	f, err := os.CreateTemp("", "vee-mcp-*.json")
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	return f.Name(), nil
 }
 
 func buildArgs(originalArgs []string, systemPromptContent string) []string {

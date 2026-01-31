@@ -1,5 +1,7 @@
 ---
 description: Have Vee challenge you mercilessly
+user-invocable: true
+disable-model-invocation: true
 ---
 
 Switch to mode: contradictor.

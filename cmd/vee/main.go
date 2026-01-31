@@ -8,32 +8,99 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+
+	"github.com/alecthomas/kong"
 )
 
 //go:embed system_prompt.md
 var systemPrompt string
 
-func main() {
-	setupLogger()
+// claudeArgs holds the arguments after "--" that are forwarded to claude.
+type claudeArgs []string
 
-	// Handle mcp subcommand
-	if len(os.Args) > 1 && os.Args[1] == "mcp" {
-		if err := runMCPServer(); err != nil {
-			fmt.Fprintf(os.Stderr, "vee mcp: %v\n", err)
-			os.Exit(1)
-		}
-		return
+// CLI is the top-level command structure for vee.
+type CLI struct {
+	Debug bool   `env:"VEE_DEBUG" help:"Enable debug logging."`
+	Run   RunCmd `cmd:"" default:"1" hidden:"" help:"Start an interactive Vee session."`
+	MCP   MCPCmd `cmd:"" help:"Run the built-in MCP server."`
+}
+
+// RunCmd is the default command that execs into claude.
+type RunCmd struct{}
+
+// Run starts a Vee session by exec-ing into claude with the composed system prompt.
+func (cmd *RunCmd) Run(args claudeArgs) error {
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found in PATH: %w", err)
 	}
 
-	if err := run(); err != nil {
+	if err := ensureMCPServer(); err != nil {
+		return fmt.Errorf("MCP server check failed: %w", err)
+	}
+
+	projectConfig, err := readProjectConfig()
+	if err != nil {
+		return fmt.Errorf("failed to read project config: %w", err)
+	}
+
+	fullPrompt := composeSystemPrompt(systemPrompt, projectConfig)
+	slog.Debug("composed system prompt", "content", fullPrompt)
+
+	finalArgs := buildArgs([]string(args), fullPrompt)
+	slog.Debug("built args", "argCount", len(finalArgs))
+
+	return syscall.Exec(claudePath, append([]string{"claude"}, finalArgs...), os.Environ())
+}
+
+// MCPCmd runs the built-in MCP server.
+type MCPCmd struct{}
+
+// Run starts the MCP server.
+func (cmd *MCPCmd) Run() error {
+	return runMCPServer()
+}
+
+// splitAtDashDash splits args at the first "--".
+// Returns (before, after). The "--" itself is consumed.
+func splitAtDashDash(args []string) (before, after []string) {
+	for i, arg := range args {
+		if arg == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
+}
+
+func main() {
+	veeArgs, claudePassthrough := splitAtDashDash(os.Args[1:])
+
+	cli := CLI{}
+	parser, err := kong.New(&cli,
+		kong.Name("vee"),
+		kong.Description("A modal code assistant built on top of Claude Code."),
+		kong.UsageOnError(),
+		kong.Bind(claudeArgs(claudePassthrough)),
+		kong.Exit(func(code int) {
+			os.Exit(code)
+		}),
+	)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "vee: %v\n", err)
 		os.Exit(1)
 	}
+	ctx, err := parser.Parse(veeArgs)
+	parser.FatalIfErrorf(err)
+
+	setupLogger(cli.Debug)
+
+	err = ctx.Run()
+	ctx.FatalIfErrorf(err)
 }
 
-func setupLogger() {
+func setupLogger(debug bool) {
 	level := slog.LevelInfo
-	if os.Getenv("VEE_DEBUG") != "" {
+	if debug {
 		level = slog.LevelDebug
 	}
 
@@ -41,36 +108,6 @@ func setupLogger() {
 		Level: level,
 	}))
 	slog.SetDefault(logger)
-}
-
-func run() error {
-	// Find claude binary
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return fmt.Errorf("claude not found in PATH: %w", err)
-	}
-
-	// Ensure MCP server is configured
-	if err := ensureMCPServer(); err != nil {
-		return fmt.Errorf("MCP server check failed: %w", err)
-	}
-
-	// Read project config
-	projectConfig, err := readProjectConfig()
-	if err != nil {
-		return fmt.Errorf("failed to read project config: %w", err)
-	}
-
-	// Compose full system prompt
-	fullPrompt := composeSystemPrompt(systemPrompt, projectConfig)
-	slog.Debug("composed system prompt", "content", fullPrompt)
-
-	// Build arguments
-	args := buildArgs(os.Args[1:], fullPrompt)
-	slog.Debug("built args", "argCount", len(args))
-
-	// Exec into claude
-	return syscall.Exec(claudePath, append([]string{"claude"}, args...), os.Environ())
 }
 
 func readProjectConfig() (string, error) {
@@ -103,8 +140,6 @@ func buildArgs(originalArgs []string, systemPromptContent string) []string {
 	var userAppendPrompt string
 	skipNext := false
 
-	// Parse original args to find --append-system-prompt (we merge it with ours)
-	// All other args pass through unchanged, including --plugin-dir
 	for i, arg := range originalArgs {
 		if skipNext {
 			skipNext = false
@@ -125,7 +160,6 @@ func buildArgs(originalArgs []string, systemPromptContent string) []string {
 		args = append(args, arg)
 	}
 
-	// Compose final system prompt (ours + user's)
 	finalPrompt := systemPromptContent
 	if userAppendPrompt != "" {
 		finalPrompt = finalPrompt + "\n\n" + userAppendPrompt

@@ -1,5 +1,8 @@
 ---
 description: Trust Vee to perform a task on your behalf
+user-invocable: true
+disable-model-invocation: true
+allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, Task, NotebookEdit
 ---
 
 <mode name="vibe">

@@ -40,7 +40,8 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		Description: "Request that the current Vee session be suspended so it can be resumed later.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args requestSuspendArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("request_suspend called")
-		if app.Control.requestSuspend() {
+		if id, ok := app.Control.requestSuspendAny(); ok {
+			slog.Debug("suspend routed to session", "session", id)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: "Suspend requested."},
@@ -59,7 +60,8 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		Description: "Signal that the current task is done. Call this when your work is complete to end the session.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args selfDropArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("self_drop called")
-		if app.Control.requestSelfDrop() {
+		if id, ok := app.Control.requestSelfDropAny(); ok {
+			slog.Debug("self-drop routed to session", "session", id)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: "Session ending."},
@@ -103,13 +105,13 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func handleState(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		activeSession := app.Sessions.active()
+		activeSessions := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
 		completedSessions := app.Sessions.completed()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"active_session":     activeSession,
+			"active_sessions":    activeSessions,
 			"suspended_sessions": suspendedSessions,
 			"completed_sessions": completedSessions,
 		})
@@ -214,8 +216,8 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="label">Current Mode</div>
     <div class="mode" id="current"></div>
   </div>
-  <h2>Active Session</h2>
-  <div id="active-session"></div>
+  <h2>Active Sessions</h2>
+  <div id="active-sessions"></div>
   <h2>Suspended Sessions</h2>
   <div id="suspended-sessions"></div>
   <h2>Completed Sessions</h2>
@@ -236,17 +238,18 @@ const dashboardHTML = `<!DOCTYPE html>
     }
     function render(data) {
       const cur = document.getElementById("current");
-      if (data.active_session) {
-        cur.textContent = data.active_session.indicator + " " + data.active_session.mode;
+      const active = data.active_sessions || [];
+      if (active.length > 0) {
+        cur.textContent = active.map(function(s) { return s.indicator + " " + s.mode; }).join(", ");
       } else {
         cur.textContent = "💤 idle";
       }
 
-      const aDiv = document.getElementById("active-session");
-      if (data.active_session) {
-        aDiv.innerHTML = sessionCard(data.active_session, "active");
+      const aDiv = document.getElementById("active-sessions");
+      if (active.length > 0) {
+        aDiv.innerHTML = active.map(function(s) { return sessionCard(s, "active"); }).join("");
       } else {
-        aDiv.innerHTML = '<div class="empty-state">No active session</div>';
+        aDiv.innerHTML = '<div class="empty-state">No active sessions</div>';
       }
 
       const sDiv = document.getElementById("suspended-sessions");

@@ -27,7 +27,7 @@ type Session struct {
 	Indicator string    `json:"indicator"`
 	StartedAt time.Time `json:"started_at"`
 	Preview   string    `json:"preview"`
-	Status    string    `json:"status"` // "active" or "suspended"
+	Status    string    `json:"status"` // "active", "suspended", or "completed"
 }
 
 // sessionStore is an in-memory store of sessions keyed by ID.
@@ -114,74 +114,124 @@ func (s *sessionStore) completed() []*Session {
 	return result
 }
 
-// active returns the currently active session, if any.
-func (s *sessionStore) active() *Session {
+// active returns all currently active sessions.
+func (s *sessionStore) active() []*Session {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	var result []*Session
 	for _, sess := range s.sessions {
 		if sess.Status == "active" {
-			return sess
+			result = append(result, sess)
 		}
 	}
-	return nil
+	return result
 }
 
-// sessionControl manages suspend and self-drop signaling for the active session.
-type sessionControl struct {
-	mu         sync.Mutex
+// sessionChannels holds the suspend and self-drop channels for a single session.
+type sessionChannels struct {
 	suspendCh  chan struct{}
 	selfDropCh chan struct{}
 }
 
+// sessionControl manages suspend and self-drop signaling for multiple sessions.
+type sessionControl struct {
+	mu       sync.Mutex
+	sessions map[string]*sessionChannels
+}
+
 func newSessionControl() *sessionControl {
-	return &sessionControl{}
+	return &sessionControl{
+		sessions: make(map[string]*sessionChannels),
+	}
 }
 
-// newSession creates buffered(1) channels for the active session and returns them.
-func (c *sessionControl) newSession() (suspend, selfDrop chan struct{}) {
+// newSessionFor creates buffered(1) channels for a session.
+func (c *sessionControl) newSessionFor(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.suspendCh = make(chan struct{}, 1)
-	c.selfDropCh = make(chan struct{}, 1)
-	return c.suspendCh, c.selfDropCh
+	c.sessions[id] = &sessionChannels{
+		suspendCh:  make(chan struct{}, 1),
+		selfDropCh: make(chan struct{}, 1),
+	}
 }
 
-// requestSuspend sends on the suspend channel (non-blocking). Returns true if sent.
-func (c *sessionControl) requestSuspend() bool {
+// channelsFor returns the suspend and self-drop channels for a session.
+func (c *sessionControl) channelsFor(id string) (suspend, selfDrop chan struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.suspendCh == nil {
+	ch, ok := c.sessions[id]
+	if !ok {
+		return nil, nil
+	}
+	return ch.suspendCh, ch.selfDropCh
+}
+
+// requestSuspendFor sends on the suspend channel for a specific session.
+func (c *sessionControl) requestSuspendFor(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch, ok := c.sessions[id]
+	if !ok {
 		return false
 	}
 	select {
-	case c.suspendCh <- struct{}{}:
+	case ch.suspendCh <- struct{}{}:
 		return true
 	default:
-		return false // already requested
+		return false
 	}
 }
 
-// requestSelfDrop sends on the self-drop channel (non-blocking). Returns true if sent.
-func (c *sessionControl) requestSelfDrop() bool {
+// requestSelfDropFor sends on the self-drop channel for a specific session.
+func (c *sessionControl) requestSelfDropFor(id string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.selfDropCh == nil {
+	ch, ok := c.sessions[id]
+	if !ok {
 		return false
 	}
 	select {
-	case c.selfDropCh <- struct{}{}:
+	case ch.selfDropCh <- struct{}{}:
 		return true
 	default:
 		return false
 	}
 }
 
-// clearSession nils out both channels.
-func (c *sessionControl) clearSession() {
+// clearSessionFor removes the channels for a session.
+func (c *sessionControl) clearSessionFor(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.suspendCh = nil
-	c.selfDropCh = nil
+	delete(c.sessions, id)
+}
+
+// requestSuspendAny sends on the suspend channel for any active session (used by MCP).
+// Returns the session ID that was suspended, or empty string if none.
+func (c *sessionControl) requestSuspendAny() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, ch := range c.sessions {
+		select {
+		case ch.suspendCh <- struct{}{}:
+			return id, true
+		default:
+		}
+	}
+	return "", false
+}
+
+// requestSelfDropAny sends on the self-drop channel for any active session (used by MCP).
+func (c *sessionControl) requestSelfDropAny() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, ch := range c.sessions {
+		select {
+		case ch.selfDropCh <- struct{}{}:
+			return id, true
+		default:
+		}
+	}
+	return "", false
 }
 
 // newUUID generates a v4 UUID using crypto/rand.

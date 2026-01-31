@@ -1,18 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"embed"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/alecthomas/kong"
 )
 
@@ -116,6 +112,11 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to read project config: %w", err)
 	}
 
+	// Set up log ring buffer for the log viewer pane and redirect slog to it
+	logBuf := newRingBuffer(10000)
+	ringHandler := newSlogRingHandler(logBuf, slog.LevelDebug)
+	slog.SetDefault(slog.New(ringHandler))
+
 	app := newApp()
 
 	srv, err := startHTTPServerInBackground(app, cmd.Port, cmd.Zettelkasten)
@@ -124,308 +125,13 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer srv.Close()
 
-	tuiLoop(app, projectConfig, cmd, []string(args))
+	m := newModel(app, projectConfig, cmd, []string(args), logBuf)
 
-	return nil
-}
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	m.program = p
 
-func tuiLoop(app *App, projectConfig string, cmd *StartCmd, passthrough []string) {
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("💤 vee> ")
-		if !scanner.Scan() {
-			break
-		}
-
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		if !strings.HasPrefix(line, "/") {
-			fmt.Fprintf(os.Stderr, "Commands must start with /. Type /help to see available commands.\n")
-			continue
-		}
-
-		// Strip leading / and parse command + argument
-		line = line[1:]
-		parts := strings.SplitN(line, " ", 2)
-		command := parts[0]
-		var argument string
-		if len(parts) > 1 {
-			argument = parts[1]
-		}
-
-		switch command {
-		case "quit", "exit":
-			return
-
-		case "help":
-			printHelp(cmd.Zettelkasten)
-
-		case "sessions", "ls":
-			printSessions(app)
-
-		case "resume":
-			handleResume(app, argument, projectConfig, cmd, passthrough)
-
-		case "drop":
-			handleDrop(app, argument)
-
-		default:
-			// Try as mode name
-			mode, ok := modeRegistry[command]
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Unknown command: /%s. Type /help to see available commands.\n", command)
-				continue
-			}
-
-			if mode.NeedsMCP && !cmd.Zettelkasten {
-				fmt.Fprintf(os.Stderr, "Mode %q requires --zettelkasten (-z) flag.\n", command)
-				continue
-			}
-
-			if err := runSession(app, mode, argument, projectConfig, cmd, passthrough); err != nil {
-				slog.Debug("session ended with error", "mode", command, "error", err)
-			}
-
-			fmt.Println()
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		slog.Error("reading stdin", "error", err)
-	}
-}
-
-func printHelp(zettelkasten bool) {
-	fmt.Println("Modes:")
-	for _, name := range modeOrder {
-		m, ok := modeRegistry[name]
-		if !ok {
-			continue
-		}
-		flag := ""
-		if m.NeedsMCP && !zettelkasten {
-			flag = " (requires -z)"
-		}
-		fmt.Printf("  /%-13s %s  %s%s\n", m.Name, m.Indicator, m.Description, flag)
-	}
-	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  /sessions, /ls     — list suspended sessions")
-	fmt.Println("  /resume <n>        — resume suspended session by index")
-	fmt.Println("  /drop <n>          — drop a suspended session")
-	fmt.Println("  /help              — show this message")
-	fmt.Println("  /quit, /exit       — exit vee")
-}
-
-func printSessions(app *App) {
-	sessions := app.Sessions.suspended()
-	if len(sessions) == 0 {
-		fmt.Println("No suspended sessions.")
-		return
-	}
-	for i, s := range sessions {
-		age := time.Since(s.StartedAt).Truncate(time.Second)
-		preview := s.Preview
-		if preview == "" {
-			preview = "(no preview)"
-		}
-		fmt.Printf("  %d. %s %s — %s (%s ago)\n", i+1, s.Indicator, s.Mode, preview, age)
-	}
-}
-
-func handleResume(app *App, argument, projectConfig string, cmd *StartCmd, passthrough []string) {
-	sessions := app.Sessions.suspended()
-	if len(sessions) == 0 {
-		fmt.Println("No suspended sessions to resume.")
-		return
-	}
-
-	if argument == "" {
-		fmt.Fprintf(os.Stderr, "Usage: /resume <n> (1-%d)\n", len(sessions))
-		return
-	}
-
-	idx, err := strconv.Atoi(argument)
-	if err != nil || idx < 1 || idx > len(sessions) {
-		fmt.Fprintf(os.Stderr, "Invalid index: %s. Use 1-%d.\n", argument, len(sessions))
-		return
-	}
-
-	sess := sessions[idx-1]
-	mode, ok := modeRegistry[sess.Mode]
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Unknown mode %q for session %s.\n", sess.Mode, sess.ID)
-		return
-	}
-
-	if err := resumeSession(app, mode, sess.ID, projectConfig, cmd, passthrough); err != nil {
-		slog.Debug("resume ended with error", "session", sess.ID, "error", err)
-	}
-
-	fmt.Println()
-}
-
-func handleDrop(app *App, argument string) {
-	sessions := app.Sessions.suspended()
-	if len(sessions) == 0 {
-		fmt.Println("No suspended sessions to drop.")
-		return
-	}
-
-	if argument == "" {
-		fmt.Fprintf(os.Stderr, "Usage: /drop <n> (1-%d)\n", len(sessions))
-		return
-	}
-
-	idx, err := strconv.Atoi(argument)
-	if err != nil || idx < 1 || idx > len(sessions) {
-		fmt.Fprintf(os.Stderr, "Invalid index: %s. Use 1-%d.\n", argument, len(sessions))
-		return
-	}
-
-	sess := sessions[idx-1]
-	app.Sessions.drop(sess.ID)
-	fmt.Printf("Dropped session: %s %s\n", sess.Indicator, sess.Mode)
-}
-
-// runSession spawns a new interactive Claude session for the given mode.
-func runSession(app *App, mode Mode, initialMsg, projectConfig string, cmd *StartCmd, passthrough []string) error {
-	id := newUUID()
-
-	preview := initialMsg
-	if len(preview) > 80 {
-		preview = preview[:80] + "…"
-	}
-	app.Sessions.create(id, mode.Name, mode.Indicator, preview)
-	suspendCh, selfDropCh := app.Control.newSession()
-	defer app.Control.clearSession()
-
-	args := buildSessionArgs(id, false, mode, projectConfig, cmd, passthrough)
-	if initialMsg != "" {
-		args = append([]string{initialMsg}, args...)
-	}
-	return execSession(app, id, args, suspendCh, selfDropCh)
-}
-
-// resumeSession resumes an existing suspended session.
-func resumeSession(app *App, mode Mode, sessionID, projectConfig string, cmd *StartCmd, passthrough []string) error {
-	app.Sessions.setStatus(sessionID, "active")
-	suspendCh, selfDropCh := app.Control.newSession()
-	defer app.Control.clearSession()
-
-	args := buildSessionArgs(sessionID, true, mode, projectConfig, cmd, passthrough)
-	return execSession(app, sessionID, args, suspendCh, selfDropCh)
-}
-
-// buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
-	var args []string
-	if mode.NoPrompt {
-		args = append(args, passthrough...)
-	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
-		args = buildArgs(passthrough, fullPrompt)
-	}
-
-	if resume {
-		args = append(args, "--resume", sessionID)
-	} else {
-		args = append(args, "--session-id", sessionID)
-	}
-
-	// MCP config — always provided (needed for request_suspend and self_drop)
-	mcpConfigFile, err := writeMCPConfig(cmd.Port)
-	if err != nil {
-		slog.Error("failed to write MCP config", "error", err)
-	} else {
-		args = append(args, "--mcp-config", mcpConfigFile)
-	}
-
-	// Settings
-	settingsFile, err := writeSettings()
-	if err != nil {
-		slog.Error("failed to write settings", "error", err)
-	} else {
-		args = append(args, "--settings", settingsFile)
-	}
-
-	// Always include plugins/vee for the suspend command
-	args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee"))
-
-	// Mode-specific plugin dirs
-	for _, dir := range mode.PluginDirs {
-		args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, dir))
-	}
-
-	return args
-}
-
-// execSession runs a claude process and handles suspend, self-drop, and natural exit.
-func execSession(app *App, sessionID string, args []string, suspendCh, selfDropCh chan struct{}) error {
-	slog.Debug("claude args", "args", args)
-
-	claude := exec.Command("claude", args...)
-	claude.Stdin = os.Stdin
-	claude.Stdout = os.Stdout
-	claude.Stderr = os.Stderr
-
-	if err := claude.Start(); err != nil {
-		app.Sessions.drop(sessionID)
-		return fmt.Errorf("claude start failed: %w", err)
-	}
-
-	doneCh := make(chan error, 1)
-	go func() {
-		doneCh <- claude.Wait()
-	}()
-
-	select {
-	case err := <-doneCh:
-		// Natural exit — drop the session
-		app.Sessions.drop(sessionID)
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				slog.Debug("claude exited", "code", exitErr.ExitCode())
-				return nil
-			}
-			return fmt.Errorf("claude failed: %w", err)
-		}
-		return nil
-
-	case <-suspendCh:
-		// Suspend requested — send SIGINT and wait for graceful exit
-		slog.Debug("suspending session", "id", sessionID)
-		_ = claude.Process.Signal(syscall.SIGINT)
-		waitOrKill(claude, doneCh)
-		app.Sessions.setStatus(sessionID, "suspended")
-		fmt.Println("\nSession suspended.")
-		return nil
-
-	case <-selfDropCh:
-		// Self-drop — task is done, terminate and record as completed
-		slog.Debug("self-drop session", "id", sessionID)
-		_ = claude.Process.Signal(syscall.SIGINT)
-		waitOrKill(claude, doneCh)
-		app.Sessions.setStatus(sessionID, "completed")
-		fmt.Println("\nSession completed.")
-		return nil
-	}
-}
-
-// waitOrKill waits up to 5 seconds for the process to exit, then force-kills it.
-func waitOrKill(cmd *exec.Cmd, doneCh <-chan error) {
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-doneCh:
-	case <-timer.C:
-		slog.Debug("force killing process", "pid", cmd.Process.Pid)
-		_ = cmd.Process.Kill()
-		<-doneCh
-	}
+	_, err = p.Run()
+	return err
 }
 
 // splitAtDashDash splits args at the first "--".
@@ -579,6 +285,49 @@ func buildArgs(originalArgs []string, systemPromptContent string) []string {
 		finalPrompt = finalPrompt + "\n\n" + userAppendPrompt
 	}
 	args = append(args, "--append-system-prompt", finalPrompt)
+
+	return args
+}
+
+// buildSessionArgs constructs the claude CLI arguments for a session.
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
+	var args []string
+	if mode.NoPrompt {
+		args = append(args, passthrough...)
+	} else {
+		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
+		args = buildArgs(passthrough, fullPrompt)
+	}
+
+	if resume {
+		args = append(args, "--resume", sessionID)
+	} else {
+		args = append(args, "--session-id", sessionID)
+	}
+
+	// MCP config — always provided (needed for request_suspend and self_drop)
+	mcpConfigFile, err := writeMCPConfig(cmd.Port)
+	if err != nil {
+		slog.Error("failed to write MCP config", "error", err)
+	} else {
+		args = append(args, "--mcp-config", mcpConfigFile)
+	}
+
+	// Settings
+	settingsFile, err := writeSettings()
+	if err != nil {
+		slog.Error("failed to write settings", "error", err)
+	} else {
+		args = append(args, "--settings", settingsFile)
+	}
+
+	// Always include plugins/vee for the suspend command
+	args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, "plugins", "vee"))
+
+	// Mode-specific plugin dirs
+	for _, dir := range mode.PluginDirs {
+		args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, dir))
+	}
 
 	return args
 }

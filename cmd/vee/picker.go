@@ -12,9 +12,8 @@ import (
 // SessionPickerCmd is the internal subcommand that shows an interactive
 // mode picker with a prompt input, rendered inside tmux display-popup.
 type SessionPickerCmd struct {
-	VeePath      string `required:"" type:"path" name:"vee-path"`
-	Zettelkasten bool   `short:"z" name:"zettelkasten"`
-	Port         int    `short:"p" default:"2700" name:"port"`
+	VeePath string `required:"" type:"path" name:"vee-path"`
+	Port    int    `short:"p" default:"2700" name:"port"`
 }
 
 type pickerMode struct {
@@ -32,9 +31,6 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	for _, name := range modeOrder {
 		mode, ok := modeRegistry[name]
 		if !ok {
-			continue
-		}
-		if mode.NeedsMCP && !cmd.Zettelkasten {
 			continue
 		}
 		modes = append(modes, pickerMode{
@@ -168,9 +164,6 @@ func (cmd *SessionPickerCmd) createSession(mode, prompt string, args claudeArgs)
 	cmdParts = append(cmdParts, "_new-pane")
 	cmdParts = append(cmdParts, "--vee-path", cmd.VeePath)
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", cmd.Port))
-	if cmd.Zettelkasten {
-		cmdParts = append(cmdParts, "-z")
-	}
 	cmdParts = append(cmdParts, "--mode", mode)
 	if prompt != "" {
 		cmdParts = append(cmdParts, "--prompt", prompt)

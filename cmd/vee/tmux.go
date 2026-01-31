@@ -84,7 +84,7 @@ func tmuxGracefulClose(windowID string) {
 }
 
 // tmuxConfigure applies all tmux configuration for the Vee session.
-func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool, passthrough []string) error {
+func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []string) error {
 	// Each entry is a slice of tmux set-option/bind-key args.
 	commands := [][]string{
 		// True color support
@@ -114,7 +114,7 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 	}
 
 	// Rebind Ctrl-b c to the session picker popup
-	pickerCmd := buildPickerPopupCmd(veeBinary, port, veePath, zettelkasten, passthrough)
+	pickerCmd := buildPickerPopupCmd(veeBinary, port, veePath, passthrough)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "c", "display-popup", "-E", "-w", "80", "-h", "20", pickerCmd); err != nil {
 		return fmt.Errorf("tmux bind-key picker: %w", err)
 	}
@@ -147,15 +147,12 @@ func tmuxConfigure(veeBinary string, port int, veePath string, zettelkasten bool
 }
 
 // buildPickerPopupCmd constructs the shell command for the session picker popup.
-func buildPickerPopupCmd(veeBinary string, port int, veePath string, zettelkasten bool, passthrough []string) string {
+func buildPickerPopupCmd(veeBinary string, port int, veePath string, passthrough []string) string {
 	var cmdParts []string
 	cmdParts = append(cmdParts, shelljoin(veeBinary))
 	cmdParts = append(cmdParts, "_session-picker")
 	cmdParts = append(cmdParts, "--vee-path", shelljoin(veePath))
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", port))
-	if zettelkasten {
-		cmdParts = append(cmdParts, "-z")
-	}
 
 	if len(passthrough) > 0 {
 		cmdParts = append(cmdParts, "--")

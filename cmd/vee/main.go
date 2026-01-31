@@ -21,10 +21,8 @@ type Mode struct {
 	Name        string
 	Indicator   string
 	Description string
-	Prompt      string   // embedded mode prompt content
-	PluginDirs  []string // plugin dirs to pass to claude (relative to vee-path)
-	NeedsMCP    bool     // whether this mode needs zettelkasten MCP tools
-	NoPrompt    bool     // skip --append-system-prompt entirely (vanilla claude)
+	Prompt      string // embedded mode prompt content
+	NoPrompt    bool   // skip --append-system-prompt entirely (vanilla claude)
 }
 
 // veeLogFile is the fixed log path for the Vee daemon.
@@ -34,7 +32,7 @@ const veeLogFile = "/tmp/vee.log"
 var modeRegistry map[string]Mode
 
 // modeOrder defines the display order for help output.
-var modeOrder = []string{"claude", "normal", "vibe", "contradictor", "query", "record"}
+var modeOrder = []string{"claude", "normal", "vibe", "contradictor"}
 
 func initModeRegistry() error {
 	basePrompt, err := promptFS.ReadFile("prompts/base.md")
@@ -47,14 +45,10 @@ func initModeRegistry() error {
 		file        string
 		indicator   string
 		description string
-		pluginDirs  []string
-		needsMCP    bool
 	}{
-		{"normal", "prompts/normal.md", "🦊", "Read-only exploration (default)", nil, false},
-		{"vibe", "prompts/vibe.md", "⚡", "Perform tasks with side-effects", nil, false},
-		{"contradictor", "prompts/contradictor.md", "😈", "Devil's advocate mode", nil, false},
-		{"query", "prompts/zettelkasten_query.md", "🔍", "Query the knowledge base", nil, true},
-		{"record", "prompts/zettelkasten_record.md", "📚", "Record into the knowledge base", []string{"plugins/vee-zettelkasten"}, true},
+		{"normal", "prompts/normal.md", "🦊", "Read-only exploration (default)"},
+		{"vibe", "prompts/vibe.md", "⚡", "Perform tasks with side-effects"},
+		{"contradictor", "prompts/contradictor.md", "😈", "Devil's advocate mode"},
 	}
 
 	modeRegistry = make(map[string]Mode, len(modes)+1)
@@ -72,8 +66,6 @@ func initModeRegistry() error {
 			Indicator:   m.indicator,
 			Description: m.description,
 			Prompt:      composed,
-			PluginDirs:  m.pluginDirs,
-			NeedsMCP:    m.needsMCP,
 		}
 	}
 
@@ -110,8 +102,7 @@ type CLI struct {
 
 // StartCmd runs the in-process server and manages the tmux session.
 type StartCmd struct {
-	VeePath      string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
-	Zettelkasten bool   `short:"z" help:"Enable the vee-zettelkasten plugin." name:"zettelkasten"`
+	VeePath string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 }
 
 // Run starts the Vee tmux session with an in-process HTTP/MCP server.
@@ -131,9 +122,15 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	// Redirect slog to a file so it can be viewed in the logs window
 	setupFileLogger(veeLogFile)
 
+	kb, err := OpenKnowledgeBase()
+	if err != nil {
+		return fmt.Errorf("failed to open knowledge base: %w", err)
+	}
+	defer kb.Close()
+
 	app := newApp()
 
-	srv, port, err := startHTTPServerInBackground(app, cmd.Zettelkasten)
+	srv, port, err := startHTTPServerInBackground(app, kb)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
@@ -149,7 +146,6 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	app.SetConfig(&AppConfig{
 		VeePath:       cmd.VeePath,
 		Port:          port,
-		Zettelkasten:  cmd.Zettelkasten,
 		Passthrough:   []string(args),
 		ProjectConfig: projectConfig,
 	})
@@ -167,7 +163,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 
 	// Apply tmux configuration (idempotent)
-	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, cmd.Zettelkasten, []string(args)); err != nil {
+	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, []string(args)); err != nil {
 		return fmt.Errorf("failed to configure tmux: %w", err)
 	}
 
@@ -180,11 +176,10 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 
 // NewPaneCmd is the internal subcommand called by tmux display-menu entries.
 type NewPaneCmd struct {
-	VeePath      string `required:"" type:"path" name:"vee-path"`
-	Zettelkasten bool   `short:"z" name:"zettelkasten"`
-	Port         int    `short:"p" default:"2700" name:"port"`
-	Mode         string `required:"" name:"mode"`
-	Prompt       string `name:"prompt" help:"Initial prompt for the session."`
+	VeePath string `required:"" type:"path" name:"vee-path"`
+	Port    int    `short:"p" default:"2700" name:"port"`
+	Mode    string `required:"" name:"mode"`
+	Prompt  string `name:"prompt" help:"Initial prompt for the session."`
 }
 
 // Run creates a new tmux window with a Claude session for the given mode.
@@ -859,11 +854,6 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 
 	// Always include plugins/vee for the suspend command
 	args = append(args, "--plugin-dir", filepath.Join(veePath, "plugins", "vee"))
-
-	// Mode-specific plugin dirs
-	for _, dir := range mode.PluginDirs {
-		args = append(args, "--plugin-dir", filepath.Join(veePath, dir))
-	}
 
 	return args
 }

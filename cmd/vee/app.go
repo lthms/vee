@@ -11,7 +11,6 @@ import (
 type AppConfig struct {
 	VeePath       string   `json:"vee_path"`
 	Port          int      `json:"port"`
-	Zettelkasten  bool     `json:"zettelkasten"`
 	Passthrough   []string `json:"passthrough"`
 	ProjectConfig string   `json:"project_config"`
 }

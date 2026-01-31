@@ -13,23 +13,26 @@ import (
 )
 
 // DaemonCmd runs the Vee daemon (MCP server + API).
-type DaemonCmd struct {
-	Zettelkasten bool `short:"z" help:"Enable the vee-zettelkasten tools." name:"zettelkasten"`
-}
+type DaemonCmd struct{}
 
 // MCP tool args
-
-type traverseArgs struct {
-	KBRoot string `json:"kb_root" jsonschema:"Absolute path to the knowledge base root"`
-	Topic  string `json:"topic" jsonschema:"The subject to search for"`
-}
 
 type requestSuspendArgs struct{}
 type selfDropArgs struct{}
 
+type kbRememberArgs struct {
+	Title   string   `json:"title" jsonschema:"Title of the note"`
+	Content string   `json:"content" jsonschema:"Body of the note (markdown)"`
+	Tags    []string `json:"tags" jsonschema:"Tags for categorization"`
+}
+
+type kbQueryArgs struct {
+	Query string `json:"query" jsonschema:"Full-text search query"`
+}
+
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
-func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
+func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
 		Version: "1.0.0",
@@ -95,20 +98,46 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		}, nil, nil
 	})
 
-	if zettelkasten {
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "kb_traverse",
-			Description: "Traverse a knowledge base index tree to find notes relevant to a topic. Returns a JSON array of {path, summary} pairs.",
-		}, handleTraverse)
-	}
+	// Knowledge base tools — available to all modes
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "kb_remember",
+		Description: "Save a note to the persistent knowledge base. Writes an Obsidian-compatible markdown file and indexes it for search.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("kb_remember called", "title", args.Title)
+		path, err := kb.AddNote(args.Title, args.Content, args.Tags)
+		if err != nil {
+			return nil, nil, fmt.Errorf("kb_remember: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("Note saved: %s", path)},
+			},
+		}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "kb_query",
+		Description: "Search the knowledge base using full-text search. Returns matching notes with snippets.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbQueryArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("kb_query called", "query", args.Query)
+		results, err := kb.Query(args.Query, 20)
+		if err != nil {
+			return nil, nil, fmt.Errorf("kb_query: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: QueryResultsJSON(results)},
+			},
+		}, nil, nil
+	})
 
 	return server
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, zettelkasten bool) *http.ServeMux {
+func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
-		return newMCPServer(app, zettelkasten)
+		return newMCPServer(app, kb)
 	}, nil)
 
 	mux := http.NewServeMux()
@@ -322,8 +351,8 @@ func handleSessionEnded(app *App) http.HandlerFunc {
 
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, zettelkasten bool) (*http.Server, int, error) {
-	mux := setupHTTPMux(app, zettelkasten)
+func startHTTPServerInBackground(app *App, kb *KnowledgeBase) (*http.Server, int, error) {
+	mux := setupHTTPMux(app, kb)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -344,8 +373,14 @@ func startHTTPServerInBackground(app *App, zettelkasten bool) (*http.Server, int
 
 // Run starts the daemon: MCP server (SSE) + API on an OS-assigned port.
 func (cmd *DaemonCmd) Run() error {
+	kb, err := OpenKnowledgeBase()
+	if err != nil {
+		return fmt.Errorf("open knowledge base: %w", err)
+	}
+	defer kb.Close()
+
 	app := newApp()
-	mux := setupHTTPMux(app, cmd.Zettelkasten)
+	mux := setupHTTPMux(app, kb)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -354,19 +389,4 @@ func (cmd *DaemonCmd) Run() error {
 
 	slog.Info("daemon listening", "addr", ln.Addr().String())
 	return http.Serve(ln, mux)
-}
-
-func handleTraverse(ctx context.Context, req *mcp.CallToolRequest, args traverseArgs) (*mcp.CallToolResult, any, error) {
-	slog.Debug("kb_traverse called", "kb_root", args.KBRoot, "topic", args.Topic)
-
-	result, err := traverseToJSON(ctx, args.KBRoot, args.Topic)
-	if err != nil {
-		return nil, nil, fmt.Errorf("traverse failed: %w", err)
-	}
-
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: result},
-		},
-	}, nil, nil
 }

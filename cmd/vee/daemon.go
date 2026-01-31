@@ -69,10 +69,10 @@ func (t *toolTracer) snapshot() []toolTrace {
 }
 
 func newModeTracker() *modeTracker {
-	initial := modeTransition{Mode: "normal", Indicator: "🦊", Timestamp: time.Now()}
+	initial := modeTransition{Mode: "idle", Indicator: "💤", Timestamp: time.Now()}
 	return &modeTracker{
-		currentMode:      "normal",
-		currentIndicator: "🦊",
+		currentMode:      "idle",
+		currentIndicator: "💤",
 		transitions:      []modeTransition{initial},
 	}
 }
@@ -165,6 +165,23 @@ func (cmd *DaemonCmd) Run() error {
 			"transitions":       transitions,
 			"tool_traces":       traces,
 		})
+	})
+	mux.HandleFunc("/api/mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Mode      string `json:"mode"`
+			Indicator string `json:"indicator"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		tracker.record(body.Mode, body.Indicator)
+		slog.Debug("mode change via HTTP", "mode", body.Mode, "indicator", body.Indicator)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/tool-trace", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

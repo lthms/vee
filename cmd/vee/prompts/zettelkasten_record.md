@@ -1,7 +1,3 @@
----
-description: Have Vee record one or more new datum in your knowledge base
----
-
 <mode name="zettelkasten-record">
 <indicator value="📚" />
 

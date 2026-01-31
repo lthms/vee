@@ -1,10 +1,3 @@
----
-description: Trust Vee to perform a task on your behalf
-user-invocable: true
-disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, Task, NotebookEdit
----
-
 <mode name="vibe">
 <indicator value="⚡" />
 
@@ -36,5 +29,3 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, Task, N
 - Summarize the blockers
 </on-abort>
 </mode>
-
-Switch to mode: vibe

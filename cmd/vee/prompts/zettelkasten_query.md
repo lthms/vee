@@ -1,9 +1,3 @@
----
-description: Have Vee learn from your knowledge base
----
-
-Switch to: query mode
-
 <mode name="zettelkasten-query">
 <indicator value="🔍" />
 

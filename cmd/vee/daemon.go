@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -19,85 +17,6 @@ type DaemonCmd struct {
 	Port         int  `short:"p" default:"2700" help:"Port for the HTTP server (MCP + dashboard)." name:"port"`
 }
 
-// modeTransition records a single mode change.
-type modeTransition struct {
-	Mode      string    `json:"mode"`
-	Indicator string    `json:"indicator"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// modeTracker keeps an in-memory log of mode transitions.
-type modeTracker struct {
-	mu               sync.RWMutex
-	currentMode      string
-	currentIndicator string
-	transitions      []modeTransition
-}
-
-// toolTrace records a single tool call received from a hook.
-type toolTrace struct {
-	Tool      string    `json:"tool"`
-	Input     any       `json:"input,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// toolTracer keeps an in-memory log of tool calls.
-type toolTracer struct {
-	mu     sync.RWMutex
-	traces []toolTrace
-}
-
-func newToolTracer() *toolTracer {
-	return &toolTracer{}
-}
-
-func (t *toolTracer) record(tool string, input any) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.traces = append(t.traces, toolTrace{
-		Tool:      tool,
-		Input:     input,
-		Timestamp: time.Now(),
-	})
-}
-
-func (t *toolTracer) snapshot() []toolTrace {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	cp := make([]toolTrace, len(t.traces))
-	copy(cp, t.traces)
-	return cp
-}
-
-func newModeTracker() *modeTracker {
-	initial := modeTransition{Mode: "idle", Indicator: "💤", Timestamp: time.Now()}
-	return &modeTracker{
-		currentMode:      "idle",
-		currentIndicator: "💤",
-		transitions:      []modeTransition{initial},
-	}
-}
-
-func (t *modeTracker) record(mode, indicator string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentMode = mode
-	t.currentIndicator = indicator
-	t.transitions = append(t.transitions, modeTransition{
-		Mode:      mode,
-		Indicator: indicator,
-		Timestamp: time.Now(),
-	})
-}
-
-func (t *modeTracker) snapshot() (string, string, []modeTransition) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	cp := make([]modeTransition, len(t.transitions))
-	copy(cp, t.transitions)
-	return t.currentMode, t.currentIndicator, cp
-}
-
 // MCP tool args
 
 type traverseArgs struct {
@@ -105,12 +24,8 @@ type traverseArgs struct {
 	Topic  string `json:"topic" jsonschema:"The subject to search for"`
 }
 
-type reportModeChangeArgs struct {
-	Mode      string `json:"mode" jsonschema:"The name of the mode being switched to (e.g. normal, vibe, contradictor)"`
-	Indicator string `json:"indicator" jsonschema:"The emoji indicator for the mode (e.g. 🦊, ⚡, 😈)"`
-}
-
 type requestSuspendArgs struct{}
+type selfDropArgs struct{}
 
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
@@ -119,19 +34,6 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		Name:    "vee",
 		Version: "1.0.0",
 	}, nil)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "report_mode_change",
-		Description: "Report a mode transition. Call this every time you switch modes.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args reportModeChangeArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("report_mode_change called", "mode", args.Mode, "indicator", args.Indicator)
-		app.Tracker.record(args.Mode, args.Indicator)
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Mode changed to %s.", args.Mode)},
-			},
-		}, nil, nil
-	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "request_suspend",
@@ -148,6 +50,25 @@ func newMCPServer(app *App, zettelkasten bool) *mcp.Server {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: "No active session to suspend."},
+			},
+		}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "self_drop",
+		Description: "Signal that the current task is done. Call this when your work is complete to end the session.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args selfDropArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("self_drop called")
+		if app.Control.requestSelfDrop() {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "Session ending."},
+				},
+			}, nil, nil
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "No active session to drop."},
 			},
 		}, nil, nil
 	})
@@ -172,8 +93,6 @@ func setupHTTPMux(app *App, zettelkasten bool) *http.ServeMux {
 	mux.Handle("/sse", sseHandler)
 	mux.HandleFunc("/", handleDashboard)
 	mux.HandleFunc("/api/state", handleState(app))
-	mux.HandleFunc("/api/mode", handleModeChange(app))
-	mux.HandleFunc("/api/tool-trace", handleToolTrace(app))
 	return mux
 }
 
@@ -184,64 +103,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func handleState(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		currentMode, currentIndicator, transitions := app.Tracker.snapshot()
-		traces := app.Tracer.snapshot()
-
-		var activeSession *Session
-		if s := app.Sessions.active(); s != nil {
-			activeSession = s
-		}
+		activeSession := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
+		completedSessions := app.Sessions.completed()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"current_mode":       currentMode,
-			"current_indicator":  currentIndicator,
-			"transitions":        transitions,
-			"tool_traces":        traces,
 			"active_session":     activeSession,
 			"suspended_sessions": suspendedSessions,
+			"completed_sessions": completedSessions,
 		})
-	}
-}
-
-func handleModeChange(app *App) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Mode      string `json:"mode"`
-			Indicator string `json:"indicator"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		app.Tracker.record(body.Mode, body.Indicator)
-		slog.Debug("mode change via HTTP", "mode", body.Mode, "indicator", body.Indicator)
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func handleToolTrace(app *App) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Tool  string `json:"tool_name"`
-			Input any    `json:"tool_input"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		app.Tracer.record(body.Tool, body.Input)
-		slog.Debug("tool-trace recorded", "tool", body.Tool)
-		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -332,25 +203,9 @@ const dashboardHTML = `<!DOCTYPE html>
   }
   .session-card.active { border-color: var(--green); }
   .session-card.suspended { border-color: var(--yellow); }
+  .session-card.completed { border-color: #565f89; opacity: 0.7; }
   .empty-state { color: #565f89; font-size: 0.85rem; font-style: italic; margin-bottom: 1rem; }
-  .timeline { list-style: none; }
-  .timeline li {
-    display: flex; align-items: center; gap: 1rem;
-    padding: 0.5rem 0; border-bottom: 1px solid var(--border);
-  }
-  .timeline li:last-child { border-bottom: none; }
-  .timeline .time { color: #565f89; font-size: 0.8rem; min-width: 8rem; }
-  .timeline .mode-name { color: var(--fg); }
-  .timeline .indicator { font-size: 1.2rem; }
   h2 { color: #565f89; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.75rem; }
-  .tool-traces { list-style: none; }
-  .tool-traces li {
-    display: flex; align-items: center; gap: 1rem;
-    padding: 0.5rem 0; border-bottom: 1px solid var(--border);
-  }
-  .tool-traces li:last-child { border-bottom: none; }
-  .tool-traces .time { color: #565f89; font-size: 0.8rem; min-width: 8rem; }
-  .tool-traces .tool-name { color: var(--accent); font-weight: bold; }
 </style>
 </head>
 <body>
@@ -363,10 +218,8 @@ const dashboardHTML = `<!DOCTYPE html>
   <div id="active-session"></div>
   <h2>Suspended Sessions</h2>
   <div id="suspended-sessions"></div>
-  <h2 style="margin-top: 1rem;">Tool Traces</h2>
-  <ul class="tool-traces" id="traces"></ul>
-  <h2 style="margin-top: 2rem;">Mode History</h2>
-  <ul class="timeline" id="timeline"></ul>
+  <h2>Completed Sessions</h2>
+  <div id="completed-sessions"></div>
   <script>
     function age(ts) {
       const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
@@ -382,8 +235,12 @@ const dashboardHTML = `<!DOCTYPE html>
         '</div>';
     }
     function render(data) {
-      const ind = data.current_indicator || "?";
-      document.getElementById("current").textContent = ind + " " + data.current_mode;
+      const cur = document.getElementById("current");
+      if (data.active_session) {
+        cur.textContent = data.active_session.indicator + " " + data.active_session.mode;
+      } else {
+        cur.textContent = "💤 idle";
+      }
 
       const aDiv = document.getElementById("active-session");
       if (data.active_session) {
@@ -400,26 +257,14 @@ const dashboardHTML = `<!DOCTYPE html>
         sDiv.innerHTML = suspended.map(function(s) { return sessionCard(s, "suspended"); }).join("");
       }
 
-      const tul = document.getElementById("traces");
-      tul.innerHTML = "";
-      const traces = [...(data.tool_traces || [])].reverse();
-      for (const t of traces) {
-        const li = document.createElement("li");
-        const ti = new Date(t.timestamp).toLocaleTimeString();
-        li.innerHTML = '<span class="time">' + ti + '</span><span class="tool-name">' + t.tool + '</span>';
-        tul.appendChild(li);
+      const cDiv = document.getElementById("completed-sessions");
+      const completed = data.completed_sessions || [];
+      if (completed.length === 0) {
+        cDiv.innerHTML = '<div class="empty-state">No completed sessions</div>';
+      } else {
+        cDiv.innerHTML = completed.map(function(s) { return sessionCard(s, "completed"); }).join("");
       }
 
-      const ul = document.getElementById("timeline");
-      ul.innerHTML = "";
-      const items = [...data.transitions].reverse();
-      for (const t of items) {
-        const li = document.createElement("li");
-        const ti = new Date(t.timestamp).toLocaleTimeString();
-        const mInd = t.indicator || "?";
-        li.innerHTML = '<span class="time">' + ti + '</span><span class="indicator">' + mInd + '</span><span class="mode-name">' + t.mode + '</span>';
-        ul.appendChild(li);
-      }
     }
     async function poll() {
       try {

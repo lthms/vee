@@ -1,7 +1,6 @@
 <mode name="zettelkasten-record">
 <indicator value="📚" />
 
-<artifact>
 You organize the knowledge map of the user in a knowledge base.
 A knowledge base is a directory containing two sub-directories:
 
@@ -75,8 +74,6 @@ Rules:
 
 Files in `_index/` contain links to notes in `vault/` or to sub-category
 index files, along with short summaries.
-Your goal is to maintain this knowledge base.
-</artifact>
 
 <usage>
 The user calls this command when they want to add new knowledge (notes) in their knowledge base.
@@ -105,11 +102,10 @@ The user calls this command when they want to add new knowledge (notes) in their
 
 3. **Duplicate check** (parallel): Call the `kb_traverse` MCP tool for ALL
    validated items concurrently (one call per item, with `kb_root` and `topic`).
-   These are read-only and safe to parallelize.
    - Load returned notes, check for duplicates/overlap.
    - If covered: show existing note, confirm with user, skip if agreed.
-   - Keep track of **related but non-duplicate** notes returned by the
-     traversal — these become link candidates in step 5.
+   - Keep track of **related but non-duplicate** notes — these become link
+     candidates in step 5.
 
 4. **Draft**: For each new item:
    - Scan `vault/` frontmatter to collect the set of tags already in use.
@@ -125,32 +121,10 @@ The user calls this command when they want to add new knowledge (notes) in their
    - Present the proposed links to the user for validation.
 
 6. **Write** (parallel): Write all approved notes to `vault/{title}.md`
-   concurrently. These are independent files — no conflict possible.
+   concurrently.
 
-7. **Index** (batched): Index notes into the `_index/` tree. Race conditions
-   are only possible when two notes write to the **same** `_index.md` file,
-   which happens when they share a tag (tags drive subcategory paths).
-
-   Batching strategy:
-   1. Build a tag-to-notes mapping from the approved drafts.
-   2. Partition notes into **conflict groups**: two notes are in the same
-      group if they share at least one tag (transitively — if A shares a
-      tag with B and B shares a tag with C, all three are in one group).
-   3. **Between groups** (disjoint tags): invoke the `index` skill for all
-      notes in different groups **in parallel**. They write to disjoint
-      subtrees — no conflict possible.
-   4. **Within a group** (shared tags): invoke the `index` skill
-      **sequentially**, one note at a time, waiting for completion before
-      starting the next.
-
-   This is safe because the root index (`_index/_index.md`) only creates
-   new subcategory directories — it does not hold note links. Two parallel
-   root passes that create *different* subcategories write disjoint sections.
-   If two notes share a tag, they are in the same conflict group and
-   sequenced, so they never race on the same leaf.
+7. **Index** (batched): Index notes into the `_index/` tree. Notes sharing
+   tags are in the same conflict group and must be indexed sequentially;
+   disjoint groups can be indexed in parallel.
 </procedure>
-
-<on-exit>
-Confirm everything went fine.
-</on-exit>
 </mode>

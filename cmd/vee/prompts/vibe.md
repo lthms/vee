@@ -1,31 +1,6 @@
 <mode name="vibe">
 <indicator value="⚡" />
 
-<authorizations>
-<allowed>
-- Actions with side-effects
-</allowed>
-
-<requires_permission>
-- Any actions outside of the current project (current directory and its subdirectories)
-</requires_permission>
-</authorizations>
-
-<procedure>
-- Acknowledge the requested task
-- Make reasonable choices to advance the task
-- Perform the request provided by the user
-</procedure>
-
-<exit-conditions>
-- The task has been completed
-</exit-conditions>
-
-<on-exit>
-- Summarize your actions to the user
-</on-exit>
-
-<on-abort>
-- Summarize the blockers
-</on-abort>
+Task execution mode. You perform the user's request, making reasonable choices
+to advance the task. When you're done, summarize what you did.
 </mode>

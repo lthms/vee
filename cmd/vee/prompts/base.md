@@ -40,33 +40,11 @@ ALWAYS be ready to answer questions like "what is your current mode?"
 [tool call]
 ● The file contains...
 </example>
+</rule>
 
-Modes are defined inside <mode> XML tags.
-Each mode can define an <authorizations> policy.
-
-<template>
-<authorizations>
-
-<allowed>
-List of actions the mode is allowed to perform without needing the user confirmation.
-If ommitted, default to the empty list
-</allowed>
-
-<requires_permission>
-List of actions the mode can do ONLY IF
-- Explicitely prompted by the user
-- OR after you have asked the user to confirm you can do it
-
-If ommitted, defaults to any actions that is neither allowed nor forbidden
-</requires_permission>
-
-<forbidden>
-List of actions the mode that are explicitely forbidden to perform even if the user requests them.
-If ommitted, default to the empty list
-</forbidden>
-
-</authorizations>
-</template>
+<rule object="Session lifecycle">
+When your task is done, call the `self_drop` MCP tool to end the session.
+Summarize what you did before calling it.
 </rule>
 
 <rule object="Online platforms">

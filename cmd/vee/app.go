@@ -9,16 +9,12 @@ import (
 
 // App holds the shared application state passed to all subsystems.
 type App struct {
-	Tracker  *modeTracker
-	Tracer   *toolTracer
 	Sessions *sessionStore
 	Control  *sessionControl
 }
 
 func newApp() *App {
 	return &App{
-		Tracker:  newModeTracker(),
-		Tracer:   newToolTracer(),
 		Sessions: newSessionStore(),
 		Control:  newSessionControl(),
 	}
@@ -100,6 +96,24 @@ func (s *sessionStore) suspended() []*Session {
 	return result
 }
 
+// completed returns all sessions with status "completed", ordered by start time.
+func (s *sessionStore) completed() []*Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Session
+	for _, sess := range s.sessions {
+		if sess.Status == "completed" {
+			result = append(result, sess)
+		}
+	}
+	for i := 1; i < len(result); i++ {
+		for j := i; j > 0 && result[j].StartedAt.Before(result[j-1].StartedAt); j-- {
+			result[j], result[j-1] = result[j-1], result[j]
+		}
+	}
+	return result
+}
+
 // active returns the currently active session, if any.
 func (s *sessionStore) active() *Session {
 	s.mu.RLock()
@@ -112,25 +126,27 @@ func (s *sessionStore) active() *Session {
 	return nil
 }
 
-// sessionControl manages suspend signaling for the active session.
+// sessionControl manages suspend and self-drop signaling for the active session.
 type sessionControl struct {
-	mu        sync.Mutex
-	suspendCh chan struct{}
+	mu         sync.Mutex
+	suspendCh  chan struct{}
+	selfDropCh chan struct{}
 }
 
 func newSessionControl() *sessionControl {
 	return &sessionControl{}
 }
 
-// newSession creates a buffered(1) channel for the active session and returns it.
-func (c *sessionControl) newSession() chan struct{} {
+// newSession creates buffered(1) channels for the active session and returns them.
+func (c *sessionControl) newSession() (suspend, selfDrop chan struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.suspendCh = make(chan struct{}, 1)
-	return c.suspendCh
+	c.selfDropCh = make(chan struct{}, 1)
+	return c.suspendCh, c.selfDropCh
 }
 
-// requestSuspend sends on the channel (non-blocking). Returns true if sent.
+// requestSuspend sends on the suspend channel (non-blocking). Returns true if sent.
 func (c *sessionControl) requestSuspend() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -145,11 +161,27 @@ func (c *sessionControl) requestSuspend() bool {
 	}
 }
 
-// clearSession nils out the channel.
+// requestSelfDrop sends on the self-drop channel (non-blocking). Returns true if sent.
+func (c *sessionControl) requestSelfDrop() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.selfDropCh == nil {
+		return false
+	}
+	select {
+	case c.selfDropCh <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// clearSession nils out both channels.
 func (c *sessionControl) clearSession() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.suspendCh = nil
+	c.selfDropCh = nil
 }
 
 // newUUID generates a v4 UUID using crypto/rand.

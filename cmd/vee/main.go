@@ -115,8 +115,6 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer srv.Close()
 
-	app.Tracker.record("idle", "💤")
-
 	tuiLoop(app, projectConfig, cmd, []string(args))
 
 	return nil
@@ -178,13 +176,10 @@ func tuiLoop(app *App, projectConfig string, cmd *StartCmd, passthrough []string
 				continue
 			}
 
-			app.Tracker.record(mode.Name, mode.Indicator)
-
 			if err := runSession(app, mode, argument, projectConfig, cmd, passthrough); err != nil {
 				slog.Debug("session ended with error", "mode", command, "error", err)
 			}
 
-			app.Tracker.record("idle", "💤")
 			fmt.Println()
 		}
 	}
@@ -257,13 +252,10 @@ func handleResume(app *App, argument, projectConfig string, cmd *StartCmd, passt
 		return
 	}
 
-	app.Tracker.record(mode.Name, mode.Indicator)
-
 	if err := resumeSession(app, mode, sess.ID, projectConfig, cmd, passthrough); err != nil {
 		slog.Debug("resume ended with error", "session", sess.ID, "error", err)
 	}
 
-	app.Tracker.record("idle", "💤")
 	fmt.Println()
 }
 
@@ -299,25 +291,28 @@ func runSession(app *App, mode Mode, initialMsg, projectConfig string, cmd *Star
 		preview = preview[:80] + "…"
 	}
 	app.Sessions.create(id, mode.Name, mode.Indicator, preview)
-	suspendCh := app.Control.newSession()
+	suspendCh, selfDropCh := app.Control.newSession()
 	defer app.Control.clearSession()
 
-	args := buildSessionArgs(id, false, mode, initialMsg, projectConfig, cmd, passthrough)
-	return execSession(app, id, args, suspendCh)
+	args := buildSessionArgs(id, false, mode, projectConfig, cmd, passthrough)
+	if initialMsg != "" {
+		args = append([]string{initialMsg}, args...)
+	}
+	return execSession(app, id, args, suspendCh, selfDropCh)
 }
 
 // resumeSession resumes an existing suspended session.
 func resumeSession(app *App, mode Mode, sessionID, projectConfig string, cmd *StartCmd, passthrough []string) error {
 	app.Sessions.setStatus(sessionID, "active")
-	suspendCh := app.Control.newSession()
+	suspendCh, selfDropCh := app.Control.newSession()
 	defer app.Control.clearSession()
 
-	args := buildSessionArgs(sessionID, true, mode, "", projectConfig, cmd, passthrough)
-	return execSession(app, sessionID, args, suspendCh)
+	args := buildSessionArgs(sessionID, true, mode, projectConfig, cmd, passthrough)
+	return execSession(app, sessionID, args, suspendCh, selfDropCh)
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, initialMsg, projectConfig string, cmd *StartCmd, passthrough []string) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, cmd *StartCmd, passthrough []string) []string {
 	fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
 
 	var args []string
@@ -329,13 +324,12 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, initialMsg, proj
 		args = append(args, "--session-id", sessionID)
 	}
 
-	// MCP config — always provided (needed for request_suspend)
+	// MCP config — always provided (needed for request_suspend and self_drop)
 	mcpConfigFile, err := writeMCPConfig(cmd.Port)
 	if err != nil {
 		slog.Error("failed to write MCP config", "error", err)
 	} else {
 		args = append(args, "--mcp-config", mcpConfigFile)
-		// Note: temp file cleanup is best-effort; OS cleans /tmp anyway
 	}
 
 	// Settings
@@ -354,16 +348,11 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, initialMsg, proj
 		args = append(args, "--plugin-dir", filepath.Join(cmd.VeePath, dir))
 	}
 
-	// Initial message as positional argument (only for new sessions)
-	if !resume && initialMsg != "" {
-		args = append(args, initialMsg)
-	}
-
 	return args
 }
 
-// execSession runs a claude process and handles suspend vs natural exit.
-func execSession(app *App, sessionID string, args []string, suspendCh chan struct{}) error {
+// execSession runs a claude process and handles suspend, self-drop, and natural exit.
+func execSession(app *App, sessionID string, args []string, suspendCh, selfDropCh chan struct{}) error {
 	slog.Debug("claude args", "args", args)
 
 	claude := exec.Command("claude", args...)
@@ -398,22 +387,32 @@ func execSession(app *App, sessionID string, args []string, suspendCh chan struc
 		// Suspend requested — send SIGINT and wait for graceful exit
 		slog.Debug("suspending session", "id", sessionID)
 		_ = claude.Process.Signal(syscall.SIGINT)
-
-		// Wait up to 5 seconds for graceful exit
-		timer := time.NewTimer(5 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-doneCh:
-			// Graceful exit after SIGINT
-		case <-timer.C:
-			slog.Debug("force killing session", "id", sessionID)
-			_ = claude.Process.Kill()
-			<-doneCh
-		}
-
+		waitOrKill(claude, doneCh)
 		app.Sessions.setStatus(sessionID, "suspended")
 		fmt.Println("\nSession suspended.")
 		return nil
+
+	case <-selfDropCh:
+		// Self-drop — task is done, terminate and record as completed
+		slog.Debug("self-drop session", "id", sessionID)
+		_ = claude.Process.Signal(syscall.SIGINT)
+		waitOrKill(claude, doneCh)
+		app.Sessions.setStatus(sessionID, "completed")
+		fmt.Println("\nSession completed.")
+		return nil
+	}
+}
+
+// waitOrKill waits up to 5 seconds for the process to exit, then force-kills it.
+func waitOrKill(cmd *exec.Cmd, doneCh <-chan error) {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-doneCh:
+	case <-timer.C:
+		slog.Debug("force killing process", "pid", cmd.Process.Pid)
+		_ = cmd.Process.Kill()
+		<-doneCh
 	}
 }
 

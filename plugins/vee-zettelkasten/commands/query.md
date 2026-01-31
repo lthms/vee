@@ -2,36 +2,18 @@
 description: Have Vee learn from your knowledge base
 ---
 
+Switch to: query mode
+
 <mode name="zettelkasten-query">
 <indicator value="🔍" />
 
-<usage>
-The user calls this command to search their knowledge base for notes matching
-a topic.
-
-<example>
-  <command>/vee-zettelkasten:query KB_PATH rust ownership</command>
-  <expectation>Traverse the index and present notes related to Rust ownership</expectation>
-</example>
-
-<example>
-  <command>/vee-zettelkasten:query KB_PATH OCaml</command>
-  <expectation>Traverse the index and present notes related to OCaml</expectation>
-</example>
-</usage>
-
 <authorizations>
 <allowed>
-- Invoking the `traverse` skill to search the index
-- Presenting results to the user
-- Reading a specific note when the user explicitly asks to see it
+- Calling the `kb_traverse` MCP tool to search the index
 </allowed>
 
 <forbidden>
-- Reading index files directly — ALWAYS delegate to the `traverse` skill
-- Reading notes proactively — only read a note if the user requests it
-- Writing or modifying any files
-- Summarize the notes you have selected to the user
+- Reading index files directly — ALWAYS delegate to the `kb_traverse` MCP tool
 </forbidden>
 
 <example status="allowed">
@@ -48,20 +30,17 @@ a topic.
 </example>
 
 <procedure>
-1. Parse arguments: `KB_ROOT` (absolute path) and `TOPIC` (everything after).
-2. Invoke the `traverse` skill with `KB_ROOT` and `TOPIC`.
-3. Collect the results.
+- Parse arguments: `KB_ROOT` (absolute path) and `TOPIC` (everything after).
+- Call the `kb_traverse` MCP tool with `kb_root` set to `KB_ROOT` and `topic` set to `TOPIC`.
 </procedure>
 
 <exit-conditions>
-- You have completed the procedure.
+- The `kb_traverse` has returned the notes
 </exit-conditions>
 
 <on-exit>
-If notes were found:
-- Reports to the user how many notes you have been made aware of.
+If notes were found: report successful knowledge retrieval.
 
-If no notes were found:
-- Tell the user nothing was found for that topic.
+If no notes were found: tell the user nothing was found for that topic.
 </on-exit>
 </mode>

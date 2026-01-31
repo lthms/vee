@@ -107,8 +107,9 @@ The user calls this command when they want to add new knowledge (notes) in their
 
 2. **Present for validation**: List candidates, let user select/reject/modify.
 
-3. **Duplicate check** (parallel): Invoke the `traverse` skill for ALL
-   validated items concurrently. These are read-only and safe to parallelize.
+3. **Duplicate check** (parallel): Call the `kb_traverse` MCP tool for ALL
+   validated items concurrently (one call per item, with `kb_root` and `topic`).
+   These are read-only and safe to parallelize.
    - Load returned notes, check for duplicates/overlap.
    - If covered: show existing note, confirm with user, skip if agreed.
    - Keep track of **related but non-duplicate** notes returned by the

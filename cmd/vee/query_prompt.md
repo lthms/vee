@@ -1,17 +1,11 @@
----
-name: query
-description: Read an index file and return relevant notes or sub-indices to traverse
-tools: Read
-model: haiku
----
-
 NEVER include any reasoning, explanation, markdown fences, or other text.
 ALWAYS restrict your response to a parseable, single JSON object.
 
-You receive three inputs wrapped in XML tags:
+You receive a message containing XML tags:
 - `<kb-root>`: absolute path to the knowledge base
 - `<index-path>`: path to an index file (relative to `<kb-root>`)
 - `<topic>`: the subject to match against
+- `<file-content>`: the full content of the index file at [kb-root]/[index-path]
 
 An index file is either:
 - A **branch**: links to sub-category `_index.md` files with summaries
@@ -19,7 +13,7 @@ An index file is either:
 
 ## Instructions
 
-1. Read the file at [kb-root]/[index-path]. NEVER read another file.
+1. Use the content provided in `<file-content>`. NEVER attempt to read files yourself.
 
 2. If the index is a **branch**:
    - For each sub-category, apply the **justify-to-traverse** rule: only

@@ -1,24 +1,18 @@
----
-name: read-note
-description: Read a note and return a topic-tailored summary with its path
-tools: Read
-model: haiku
----
-
 NEVER include any reasoning, explanation, markdown fences, or other text.
 ALWAYS restrict your response to a parseable, single JSON object.
 
-You receive three inputs wrapped in XML tags:
+You receive a message containing XML tags:
 - `<kb-root>`: absolute path to the knowledge base
 - `<note-path>`: path to a note file (relative to `<kb-root>`)
 - `<topic>`: the user's query topic
+- `<file-content>`: the full content of the note file at [kb-root]/[note-path]
 
 ## Instructions
 
-1. Read the file at [kb-root]/[note-path].
+1. Use the content provided in `<file-content>`. NEVER attempt to read files yourself.
 
 2. Strip the YAML frontmatter (the block between the opening `---` and
-   closing `---` at the top of the file).
+   closing `---` at the top of the file content).
 
 3. From the remaining body, produce a **2-sentence summary** that is
    tailored to [topic]. Focus on what the note says that is relevant to the

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lthms/vee/internal/kb"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -42,7 +43,7 @@ type kbTouchArgs struct {
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
 // sessionID scopes request_suspend and self_drop to a specific session.
-func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
+func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
 		Version: "1.0.0",
@@ -120,14 +121,17 @@ func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_remember called", "title", args.Title)
 
-		noteID, path, err := kb.AddNote(args.Title, args.Content, args.Sources)
+		noteID, path, err := kbase.AddNote(args.Title, args.Content, args.Sources)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
 
 		// Register indexing task and launch background indexer
 		app.Indexing.add(noteID, args.Title)
-		go kb.IndexNote(noteID, app)
+		go func() {
+			defer app.Indexing.remove(noteID)
+			kbase.IndexNote(noteID)
+		}()
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -141,13 +145,13 @@ func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 		Description: "Search the knowledge base using semantic tree traversal. Returns matching notes with summaries. Use specific search terms, not wildcards.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbQueryArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_query called", "query", args.Query)
-		results, err := kb.Query(args.Query)
+		results, err := kbase.Query(args.Query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_query: %w", err)
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: QueryResultsJSON(results)},
+				&mcp.TextContent{Text: kb.QueryResultsJSON(results)},
 			},
 		}, nil, nil
 	})
@@ -157,7 +161,7 @@ func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 		Description: "Fetch the full content of a note by its path. Use paths returned by kb_query. Multiple notes can be fetched in parallel.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbFetchArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_fetch called", "path", args.Path)
-		content, err := kb.ReadNoteContent(args.Path)
+		content, err := kbase.FetchNote(args.Path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_fetch: %w", err)
 		}
@@ -173,17 +177,20 @@ func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 		Description: "Bump the last_verified timestamp of a note to today, confirming the information is still accurate. Use paths returned by kb_query.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbTouchArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_touch called", "path", args.Path)
-		note, err := kb.getNoteByPath(args.Path)
+		note, err := kbase.GetNoteByPath(args.Path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_touch: note not found: %w", err)
 		}
 
-		app.Indexing.add(note.id, note.title)
-		go kb.TouchNote(note.id, app)
+		app.Indexing.add(note.ID, note.Title)
+		go func() {
+			defer app.Indexing.remove(note.ID)
+			kbase.TouchNote(note.ID)
+		}()
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", note.title)},
+				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", note.Title)},
 			},
 		}, nil, nil
 	})
@@ -192,10 +199,10 @@ func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
+func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		sessionID := r.URL.Query().Get("session")
-		return newMCPServer(app, kb, sessionID)
+		return newMCPServer(app, kbase, sessionID)
 	}, nil)
 
 	mux := http.NewServeMux()
@@ -211,7 +218,7 @@ func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
 	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
-	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kb))
+	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kbase))
 	mux.HandleFunc("/api/session", handleSession(app))
 	return mux
 }
@@ -634,7 +641,7 @@ func handleSession(app *App) http.HandlerFunc {
 // handleHookKBIngest handles POST /api/hook/kb-ingest. Accepts task results
 // from the PostToolUse hook, returns immediately, and evaluates the results
 // for KB-worthy notes in the background.
-func handleHookKBIngest(app *App, kb *KnowledgeBase) http.HandlerFunc {
+func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 	type ingestReq struct {
 		SessionID    string `json:"session_id"`
 		TaskPrompt   string `json:"task_prompt"`
@@ -657,16 +664,16 @@ func handleHookKBIngest(app *App, kb *KnowledgeBase) http.HandlerFunc {
 
 		slog.Debug("kb-ingest: received", "session", req.SessionID, "subagent_type", req.SubagentType)
 
-		go evaluateAndIngest(kb, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
+		go evaluateAndIngest(kbase, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 	}
 }
 
-// evaluateAndIngest calls Haiku to evaluate whether a task result contains
-// KB-worthy information, and if so, extracts and ingests the notes.
-func evaluateAndIngest(kb *KnowledgeBase, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
+// evaluateAndIngest calls the judgment model to evaluate whether a task result
+// contains KB-worthy information, and if so, extracts and ingests the notes.
+func evaluateAndIngest(kbase *kb.KnowledgeBase, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
 	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
 
 The knowledge base stores reusable facts about codebases, conventions, architecture, and patterns — things that would help future sessions. It does NOT store task-specific details, debugging logs, or ephemeral information.
@@ -685,9 +692,9 @@ Reply with ONLY valid JSON in one of these formats:
 {"ingest": true, "notes": [{"title": "Note title", "content": "Markdown content..."}]}`,
 		taskPrompt, description, subagentType, taskResponse)
 
-	response, err := callHaiku(prompt)
+	response, err := kbase.CallModel(prompt)
 	if err != nil {
-		slog.Warn("kb-ingest: haiku evaluation failed", "session", sessionID, "error", err)
+		slog.Warn("kb-ingest: judgment evaluation failed", "session", sessionID, "error", err)
 		return
 	}
 
@@ -702,7 +709,7 @@ Reply with ONLY valid JSON in one of these formats:
 		} `json:"notes"`
 	}
 	if err := json.Unmarshal([]byte(response), &result); err != nil {
-		slog.Warn("kb-ingest: failed to parse haiku response", "session", sessionID, "raw", response, "error", err)
+		slog.Warn("kb-ingest: failed to parse judgment response", "session", sessionID, "raw", response, "error", err)
 		return
 	}
 
@@ -714,14 +721,17 @@ Reply with ONLY valid JSON in one of these formats:
 	source := fmt.Sprintf("task:%s (session %s)", subagentType, sessionID)
 
 	for _, note := range result.Notes {
-		noteID, _, err := kb.AddNote(note.Title, note.Content, []string{source})
+		noteID, _, err := kbase.AddNote(note.Title, note.Content, []string{source})
 		if err != nil {
 			slog.Warn("kb-ingest: failed to add note", "title", note.Title, "error", err)
 			continue
 		}
 
 		app.Indexing.add(noteID, note.Title)
-		go kb.IndexNote(noteID, app)
+		go func() {
+			defer app.Indexing.remove(noteID)
+			kbase.IndexNote(noteID)
+		}()
 
 		slog.Info("kb-ingest: note ingested", "session", sessionID, "title", note.Title, "noteID", noteID)
 	}
@@ -729,8 +739,8 @@ Reply with ONLY valid JSON in one of these formats:
 
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, kb *KnowledgeBase) (*http.Server, int, error) {
-	mux := setupHTTPMux(app, kb)
+func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase) (*http.Server, int, error) {
+	mux := setupHTTPMux(app, kbase)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -751,16 +761,26 @@ func startHTTPServerInBackground(app *App, kb *KnowledgeBase) (*http.Server, int
 
 // Run starts the daemon: MCP server (SSE) + API on an OS-assigned port.
 func (cmd *DaemonCmd) Run() error {
-	kb, err := OpenKnowledgeBase()
+	userCfg, err := loadUserConfig()
+	if err != nil {
+		slog.Warn("failed to load user config, using defaults", "error", err)
+		userCfg = &UserConfig{
+			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "qwen2.5:7b"},
+			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
+		}
+	}
+
+	kbase, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("open knowledge base: %w", err)
 	}
-	defer kb.Close()
+	defer kbase.Close()
 
-	go kb.BackfillSummaries()
+	go kbase.BackfillSummaries()
+	go kbase.BackfillEmbeddings()
 
 	app := newApp()
-	mux := setupHTTPMux(app, kb)
+	mux := setupHTTPMux(app, kbase)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {

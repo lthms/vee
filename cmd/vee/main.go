@@ -140,17 +140,27 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	// Redirect slog to a file so it can be viewed in the logs window
 	setupFileLogger(veeLogFile)
 
-	kb, err := OpenKnowledgeBase()
+	userCfg, err := loadUserConfig()
+	if err != nil {
+		slog.Warn("failed to load user config, using defaults", "error", err)
+		userCfg = &UserConfig{
+			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "qwen2.5:7b"},
+			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
+		}
+	}
+
+	kbase, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("failed to open knowledge base: %w", err)
 	}
-	defer kb.Close()
+	defer kbase.Close()
 
-	go kb.BackfillSummaries()
+	go kbase.BackfillSummaries()
+	go kbase.BackfillEmbeddings()
 
 	app := newApp()
 
-	srv, port, err := startHTTPServerInBackground(app, kb)
+	srv, port, err := startHTTPServerInBackground(app, kbase)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}

@@ -30,7 +30,9 @@ type JudgmentConfig struct {
 
 // KnowledgeConfig configures knowledge base settings.
 type KnowledgeConfig struct {
-	EmbeddingModel string `toml:"embedding_model"`
+	EmbeddingModel string  `toml:"embedding_model"`
+	Threshold      float64 `toml:"threshold"`
+	MaxSelect      int     `toml:"max_select"`
 }
 
 // loadUserConfig reads ~/.config/vee/config.toml and returns the parsed config
@@ -51,6 +53,8 @@ func loadUserConfig() (*UserConfig, error) {
 		},
 		Knowledge: KnowledgeConfig{
 			EmbeddingModel: "nomic-embed-text",
+			Threshold:      0.3,
+			MaxSelect:      5,
 		},
 	}
 
@@ -70,6 +74,12 @@ func loadUserConfig() (*UserConfig, error) {
 	}
 	if cfg.Knowledge.EmbeddingModel == "" {
 		cfg.Knowledge.EmbeddingModel = "nomic-embed-text"
+	}
+	if cfg.Knowledge.Threshold == 0 {
+		cfg.Knowledge.Threshold = 0.3
+	}
+	if cfg.Knowledge.MaxSelect == 0 {
+		cfg.Knowledge.MaxSelect = 5
 	}
 
 	return cfg, nil
@@ -222,6 +232,8 @@ func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, error) {
 		VaultDir:       filepath.Join(stateDir, "vault"),
 		Model:          model,
 		EmbeddingModel: userCfg.Knowledge.EmbeddingModel,
+		Threshold:      userCfg.Knowledge.Threshold,
+		MaxSelect:      userCfg.Knowledge.MaxSelect,
 	})
 }
 

@@ -88,48 +88,45 @@ func (kb *KnowledgeBase) embedAndStoreNode(nodeID int, summary string) []float64
 	return emb
 }
 
-// selectByThreshold selects nodes whose cosine similarity to the query embedding
-// exceeds the threshold, up to maxCount. Returns all node IDs if none exceed
-// the threshold (fallback behavior).
+// selectByThreshold selects the top maxCount nodes by cosine similarity,
+// excluding any below the threshold. Returns nil if no nodes exceed the threshold.
 func selectByThreshold(queryEmb []float64, nodes []*treeNode, embeddings map[int][]float64, threshold float64, maxCount int) []*treeNode {
 	type scored struct {
 		node  *treeNode
 		score float64
 	}
 
-	var candidates []scored
+	// Score all nodes that have embeddings
+	var all []scored
 	for _, n := range nodes {
 		emb, ok := embeddings[n.id]
 		if !ok {
 			continue
 		}
-		score := cosineSimilarity(queryEmb, emb)
-		if score >= threshold {
-			candidates = append(candidates, scored{node: n, score: score})
-		}
-	}
-
-	if len(candidates) == 0 {
-		// Fallback: return all nodes
-		return nodes
+		all = append(all, scored{node: n, score: cosineSimilarity(queryEmb, emb)})
 	}
 
 	// Sort by score descending (insertion sort is fine for small N)
-	for i := 1; i < len(candidates); i++ {
-		for j := i; j > 0 && candidates[j].score > candidates[j-1].score; j-- {
-			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].score > all[j-1].score; j-- {
+			all[j], all[j-1] = all[j-1], all[j]
 		}
 	}
 
 	// Cap at maxCount
-	if maxCount > 0 && len(candidates) > maxCount {
-		candidates = candidates[:maxCount]
+	if maxCount > 0 && len(all) > maxCount {
+		all = all[:maxCount]
 	}
 
-	selected := make([]*treeNode, len(candidates))
-	for i, c := range candidates {
-		selected[i] = c.node
+	// Apply threshold floor
+	var selected []*treeNode
+	for _, c := range all {
+		if c.score < threshold {
+			break // sorted desc, so everything after is also below threshold
+		}
+		selected = append(selected, c.node)
 	}
+
 	return selected
 }
 

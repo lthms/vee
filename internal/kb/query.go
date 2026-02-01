@@ -6,11 +6,6 @@ import (
 	"sync"
 )
 
-const (
-	embeddingThreshold = 0.3
-	embeddingMaxSelect = 5
-)
-
 // Query performs a tree traversal to find relevant notes for a query.
 // Uses embedding-based routing when embeddings are available, falling back
 // to including all children when embeddings fail.
@@ -153,5 +148,5 @@ func (kb *KnowledgeBase) selectNodes(nodes []*treeNode, queryEmb []float64) []*t
 		return nodes
 	}
 
-	return selectByThreshold(queryEmb, nodes, embeddings, embeddingThreshold, embeddingMaxSelect)
+	return selectByThreshold(queryEmb, nodes, embeddings, kb.threshold, kb.maxSelect)
 }

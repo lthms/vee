@@ -140,10 +140,10 @@ func TestSelectByThreshold(t *testing.T) {
 		t.Errorf("expected first selected to be 'high', got %q", selected[0].label)
 	}
 
-	// With threshold above any actual similarity, fallback returns all
+	// With threshold above any actual similarity, returns empty (no fallback)
 	selected = selectByThreshold(queryEmb, nodes, embeddings, 1.1, 5)
-	if len(selected) != 3 {
-		t.Errorf("expected fallback to return all 3 nodes, got %d", len(selected))
+	if len(selected) != 0 {
+		t.Errorf("expected 0 nodes when threshold exceeds all scores, got %d", len(selected))
 	}
 
 	// With maxCount=1

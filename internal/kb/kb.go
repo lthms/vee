@@ -22,10 +22,12 @@ type Model interface {
 
 // Config holds KB initialization parameters.
 type Config struct {
-	DBPath         string // path to SQLite file
-	VaultDir       string // path to markdown vault directory
-	Model          Model  // LLM backend for indexing/judgment/embeddings
-	EmbeddingModel string // model name for stale detection in DB (e.g. "nomic-embed-text")
+	DBPath         string  // path to SQLite file
+	VaultDir       string  // path to markdown vault directory
+	Model          Model   // LLM backend for indexing/judgment/embeddings
+	EmbeddingModel string  // model name for stale detection in DB (e.g. "nomic-embed-text")
+	Threshold      float64 // minimum cosine similarity to include a node (0 = use default 0.3)
+	MaxSelect      int     // max nodes selected per tree level (0 = use default 5)
 }
 
 // KnowledgeBase provides persistent note storage backed by markdown files
@@ -34,7 +36,9 @@ type KnowledgeBase struct {
 	db             *sql.DB
 	vaultDir       string
 	model          Model
-	embeddingModel string // stored in node_embeddings.model for stale detection
+	embeddingModel string  // stored in node_embeddings.model for stale detection
+	threshold      float64 // minimum cosine similarity for node selection
+	maxSelect      int     // max nodes per tree level
 }
 
 // QueryResult is a single search hit from the tree index.
@@ -74,11 +78,22 @@ func Open(cfg Config) (*KnowledgeBase, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
+	threshold := cfg.Threshold
+	if threshold == 0 {
+		threshold = 0.3
+	}
+	maxSelect := cfg.MaxSelect
+	if maxSelect == 0 {
+		maxSelect = 5
+	}
+
 	return &KnowledgeBase{
 		db:             db,
 		vaultDir:       cfg.VaultDir,
 		model:          cfg.Model,
 		embeddingModel: cfg.EmbeddingModel,
+		threshold:      threshold,
+		maxSelect:      maxSelect,
 	}, nil
 }
 

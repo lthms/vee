@@ -32,9 +32,10 @@ const (
 
 // dashboardState mirrors the /api/state JSON response.
 type dashboardState struct {
-	Active    []*Session `json:"active_sessions"`
-	Suspended []*Session `json:"suspended_sessions"`
-	Completed []*Session `json:"completed_sessions"`
+	Active    []*Session     `json:"active_sessions"`
+	Suspended []*Session     `json:"suspended_sessions"`
+	Completed []*Session     `json:"completed_sessions"`
+	Indexing  []IndexingTask `json:"indexing_tasks"`
 }
 
 // Run starts the dashboard TUI loop.
@@ -123,6 +124,10 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	} else {
 		// Active sessions
 		cmd.renderSection(&sb, "ACTIVE", state.Active, ansiGreen, termWidth)
+		// Indexing tasks (only shown when non-empty)
+		if len(state.Indexing) > 0 {
+			cmd.renderIndexingSection(&sb, state.Indexing, termWidth)
+		}
 		// Suspended sessions
 		cmd.renderSection(&sb, "SUSPENDED", state.Suspended, ansiYellow, termWidth)
 		// Completed sessions
@@ -214,6 +219,50 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 		sb.WriteString(age)
 		sb.WriteString(ansiReset)
 
+		sb.WriteString("\r\n")
+	}
+	sb.WriteString("\r\n")
+}
+
+const ansiCyan = "\033[38;2;137;220;235m" // #89dceb
+
+func (cmd *DashboardCmd) renderIndexingSection(sb *strings.Builder, tasks []IndexingTask, termWidth int) {
+	sb.WriteString("  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("INDEXING")
+	sb.WriteString(ansiReset)
+	sb.WriteString("\r\n")
+
+	for _, task := range tasks {
+		age := formatAge(time.Since(task.StartedAt))
+
+		title := task.Title
+		const indent = 4
+		const iconWidth = 2
+		leftFixed := indent + iconWidth + 1 + len(title)
+		rightFixed := len(age) + 2
+
+		sb.WriteString("    ")
+		sb.WriteString(ansiCyan)
+		sb.WriteString("⟳")
+		sb.WriteString(" ")
+		sb.WriteString(ansiBold)
+		maxTitle := termWidth - indent - iconWidth - 1 - rightFixed - 4
+		if maxTitle > 0 && len(title) > maxTitle {
+			title = title[:maxTitle-3] + "..."
+			leftFixed = indent + iconWidth + 1 + len(title)
+		}
+		sb.WriteString(title)
+		sb.WriteString(ansiReset)
+
+		padding := termWidth - leftFixed - rightFixed
+		if padding < 2 {
+			padding = 2
+		}
+		sb.WriteString(strings.Repeat(" ", padding))
+		sb.WriteString(ansiMuted)
+		sb.WriteString(age)
+		sb.WriteString(ansiReset)
 		sb.WriteString("\r\n")
 	}
 	sb.WriteString("\r\n")

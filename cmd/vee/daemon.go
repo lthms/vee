@@ -23,11 +23,19 @@ type selfDropArgs struct{}
 type kbRememberArgs struct {
 	Title   string   `json:"title" jsonschema:"Title of the note"`
 	Content string   `json:"content" jsonschema:"Body of the note (markdown)"`
-	Tags    []string `json:"tags" jsonschema:"Tags for categorization"`
+	Sources []string `json:"sources" jsonschema:"required,Origins of the information (file paths, URLs, issue references, etc.)"`
 }
 
 type kbQueryArgs struct {
-	Query string `json:"query" jsonschema:"Full-text search query"`
+	Query string `json:"query" jsonschema:"Search query. Use specific, meaningful search terms (e.g. 'tmux keybindings'). Do NOT use wildcards or glob patterns."`
+}
+
+type kbFetchArgs struct {
+	Path string `json:"path" jsonschema:"Relative path of the note in the vault (as returned by kb_query)"`
+}
+
+type kbTouchArgs struct {
+	Path string `json:"path" jsonschema:"Relative path of the note in the vault (as returned by kb_query)"`
 }
 
 // newMCPServer creates a fresh MCP server with all tools registered.
@@ -101,32 +109,74 @@ func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
 	// Knowledge base tools — available to all modes
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
-		Description: "Save a note to the persistent knowledge base. Writes an Obsidian-compatible markdown file and indexes it for search.",
+		Description: "Save a note to the persistent knowledge base. Writes an Obsidian-compatible markdown file. Tags, summaries, and tree indexing are handled automatically in the background.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_remember called", "title", args.Title)
-		path, err := kb.AddNote(args.Title, args.Content, args.Tags)
+
+		noteID, path, err := kb.AddNote(args.Title, args.Content, args.Sources)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
+
+		// Register indexing task and launch background indexer
+		app.Indexing.add(noteID, args.Title)
+		go kb.IndexNote(noteID, app)
+
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Note saved: %s", path)},
+				&mcp.TextContent{Text: fmt.Sprintf("Note saved: %s (indexing in background)", path)},
 			},
 		}, nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_query",
-		Description: "Search the knowledge base using full-text search. Returns matching notes with snippets.",
+		Description: "Search the knowledge base using semantic tree traversal. Returns matching notes with summaries. Use specific search terms, not wildcards.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbQueryArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_query called", "query", args.Query)
-		results, err := kb.Query(args.Query, 20)
+		results, err := kb.Query(args.Query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_query: %w", err)
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: QueryResultsJSON(results)},
+			},
+		}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "kb_fetch",
+		Description: "Fetch the full content of a note by its path. Use paths returned by kb_query. Multiple notes can be fetched in parallel.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbFetchArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("kb_fetch called", "path", args.Path)
+		content, err := kb.ReadNoteContent(args.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("kb_fetch: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: content},
+			},
+		}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "kb_touch",
+		Description: "Bump the last_verified timestamp of a note to today, confirming the information is still accurate. Use paths returned by kb_query.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbTouchArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("kb_touch called", "path", args.Path)
+		note, err := kb.getNoteByPath(args.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("kb_touch: note not found: %w", err)
+		}
+
+		app.Indexing.add(note.id, note.title)
+		go kb.TouchNote(note.id, app)
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", note.title)},
 			},
 		}, nil, nil
 	})
@@ -157,12 +207,14 @@ func handleState(app *App) http.HandlerFunc {
 		activeSessions := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
 		completedSessions := app.Sessions.completed()
+		indexingTasks := app.Indexing.list()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"active_sessions":    activeSessions,
 			"suspended_sessions": suspendedSessions,
 			"completed_sessions": completedSessions,
+			"indexing_tasks":     indexingTasks,
 		})
 	}
 }
@@ -378,6 +430,8 @@ func (cmd *DaemonCmd) Run() error {
 		return fmt.Errorf("open knowledge base: %w", err)
 	}
 	defer kb.Close()
+
+	go kb.BackfillSummaries()
 
 	app := newApp()
 	mux := setupHTTPMux(app, kb)

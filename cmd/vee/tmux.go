@@ -100,7 +100,7 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 
 		// Window behavior
 		{"set-option", "-t", "vee", "-g", "allow-rename", "off"},
-		{"set-option", "-t", "vee", "-g", "mouse", "off"},
+		{"set-option", "-t", "vee", "-g", "mouse", "on"},
 		{"set-option", "-t", "vee", "-g", "history-limit", "50000"},
 
 		// Renumber windows on close so indices stay compact

@@ -69,15 +69,29 @@ func initModeRegistry() error {
 		}
 	}
 
-	// Vanilla Claude mode — no system prompt injection
+	// Vanilla Claude mode — inject only the KB section so Claude knows about the tools
+	kbPrompt := extractSection(string(basePrompt), "<knowledge-base>", "</knowledge-base>")
 	modeRegistry["claude"] = Mode{
 		Name:        "claude",
 		Indicator:   "🤖",
 		Description: "Vanilla Claude Code session",
-		NoPrompt:    true,
+		Prompt:      kbPrompt,
 	}
 
 	return nil
+}
+
+// extractSection returns the content between start and end markers (inclusive).
+func extractSection(s, start, end string) string {
+	i := strings.Index(s, start)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(s[i:], end)
+	if j < 0 {
+		return ""
+	}
+	return s[i : i+j+len(end)]
 }
 
 // claudeArgs holds the arguments after "--" that are forwarded to claude.
@@ -127,6 +141,8 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to open knowledge base: %w", err)
 	}
 	defer kb.Close()
+
+	go kb.BackfillSummaries()
 
 	app := newApp()
 
@@ -427,7 +443,7 @@ func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArg
 	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --session-id %s",
 		shelljoin(veeBinary), port, sessionID)
 
-	return claudeCmd + "; " + cleanupCmd
+	return "printf '\\033[?25h'; " + claudeCmd + "; " + cleanupCmd
 }
 
 // SessionEndedCmd is called when Claude exits to clean up stale sessions.
@@ -472,15 +488,28 @@ func (cmd *ShutdownCmd) Run() error {
 	setupFileLogger(veeLogFile)
 	slog.Debug("shutdown: starting graceful shutdown")
 
-	// Fetch all active sessions from the daemon
+	// Fetch state from the daemon
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
 	if err == nil {
 		defer resp.Body.Close()
 
 		var state struct {
-			Active []*Session `json:"active_sessions"`
+			Active   []*Session     `json:"active_sessions"`
+			Indexing []IndexingTask `json:"indexing_tasks"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&state); err == nil {
+			// Warn if indexing is in progress
+			if len(state.Indexing) > 0 {
+				slog.Debug("shutdown: indexing in progress", "count", len(state.Indexing))
+				msg := fmt.Sprintf("%d note(s) are being indexed. Quit anyway?", len(state.Indexing))
+				// Use tmux confirm-before to ask the user
+				out, confirmErr := tmuxRun("confirm-before", "-p", msg+" (y/n)", "run-shell 'exit 0'")
+				if confirmErr != nil {
+					slog.Debug("shutdown: user cancelled due to indexing warning", "output", out)
+					return nil
+				}
+			}
+
 			slog.Debug("shutdown: suspending active sessions", "count", len(state.Active))
 			for _, sess := range state.Active {
 				slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)

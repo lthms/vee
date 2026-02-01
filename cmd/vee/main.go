@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -193,10 +194,11 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 
 // NewPaneCmd is the internal subcommand called by tmux display-menu entries.
 type NewPaneCmd struct {
-	VeePath string `required:"" type:"path" name:"vee-path"`
-	Port    int    `short:"p" default:"2700" name:"port"`
-	Mode    string `required:"" name:"mode"`
-	Prompt  string `name:"prompt" help:"Initial prompt for the session."`
+	VeePath   string `required:"" type:"path" name:"vee-path"`
+	Port      int    `short:"p" default:"2700" name:"port"`
+	Mode      string `required:"" name:"mode"`
+	Prompt    string `name:"prompt" help:"Initial prompt for the session."`
+	Ephemeral bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
 }
 
 // Run creates a new tmux window with a Claude session for the given mode.
@@ -224,10 +226,21 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	// Generate session ID
 	sessionID := newUUID()
 
-	// Build claude args
-	sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, cmd.Port, cmd.VeePath, []string(args), veeBinary)
+	var shellCmd string
+	if cmd.Ephemeral {
+		cfg, err := readProjectTOML()
+		if err != nil {
+			return fmt.Errorf("failed to read .vee/config.toml: %w", err)
+		}
+		if cfg.Ephemeral == nil {
+			return fmt.Errorf("no [ephemeral] section in .vee/config.toml")
+		}
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, projectConfig, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+	} else {
+		sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, cmd.Port, cmd.VeePath, []string(args), veeBinary)
+		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
+	}
 
-	shellCmd := buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
 
 	// Create the tmux window first so we have the window ID
@@ -237,7 +250,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	}
 
 	// Register session with daemon, including the window target
-	if err := registerSession(cmd.Port, sessionID, mode, windowID); err != nil {
+	if err := registerSession(cmd.Port, sessionID, mode, windowID, cmd.Ephemeral); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -265,9 +278,9 @@ func fetchProjectConfig(port int) (string, error) {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string) error {
-	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q}`,
-		sessionID, mode.Name, mode.Indicator, windowTarget)
+func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool) error {
+	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q,"ephemeral":%t}`,
+		sessionID, mode.Name, mode.Indicator, windowTarget, ephemeral)
 
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port),
@@ -477,13 +490,25 @@ func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArg
 
 // SessionEndedCmd is called when Claude exits to clean up stale sessions.
 type SessionEndedCmd struct {
-	Port      int    `short:"p" default:"2700" name:"port"`
-	SessionID string `required:"" name:"session-id"`
+	Port        int    `short:"p" default:"2700" name:"port"`
+	SessionID   string `required:"" name:"session-id"`
+	WaitForUser bool   `name:"wait-for-user" help:"Pause for user input before closing (used for ephemeral sessions)."`
 }
 
 // Run notifies the daemon that a Claude process has exited and cleans up temp files.
 func (cmd *SessionEndedCmd) Run() error {
 	setupFileLogger(veeLogFile)
+
+	if cmd.WaitForUser {
+		fmt.Print("\n\033[1mPress Enter to close...\033[0m")
+		buf := make([]byte, 1)
+		os.Stdin.Read(buf)
+
+		// Defensive cleanup: remove container if --rm didn't catch it
+		dockerRm := exec.Command("docker", "rm", "-f", "vee-"+cmd.SessionID)
+		dockerRm.Run() // ignore errors — container is likely already gone
+	}
+
 	// Clean up per-session temp directory
 	dir := sessionTempDir(cmd.SessionID)
 	if err := os.RemoveAll(dir); err != nil {
@@ -539,17 +564,33 @@ func (cmd *ShutdownCmd) Run() error {
 				}
 			}
 
-			slog.Debug("shutdown: suspending active sessions", "count", len(state.Active))
+			slog.Debug("shutdown: handling active sessions", "count", len(state.Active))
 			for _, sess := range state.Active {
-				slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
-				body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
-				r, err := http.Post(
-					fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
-					"application/json",
-					strings.NewReader(body),
-				)
-				if err == nil {
-					r.Body.Close()
+				if sess.Ephemeral {
+					// Ephemeral sessions cannot be suspended — complete and kill container
+					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "mode", sess.Mode)
+					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
+					r, err := http.Post(
+						fmt.Sprintf("http://127.0.0.1:%d/api/complete", cmd.Port),
+						"application/json",
+						strings.NewReader(body),
+					)
+					if err == nil {
+						r.Body.Close()
+					}
+					dockerKill := exec.Command("docker", "kill", "vee-"+sess.ID)
+					dockerKill.Run() // ignore errors
+				} else {
+					slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
+					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
+					r, err := http.Post(
+						fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
+						"application/json",
+						strings.NewReader(body),
+					)
+					if err == nil {
+						r.Body.Close()
+					}
 				}
 			}
 		}
@@ -743,7 +784,7 @@ func writeMCPConfig(port int, sessionID string) (string, error) {
 	}
 
 	path := filepath.Join(dir, "mcp.json")
-	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, port)
+	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse?session=%s"}}}`, port, sessionID)
 
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return "", err

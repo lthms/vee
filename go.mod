@@ -3,6 +3,7 @@ module github.com/lthms/vee
 go 1.25
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/alecthomas/kong v1.13.0
 	github.com/modelcontextprotocol/go-sdk v1.2.0
 	golang.org/x/term v0.39.0

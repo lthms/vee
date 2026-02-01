@@ -48,6 +48,8 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 
 	selected := 0
 	prompt := ""
+	ephemeral := false
+	canEphemeral := ephemeralAvailable()
 
 	render := func() {
 		var sb strings.Builder
@@ -71,12 +73,27 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			sb.WriteString("\r\n")
 		}
 
+		// Ephemeral toggle (only shown when available)
+		if canEphemeral {
+			sb.WriteString("\r\n  ")
+			if ephemeral {
+				sb.WriteString("\033[38;2;249;226;175m📦 Ephemeral\033[0m")
+			} else {
+				sb.WriteString("\033[2m   Local\033[0m")
+			}
+			sb.WriteString("\r\n")
+		}
+
 		sb.WriteString("\r\n  \033[2mPrompt:\033[0m ")
 		sb.WriteString(prompt)
 		sb.WriteString("\033[s") // save cursor position
 
 		sb.WriteString("\r\n\r\n  \033[2m")
-		sb.WriteString("C-n/C-p select mode  Enter confirm  Esc cancel")
+		if canEphemeral {
+			sb.WriteString("C-n/C-p select  C-e ephemeral  Enter confirm  Esc cancel")
+		} else {
+			sb.WriteString("C-n/C-p select mode  Enter confirm  Esc cancel")
+		}
 		sb.WriteString("\033[0m\r\n")
 
 		sb.WriteString("\033[u\033[?25h") // restore cursor + show it
@@ -100,10 +117,14 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			case 27: // Esc
 				fmt.Print("\033[?25h")
 				return nil
-			case 13: // Enter
+			case 10, 13: // Enter (LF or CR)
 				fmt.Print("\033[?25h")
 				term.Restore(int(os.Stdin.Fd()), oldState)
-				return cmd.createSession(modes[selected].name, prompt, args)
+				return cmd.createSession(modes[selected].name, prompt, ephemeral, args)
+			case 5: // C-e
+				if canEphemeral {
+					ephemeral = !ephemeral
+				}
 			case 14: // C-n
 				if selected < len(modes)-1 {
 					selected++
@@ -153,7 +174,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	}
 }
 
-func (cmd *SessionPickerCmd) createSession(mode, prompt string, args claudeArgs) error {
+func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral bool, args claudeArgs) error {
 	veeBinary, err := os.Executable()
 	if err != nil {
 		return err
@@ -167,6 +188,9 @@ func (cmd *SessionPickerCmd) createSession(mode, prompt string, args claudeArgs)
 	cmdParts = append(cmdParts, "--mode", mode)
 	if prompt != "" {
 		cmdParts = append(cmdParts, "--prompt", prompt)
+	}
+	if ephemeral {
+		cmdParts = append(cmdParts, "--ephemeral")
 	}
 
 	if len(args) > 0 {

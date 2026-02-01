@@ -111,6 +111,7 @@ type Session struct {
 	Preview      string    `json:"preview"`
 	Status       string    `json:"status"`        // "active", "suspended", or "completed"
 	WindowTarget string    `json:"window_target"` // tmux window ID (e.g. "@3")
+	Ephemeral    bool      `json:"ephemeral"`
 }
 
 // sessionStore is an in-memory store of sessions keyed by ID.
@@ -125,7 +126,7 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string) *Session {
+func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &Session{
@@ -136,6 +137,7 @@ func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string)
 		Preview:      preview,
 		Status:       "active",
 		WindowTarget: windowTarget,
+		Ephemeral:    ephemeral,
 	}
 	s.sessions[id] = sess
 	return sess

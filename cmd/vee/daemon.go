@@ -40,7 +40,8 @@ type kbTouchArgs struct {
 
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
-func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
+// sessionID scopes request_suspend and self_drop to a specific session.
+func newMCPServer(app *App, kb *KnowledgeBase, sessionID string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
 		Version: "1.0.0",
@@ -50,28 +51,34 @@ func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
 		Name:        "request_suspend",
 		Description: "Request that the current Vee session be suspended so it can be resumed later.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args requestSuspendArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("request_suspend called")
-		activeSessions := app.Sessions.active()
-		if len(activeSessions) > 0 {
-			sess := activeSessions[0]
-			app.Sessions.setStatus(sess.ID, "suspended")
-			slog.Debug("session suspended", "session", sess.ID)
-			if sess.WindowTarget != "" {
-				go func() {
-					// Delay so the MCP response reaches Claude before we interrupt
-					time.Sleep(2 * time.Second)
-					tmuxGracefulClose(sess.WindowTarget)
-				}()
-			}
+		slog.Debug("request_suspend called", "session", sessionID)
+		sess := app.Sessions.get(sessionID)
+		if sess == nil || sess.Status != "active" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: "Session suspended."},
+					&mcp.TextContent{Text: "No active session to suspend."},
 				},
 			}, nil, nil
 		}
+		if sess.Ephemeral {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "Ephemeral sessions cannot be suspended. Use self_drop to end the session instead."},
+				},
+			}, nil, nil
+		}
+		app.Sessions.setStatus(sess.ID, "suspended")
+		slog.Debug("session suspended", "session", sess.ID)
+		if sess.WindowTarget != "" {
+			go func() {
+				// Delay so the MCP response reaches Claude before we interrupt
+				time.Sleep(2 * time.Second)
+				tmuxGracefulClose(sess.WindowTarget)
+			}()
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: "No active session to suspend."},
+				&mcp.TextContent{Text: "Session suspended."},
 			},
 		}, nil, nil
 	})
@@ -80,28 +87,27 @@ func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
 		Name:        "self_drop",
 		Description: "Signal that the current task is done. Call this when your work is complete to end the session.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args selfDropArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("self_drop called")
-		activeSessions := app.Sessions.active()
-		if len(activeSessions) > 0 {
-			sess := activeSessions[0]
-			app.Sessions.setStatus(sess.ID, "completed")
-			slog.Debug("session completed", "session", sess.ID)
-			if sess.WindowTarget != "" {
-				go func() {
-					// Delay so the MCP response reaches Claude before we interrupt
-					time.Sleep(2 * time.Second)
-					tmuxGracefulClose(sess.WindowTarget)
-				}()
-			}
+		slog.Debug("self_drop called", "session", sessionID)
+		sess := app.Sessions.get(sessionID)
+		if sess == nil || sess.Status != "active" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: "Session ending."},
+					&mcp.TextContent{Text: "No active session to drop."},
 				},
 			}, nil, nil
 		}
+		app.Sessions.setStatus(sess.ID, "completed")
+		slog.Debug("session completed", "session", sess.ID)
+		if sess.WindowTarget != "" {
+			go func() {
+				// Delay so the MCP response reaches Claude before we interrupt
+				time.Sleep(2 * time.Second)
+				tmuxGracefulClose(sess.WindowTarget)
+			}()
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: "No active session to drop."},
+				&mcp.TextContent{Text: "Session ending."},
 			},
 		}, nil, nil
 	})
@@ -187,7 +193,8 @@ func newMCPServer(app *App, kb *KnowledgeBase) *mcp.Server {
 // setupHTTPMux creates an http.ServeMux with all routes registered.
 func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
-		return newMCPServer(app, kb)
+		sessionID := r.URL.Query().Get("session")
+		return newMCPServer(app, kb, sessionID)
 	}, nil)
 
 	mux := http.NewServeMux()
@@ -200,6 +207,7 @@ func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/activate", handleActivate(app))
 	mux.HandleFunc("/api/preview", handlePreview(app))
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
+	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
 	return mux
 }
 
@@ -228,6 +236,7 @@ func handleSessions(app *App) http.HandlerFunc {
 		Indicator    string `json:"indicator"`
 		Preview      string `json:"preview"`
 		WindowTarget string `json:"window_target"`
+		Ephemeral    bool   `json:"ephemeral"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -242,8 +251,8 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget)
-		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget)
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral)
+		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -291,6 +300,18 @@ func handleSuspend(app *App) http.HandlerFunc {
 		sess := app.Sessions.findByWindowTarget(req.WindowTarget)
 		if sess == nil || sess.Status != "active" {
 			http.Error(w, "no active session for this window", http.StatusNotFound)
+			return
+		}
+
+		// Ephemeral sessions cannot be suspended — mark completed instead
+		if sess.Ephemeral {
+			app.Sessions.setStatus(sess.ID, "completed")
+			slog.Debug("ephemeral session completed via suspend API", "id", sess.ID, "window", req.WindowTarget)
+			if req.WindowTarget != "" {
+				go tmuxGracefulClose(req.WindowTarget)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "completed", "session_id": sess.ID})
 			return
 		}
 
@@ -438,12 +459,56 @@ func handleSessionEnded(app *App) http.HandlerFunc {
 	}
 }
 
+// handleHookPreview handles POST /api/hook/preview?session=<id>.
+// Accepts raw Claude hook JSON from stdin (piped via curl), extracts the prompt,
+// and updates the session preview. Used by ephemeral sessions where the vee binary
+// is not available inside the container.
+func handleHookPreview(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		sessionID := r.URL.Query().Get("session")
+		if sessionID == "" {
+			http.Error(w, "missing session query parameter", http.StatusBadRequest)
+			return
+		}
+
+		var hookData struct {
+			Prompt string `json:"prompt"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&hookData); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if hookData.Prompt == "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+
+		preview := hookData.Prompt
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+
+		app.Sessions.setPreview(sessionID, preview)
+		slog.Debug("hook preview updated", "session", sessionID, "preview", preview)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
 func startHTTPServerInBackground(app *App, kb *KnowledgeBase) (*http.Server, int, error) {
 	mux := setupHTTPMux(app, kb)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		return nil, 0, fmt.Errorf("listen: %w", err)
 	}
@@ -473,7 +538,7 @@ func (cmd *DaemonCmd) Run() error {
 	app := newApp()
 	mux := setupHTTPMux(app, kb)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}

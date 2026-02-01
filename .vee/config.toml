@@ -1,0 +1,16 @@
+[ephemeral]
+# Path to Dockerfile relative to .vee/ (defaults to "Dockerfile" → .vee/Dockerfile)
+# dockerfile = "Dockerfile"
+
+# Extra arguments passed verbatim to `docker run`
+# extra_args = ["--gpus", "all"]
+
+# Bind mounts
+[[ephemeral.mounts]]
+source = "~/.claude"
+target = "/root/.claude"
+
+[[ephemeral.mounts]]
+source = "~/.claude.json"
+target = "/root/.claude.json"
+mount = "rw"

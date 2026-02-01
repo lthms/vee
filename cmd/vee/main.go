@@ -112,6 +112,7 @@ type CLI struct {
 	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
 	SessionEnded  SessionEndedCmd  `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
 	UpdatePreview UpdatePreviewCmd `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
+	UpdateWindow  UpdateWindowCmd  `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
 	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
 	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
 }
@@ -247,6 +248,11 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	windowID, err := tmuxNewWindow(windowName, shellCmd)
 	if err != nil {
 		return fmt.Errorf("failed to create tmux window: %w", err)
+	}
+
+	// Set @vee-ephemeral on the window if this is an ephemeral session
+	if cmd.Ephemeral {
+		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
 	}
 
 	// Register session with daemon, including the window target
@@ -656,6 +662,87 @@ func (cmd *UpdatePreviewCmd) Run() error {
 	return nil
 }
 
+// UpdateWindowCmd is the hook handler that reads Claude hook JSON from stdin
+// and updates the session's dynamic window state via the daemon API.
+type UpdateWindowCmd struct {
+	Port            int    `short:"p" default:"2700" name:"port"`
+	SessionID       string `required:"" name:"session-id"`
+	Working         bool   `name:"working" help:"Set working=true (Claude is processing)."`
+	NoWorking       bool   `name:"no-working" help:"Set working=false (Claude stopped)."`
+	Notification    bool   `name:"notification" help:"Set notification=true."`
+	NoNotification  bool   `name:"no-notification" help:"Clear notification flag."`
+	OnlyOnInterrupt bool   `name:"only-on-interrupt" help:"Only apply the update when the hook payload contains is_interrupt=true."`
+}
+
+// Run reads the hook JSON from stdin, extracts permission_mode and prompt,
+// then POSTs the combined state update to the daemon.
+func (cmd *UpdateWindowCmd) Run() error {
+	setupFileLogger(veeLogFile)
+
+	var hookData struct {
+		PermissionMode string `json:"permission_mode"`
+		Prompt         string `json:"prompt"`
+		IsInterrupt    bool   `json:"is_interrupt"`
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&hookData); err != nil {
+		slog.Debug("update-window: failed to decode hook stdin", "error", err)
+		// Continue with flags only — stdin might be empty for some hooks
+	}
+
+	if cmd.OnlyOnInterrupt && !hookData.IsInterrupt {
+		slog.Debug("update-window: skipping (only-on-interrupt set but is_interrupt is false)")
+		return nil
+	}
+
+	// Build the request body
+	body := map[string]any{
+		"session_id": cmd.SessionID,
+	}
+
+	if cmd.Working {
+		body["working"] = true
+	} else if cmd.NoWorking {
+		body["working"] = false
+	}
+
+	if cmd.Notification {
+		body["notification"] = true
+	} else if cmd.NoNotification {
+		body["notification"] = false
+	}
+
+	if hookData.PermissionMode != "" {
+		body["permission_mode"] = hookData.PermissionMode
+	}
+
+	if hookData.Prompt != "" {
+		preview := hookData.Prompt
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		body["preview"] = preview
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	slog.Debug("update-window: posting state", "session", cmd.SessionID, "body", string(payload))
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/window-state", cmd.Port),
+		"application/json",
+		strings.NewReader(string(payload)),
+	)
+	if err != nil {
+		slog.Debug("update-window: failed to post state", "error", err)
+		return nil
+	}
+	resp.Body.Close()
+	return nil
+}
+
 // sessionTempDir returns the per-session temp directory path.
 func sessionTempDir(sessionID string) string {
 	return filepath.Join(os.TempDir(), "vee-"+sessionID)
@@ -800,9 +887,14 @@ func writeSettings(sessionID string, port int, veeBinary string) (string, error)
 		return "", err
 	}
 
-	previewCmd := fmt.Sprintf("%s _update-preview --port %d --session-id %s",
-		veeBinary, port, sessionID)
 	cleanupCmd := fmt.Sprintf("rm -rf %s", shelljoin(dir))
+	updateBase := fmt.Sprintf("%s _update-window --port %d --session-id %s",
+		veeBinary, port, sessionID)
+
+	promptSubmitCmd := updateBase + " --working --no-notification"
+	stopCmd := updateBase + " --no-working"
+	interruptCmd := updateBase + " --no-working --only-on-interrupt"
+	notifCmd := updateBase + " --notification"
 
 	settings := map[string]any{
 		"hooks": map[string]any{
@@ -821,7 +913,37 @@ func writeSettings(sessionID string, port int, veeBinary string) (string, error)
 					"hooks": []map[string]any{
 						{
 							"type":    "command",
-							"command": previewCmd,
+							"command": promptSubmitCmd,
+						},
+					},
+				},
+			},
+			"Stop": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": stopCmd,
+						},
+					},
+				},
+			},
+			"PostToolUseFailure": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": interruptCmd,
+						},
+					},
+				},
+			},
+			"Notification": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": notifCmd,
 						},
 					},
 				},
@@ -839,7 +961,7 @@ func writeSettings(sessionID string, port int, veeBinary string) (string, error)
 		return "", err
 	}
 
-	slog.Debug("wrote settings", "path", path, "session", sessionID, "hooks", "SessionStart,UserPromptSubmit")
+	slog.Debug("wrote settings", "path", path, "session", sessionID, "hooks", "SessionStart,UserPromptSubmit,Stop,Notification")
 	return path, nil
 }
 

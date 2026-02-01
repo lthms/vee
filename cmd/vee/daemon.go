@@ -206,8 +206,10 @@ func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/complete", handleComplete(app))
 	mux.HandleFunc("/api/activate", handleActivate(app))
 	mux.HandleFunc("/api/preview", handlePreview(app))
+	mux.HandleFunc("/api/window-state", handleWindowState(app))
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
+	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
 	return mux
 }
 
@@ -497,6 +499,103 @@ func handleHookPreview(app *App) http.HandlerFunc {
 
 		app.Sessions.setPreview(sessionID, preview)
 		slog.Debug("hook preview updated", "session", sessionID, "preview", preview)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+// handleWindowState handles POST /api/window-state to update dynamic window indicators.
+func handleWindowState(app *App) http.HandlerFunc {
+	type windowStateReq struct {
+		SessionID      string `json:"session_id"`
+		Working        *bool  `json:"working,omitempty"`
+		Notification   *bool  `json:"notification,omitempty"`
+		PermissionMode string `json:"permission_mode,omitempty"`
+		Preview        string `json:"preview,omitempty"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req windowStateReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.get(req.SessionID)
+		if sess == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+
+		app.Sessions.setWindowState(req.SessionID, req.Working, req.Notification, req.PermissionMode, req.Preview)
+
+		// Re-fetch after update to get the latest state for tmux sync
+		sess = app.Sessions.get(req.SessionID)
+		if sess != nil {
+			syncWindowOptions(sess)
+		}
+
+		slog.Debug("window-state updated", "session", req.SessionID,
+			"working", req.Working, "notification", req.Notification,
+			"permission_mode", req.PermissionMode)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+// handleHookWindowState handles POST /api/hook/window-state?session=<id>.
+// Accepts raw Claude hook JSON from stdin (piped via curl), extracts permission_mode
+// and prompt, and updates the session window state. Used by ephemeral sessions
+// where the vee binary is not available inside the container.
+func handleHookWindowState(app *App) http.HandlerFunc {
+	type hookWindowStateReq struct {
+		SessionID      string `json:"session_id"`
+		Working        *bool  `json:"working,omitempty"`
+		Notification   *bool  `json:"notification,omitempty"`
+		PermissionMode string `json:"permission_mode,omitempty"`
+		Prompt         string `json:"prompt,omitempty"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		sessionID := r.URL.Query().Get("session")
+		if sessionID == "" {
+			http.Error(w, "missing session query parameter", http.StatusBadRequest)
+			return
+		}
+
+		var req hookWindowStateReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		preview := req.Prompt
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+
+		app.Sessions.setWindowState(sessionID, req.Working, req.Notification, req.PermissionMode, preview)
+
+		sess := app.Sessions.get(sessionID)
+		if sess != nil {
+			syncWindowOptions(sess)
+		}
+
+		slog.Debug("hook window-state updated", "session", sessionID,
+			"working", req.Working, "notification", req.Notification,
+			"permission_mode", req.PermissionMode)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

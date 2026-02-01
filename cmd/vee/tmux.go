@@ -83,8 +83,60 @@ func tmuxGracefulClose(windowID string) {
 	tmuxKillWindowByID(windowID)
 }
 
+// tmuxSetWindowOption sets a per-window user option (@-prefixed) on a tmux window.
+func tmuxSetWindowOption(windowID, key, value string) error {
+	_, err := tmuxRun("set-option", "-t", windowID, "-p", "@"+key, value)
+	return err
+}
+
+// tmuxUnsetWindowOption removes a per-window user option from a tmux window.
+func tmuxUnsetWindowOption(windowID, key string) error {
+	_, err := tmuxRun("set-option", "-t", windowID, "-p", "-u", "@"+key)
+	return err
+}
+
+// syncWindowOptions pushes the session's dynamic state to tmux per-window options.
+func syncWindowOptions(sess *Session) error {
+	if sess.WindowTarget == "" {
+		return nil
+	}
+	wid := sess.WindowTarget
+
+	// @vee-working
+	if sess.Working {
+		tmuxSetWindowOption(wid, "vee-working", "1")
+	} else {
+		tmuxUnsetWindowOption(wid, "vee-working")
+	}
+
+	// @vee-notif
+	if sess.HasNotification {
+		tmuxSetWindowOption(wid, "vee-notif", "1")
+	} else {
+		tmuxUnsetWindowOption(wid, "vee-notif")
+	}
+
+	// @vee-perm
+	if sess.PermissionMode != "" && sess.PermissionMode != "default" {
+		tmuxSetWindowOption(wid, "vee-perm", sess.PermissionMode)
+	} else {
+		tmuxUnsetWindowOption(wid, "vee-perm")
+	}
+
+	return nil
+}
+
 // tmuxConfigure applies all tmux configuration for the Vee session.
 func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []string) error {
+	// Window status format strings with dynamic indicators.
+	// Indicators use per-window @vee-* user options:
+	//   @vee-ephemeral: ⏣ (inherits tab fg)
+	//   @vee-working:   ✱ (orange #ff9e64) — mutually exclusive with notif (working wins)
+	//   @vee-notif:     ♪ (blue #7aa2f7)
+	//   @vee-perm:      ⏸ for "plan" (yellow #e0af68), ⏵⏵ for "acceptEdits" (violet #bb9af7)
+	windowStatusFmt := ` #W#{?#{@vee-ephemeral}, ⏣,}#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=default],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=default],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=default],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=default],} `
+	windowStatusCurrentFmt := `#[bg=#414868,fg=#a9b1d6] #W#{?#{@vee-ephemeral}, ⏣,}#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=#a9b1d6],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=#a9b1d6],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=#a9b1d6],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=#a9b1d6],} #[default]`
+
 	// Each entry is a slice of tmux set-option/bind-key args.
 	commands := [][]string{
 		// True color support
@@ -95,8 +147,9 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 		{"set-option", "-t", "vee", "-g", "status-style", "bg=#1a1b26,fg=#a9b1d6"},
 		{"set-option", "-t", "vee", "-g", "status-left", ""},
 		{"set-option", "-t", "vee", "-g", "status-right", " #S "},
-		{"set-option", "-t", "vee", "-g", "window-status-format", " #W "},
-		{"set-option", "-t", "vee", "-g", "window-status-current-format", "#[bg=#7aa2f7,fg=#1a1b26] #W #[default]"},
+		{"set-option", "-t", "vee", "-g", "status-interval", "1"},
+		{"set-option", "-t", "vee", "-g", "window-status-format", windowStatusFmt},
+		{"set-option", "-t", "vee", "-g", "window-status-current-format", windowStatusCurrentFmt},
 
 		// Window behavior
 		{"set-option", "-t", "vee", "-g", "allow-rename", "off"},

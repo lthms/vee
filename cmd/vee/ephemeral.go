@@ -245,14 +245,36 @@ func writeMCPConfigDocker(port int, sessionID string) (string, error) {
 
 // writeEphemeralSettings writes a settings file with curl-based hooks suitable
 // for use inside a Docker container (no vee binary required, just curl).
+// Uses a shell pipeline that reads stdin once, enriches it with flags, and
+// POSTs the combined JSON to /api/hook/window-state.
 func writeEphemeralSettings(sessionID string, port int) (string, error) {
 	dir := sessionTempDir(sessionID)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
 
-	previewCmd := fmt.Sprintf("curl -sf -X POST 'http://host.docker.internal:%d/api/hook/preview?session=%s' -H 'Content-Type: application/json' -d @-",
+	baseURL := fmt.Sprintf("http://host.docker.internal:%d/api/hook/window-state?session=%s",
 		port, sessionID)
+
+	// UserPromptSubmit: merge working=true, notification=false into the hook JSON, then POST
+	promptSubmitCmd := fmt.Sprintf(
+		`jq -c '. + {"working":true,"notification":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
+		baseURL)
+
+	// Stop: merge working=false into the hook JSON, then POST
+	stopCmd := fmt.Sprintf(
+		`jq -c '. + {"working":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
+		baseURL)
+
+	// PostToolUseFailure: clear working only when is_interrupt is true
+	interruptCmd := fmt.Sprintf(
+		`jq -ce 'select(.is_interrupt == true) | . + {"working":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
+		baseURL)
+
+	// Notification: merge notification=true into the hook JSON, then POST
+	notifCmd := fmt.Sprintf(
+		`jq -c '. + {"notification":true}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
+		baseURL)
 
 	settings := map[string]any{
 		"hooks": map[string]any{
@@ -261,7 +283,37 @@ func writeEphemeralSettings(sessionID string, port int) (string, error) {
 					"hooks": []map[string]any{
 						{
 							"type":    "command",
-							"command": previewCmd,
+							"command": promptSubmitCmd,
+						},
+					},
+				},
+			},
+			"Stop": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": stopCmd,
+						},
+					},
+				},
+			},
+			"PostToolUseFailure": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": interruptCmd,
+						},
+					},
+				},
+			},
+			"Notification": []map[string]any{
+				{
+					"hooks": []map[string]any{
+						{
+							"type":    "command",
+							"command": notifCmd,
 						},
 					},
 				},
@@ -279,6 +331,6 @@ func writeEphemeralSettings(sessionID string, port int) (string, error) {
 		return "", err
 	}
 
-	slog.Debug("wrote ephemeral settings", "path", path, "session", sessionID)
+	slog.Debug("wrote ephemeral settings", "path", path, "session", sessionID, "hooks", "UserPromptSubmit,Stop,PostToolUseFailure,Notification")
 	return path, nil
 }

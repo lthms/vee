@@ -104,14 +104,17 @@ func (a *App) Config() *AppConfig {
 
 // Session represents a Claude Code session (active or suspended).
 type Session struct {
-	ID           string    `json:"id"`
-	Mode         string    `json:"mode"`
-	Indicator    string    `json:"indicator"`
-	StartedAt    time.Time `json:"started_at"`
-	Preview      string    `json:"preview"`
-	Status       string    `json:"status"`        // "active", "suspended", or "completed"
-	WindowTarget string    `json:"window_target"` // tmux window ID (e.g. "@3")
-	Ephemeral    bool      `json:"ephemeral"`
+	ID              string    `json:"id"`
+	Mode            string    `json:"mode"`
+	Indicator       string    `json:"indicator"`
+	StartedAt       time.Time `json:"started_at"`
+	Preview         string    `json:"preview"`
+	Status          string    `json:"status"`          // "active", "suspended", or "completed"
+	WindowTarget    string    `json:"window_target"`   // tmux window ID (e.g. "@3")
+	Ephemeral       bool      `json:"ephemeral"`
+	Working         bool      `json:"working"`
+	HasNotification bool      `json:"has_notification"`
+	PermissionMode  string    `json:"permission_mode"`
 }
 
 // sessionStore is an in-memory store of sessions keyed by ID.
@@ -223,6 +226,29 @@ func (s *sessionStore) findByWindowTarget(target string) *Session {
 		}
 	}
 	return nil
+}
+
+// setWindowState updates the dynamic window state fields for a session.
+// Pointer bools so callers only update the fields they care about.
+func (s *sessionStore) setWindowState(id string, working, notif *bool, permMode, preview string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return
+	}
+	if working != nil {
+		sess.Working = *working
+	}
+	if notif != nil {
+		sess.HasNotification = *notif
+	}
+	if permMode != "" {
+		sess.PermissionMode = permMode
+	}
+	if preview != "" {
+		sess.Preview = preview
+	}
 }
 
 // setPreview updates the preview text for a session.

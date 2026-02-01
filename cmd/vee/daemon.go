@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -210,6 +211,8 @@ func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
 	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
+	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kb))
+	mux.HandleFunc("/api/session", handleSession(app))
 	return mux
 }
 
@@ -239,6 +242,7 @@ func handleSessions(app *App) http.HandlerFunc {
 		Preview      string `json:"preview"`
 		WindowTarget string `json:"window_target"`
 		Ephemeral    bool   `json:"ephemeral"`
+		KBIngest     bool   `json:"kb_ingest"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -253,8 +257,8 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral)
-		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.KBIngest)
+		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral, "kb_ingest", req.KBIngest)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -602,6 +606,127 @@ func handleHookWindowState(app *App) http.HandlerFunc {
 	}
 }
 
+// handleSession handles GET /api/session?id=<id> to return a single session.
+func handleSession(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing id query parameter", http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.get(id)
+		if sess == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sess)
+	}
+}
+
+// handleHookKBIngest handles POST /api/hook/kb-ingest. Accepts task results
+// from the PostToolUse hook, returns immediately, and evaluates the results
+// for KB-worthy notes in the background.
+func handleHookKBIngest(app *App, kb *KnowledgeBase) http.HandlerFunc {
+	type ingestReq struct {
+		SessionID    string `json:"session_id"`
+		TaskPrompt   string `json:"task_prompt"`
+		TaskResponse string `json:"task_response"`
+		SubagentType string `json:"subagent_type"`
+		Description  string `json:"description"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ingestReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		slog.Debug("kb-ingest: received", "session", req.SessionID, "subagent_type", req.SubagentType)
+
+		go evaluateAndIngest(kb, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}
+}
+
+// evaluateAndIngest calls Haiku to evaluate whether a task result contains
+// KB-worthy information, and if so, extracts and ingests the notes.
+func evaluateAndIngest(kb *KnowledgeBase, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
+	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
+
+The knowledge base stores reusable facts about codebases, conventions, architecture, and patterns — things that would help future sessions. It does NOT store task-specific details, debugging logs, or ephemeral information.
+
+Task prompt: %s
+Task description: %s
+Subagent type: %s
+
+Task result:
+%s
+
+Decide whether this result contains knowledge worth persisting. If yes, extract atomic notes (each covering one concept). Each note needs a title and markdown content.
+
+Reply with ONLY valid JSON in one of these formats:
+{"ingest": false}
+{"ingest": true, "notes": [{"title": "Note title", "content": "Markdown content..."}]}`,
+		taskPrompt, description, subagentType, taskResponse)
+
+	response, err := callHaiku(prompt)
+	if err != nil {
+		slog.Warn("kb-ingest: haiku evaluation failed", "session", sessionID, "error", err)
+		return
+	}
+
+	response = strings.TrimSpace(response)
+	response = stripCodeFence(response)
+
+	var result struct {
+		Ingest bool `json:"ingest"`
+		Notes  []struct {
+			Title   string `json:"title"`
+			Content string `json:"content"`
+		} `json:"notes"`
+	}
+	if err := json.Unmarshal([]byte(response), &result); err != nil {
+		slog.Warn("kb-ingest: failed to parse haiku response", "session", sessionID, "raw", response, "error", err)
+		return
+	}
+
+	if !result.Ingest || len(result.Notes) == 0 {
+		slog.Debug("kb-ingest: no notes to ingest", "session", sessionID)
+		return
+	}
+
+	source := fmt.Sprintf("task:%s (session %s)", subagentType, sessionID)
+
+	for _, note := range result.Notes {
+		noteID, _, err := kb.AddNote(note.Title, note.Content, []string{source})
+		if err != nil {
+			slog.Warn("kb-ingest: failed to add note", "title", note.Title, "error", err)
+			continue
+		}
+
+		app.Indexing.add(noteID, note.Title)
+		go kb.IndexNote(noteID, app)
+
+		slog.Info("kb-ingest: note ingested", "session", sessionID, "title", note.Title, "noteID", noteID)
+	}
+}
+
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
 func startHTTPServerInBackground(app *App, kb *KnowledgeBase) (*http.Server, int, error) {
@@ -644,4 +769,25 @@ func (cmd *DaemonCmd) Run() error {
 
 	slog.Info("daemon listening", "addr", ln.Addr().String())
 	return http.Serve(ln, mux)
+}
+
+// stripCodeFence extracts content from within a markdown code fence if present.
+// Handles ```json ... ``` as well as prose before/after the fence.
+// Returns the original string if no code fence is found.
+func stripCodeFence(s string) string {
+	start := strings.Index(s, "```")
+	if start < 0 {
+		return s
+	}
+	// Skip past the opening ``` and any language tag (e.g. ```json)
+	inner := s[start+3:]
+	if nl := strings.Index(inner, "\n"); nl >= 0 {
+		inner = inner[nl+1:]
+	}
+	// Find closing ```
+	end := strings.Index(inner, "```")
+	if end < 0 {
+		return s
+	}
+	return strings.TrimSpace(inner[:end])
 }

@@ -49,6 +49,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	selected := 0
 	prompt := ""
 	ephemeral := false
+	kbIngest := false
 	canEphemeral := ephemeralAvailable()
 
 	render := func() {
@@ -84,15 +85,24 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			sb.WriteString("\r\n")
 		}
 
+		// KB ingest toggle
+		sb.WriteString("  ")
+		if kbIngest {
+			sb.WriteString("\033[38;2;115;218;202m⊙ KB ingest\033[0m")
+		} else {
+			sb.WriteString("\033[2m  No KB ingest\033[0m")
+		}
+		sb.WriteString("\r\n")
+
 		sb.WriteString("\r\n  \033[2mPrompt:\033[0m ")
 		sb.WriteString(prompt)
 		sb.WriteString("\033[s") // save cursor position
 
 		sb.WriteString("\r\n\r\n  \033[2m")
 		if canEphemeral {
-			sb.WriteString("C-n/C-p select  C-e ephemeral  Enter confirm  Esc cancel")
+			sb.WriteString("C-n/C-p select  C-e ephemeral  C-k kb-ingest  Enter confirm  Esc cancel")
 		} else {
-			sb.WriteString("C-n/C-p select mode  Enter confirm  Esc cancel")
+			sb.WriteString("C-n/C-p select  C-k kb-ingest  Enter confirm  Esc cancel")
 		}
 		sb.WriteString("\033[0m\r\n")
 
@@ -120,11 +130,13 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			case 10, 13: // Enter (LF or CR)
 				fmt.Print("\033[?25h")
 				term.Restore(int(os.Stdin.Fd()), oldState)
-				return cmd.createSession(modes[selected].name, prompt, ephemeral, args)
+				return cmd.createSession(modes[selected].name, prompt, ephemeral, kbIngest, args)
 			case 5: // C-e
 				if canEphemeral {
 					ephemeral = !ephemeral
 				}
+			case 11: // C-k
+				kbIngest = !kbIngest
 			case 14: // C-n
 				if selected < len(modes)-1 {
 					selected++
@@ -174,7 +186,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	}
 }
 
-func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral bool, args claudeArgs) error {
+func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral, kbIngest bool, args claudeArgs) error {
 	veeBinary, err := os.Executable()
 	if err != nil {
 		return err
@@ -191,6 +203,9 @@ func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral bool, 
 	}
 	if ephemeral {
 		cmdParts = append(cmdParts, "--ephemeral")
+	}
+	if kbIngest {
+		cmdParts = append(cmdParts, "--kb-ingest")
 	}
 
 	if len(args) > 0 {

@@ -51,7 +51,8 @@ func OpenKnowledgeBase() (*KnowledgeBase, error) {
 	}
 
 	dbPath := filepath.Join(stateDir, "kb.db")
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

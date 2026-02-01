@@ -105,7 +105,8 @@ type CLI struct {
 	NewPane       NewPaneCmd       `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
 	Dashboard     DashboardCmd     `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
 	SessionPicker SessionPickerCmd `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive mode picker."`
-	SuspendWindow SuspendWindowCmd `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
+	SuspendWindow  SuspendWindowCmd  `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
+	CompleteWindow CompleteWindowCmd `cmd:"" name:"_complete-window" hidden:"" help:"Internal: complete session by window."`
 	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
 	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
 	SessionEnded  SessionEndedCmd  `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
@@ -308,6 +309,34 @@ func (cmd *SuspendWindowCmd) Run() error {
 	if resp.StatusCode == http.StatusNotFound {
 		// No session in this window (e.g. dashboard) — show a tmux message
 		tmuxRun("display-message", "No session to suspend in this window")
+		return nil
+	}
+
+	return nil
+}
+
+// CompleteWindowCmd marks the session running in a given tmux window as completed.
+type CompleteWindowCmd struct {
+	Port     int    `short:"p" default:"2700" name:"port"`
+	WindowID string `required:"" name:"window-id"`
+}
+
+// Run marks the session as completed by its tmux window ID.
+func (cmd *CompleteWindowCmd) Run() error {
+	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/complete", cmd.Port),
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		tmuxRun("display-message", "No session to complete in this window")
 		return nil
 	}
 

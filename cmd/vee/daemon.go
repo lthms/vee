@@ -196,6 +196,7 @@ func setupHTTPMux(app *App, kb *KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/sessions", handleSessions(app))
 	mux.HandleFunc("/api/config", handleConfig(app))
 	mux.HandleFunc("/api/suspend", handleSuspend(app))
+	mux.HandleFunc("/api/complete", handleComplete(app))
 	mux.HandleFunc("/api/activate", handleActivate(app))
 	mux.HandleFunc("/api/preview", handlePreview(app))
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
@@ -302,6 +303,42 @@ func handleSuspend(app *App) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "suspended", "session_id": sess.ID})
+	}
+}
+
+// handleComplete handles POST /api/complete to mark a session as completed by its tmux window target.
+func handleComplete(app *App) http.HandlerFunc {
+	type completeReq struct {
+		WindowTarget string `json:"window_target"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req completeReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.findByWindowTarget(req.WindowTarget)
+		if sess == nil || sess.Status != "active" {
+			http.Error(w, "no active session for this window", http.StatusNotFound)
+			return
+		}
+
+		app.Sessions.setStatus(sess.ID, "completed")
+		slog.Debug("session completed via API", "id", sess.ID, "window", req.WindowTarget)
+
+		if req.WindowTarget != "" {
+			go tmuxGracefulClose(req.WindowTarget)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "completed", "session_id": sess.ID})
 	}
 }
 

@@ -131,6 +131,12 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 		return fmt.Errorf("tmux bind-key x: %w", err)
 	}
 
+	// Ctrl-b k: complete (kill) the session in the current window
+	completeCmd := fmt.Sprintf("%s _complete-window --port %d --window-id #{window_id}", shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "k", "run-shell", completeCmd); err != nil {
+		return fmt.Errorf("tmux bind-key k: %w", err)
+	}
+
 	// Ctrl-b r: resume a suspended session
 	resumeCmd := fmt.Sprintf("%s _resume-menu --port %d", shelljoin(veeBinary), port)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "r", "run-shell", resumeCmd); err != nil {

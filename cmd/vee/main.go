@@ -156,8 +156,8 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer kbase.Close()
 
-	go kbase.BackfillSummaries()
-	go kbase.BackfillEmbeddings()
+	kbase.RecoverStaleTasks()
+	kbase.StartWorkers()
 
 	app := newApp()
 
@@ -804,8 +804,12 @@ func (cmd *KBIngestCmd) Run() error {
 	if len(taskPrompt) > 4096 {
 		taskPrompt = taskPrompt[:4096]
 	}
-	// tool_response can be a string or an object; normalize to string.
-	taskResponse := string(hookData.ToolResponse)
+	// tool_response is typically a JSON-encoded string (e.g. "\"actual text\"").
+	// Try to unwrap the outer quoting; fall back to the raw JSON bytes.
+	var taskResponse string
+	if err := json.Unmarshal(hookData.ToolResponse, &taskResponse); err != nil {
+		taskResponse = string(hookData.ToolResponse)
+	}
 	if len(taskResponse) > 16384 {
 		taskResponse = taskResponse[:16384]
 	}

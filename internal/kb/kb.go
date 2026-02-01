@@ -4,14 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
+	"log/slog"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
-)
-
-const (
-	maxLeafSize     = 20
-	maxNodeChildren = 10
 )
 
 // Model abstracts the LLM backend used for judgment calls and embeddings.
@@ -23,48 +20,46 @@ type Model interface {
 // Config holds KB initialization parameters.
 type Config struct {
 	DBPath         string  // path to SQLite file
-	VaultDir       string  // path to markdown vault directory
-	Model          Model   // LLM backend for indexing/judgment/embeddings
-	EmbeddingModel string  // model name for stale detection in DB (e.g. "nomic-embed-text")
-	Threshold      float64 // minimum cosine similarity to include a node (0 = use default 0.3)
-	MaxSelect      int     // max nodes selected per tree level (0 = use default 5)
+	Model          Model   // LLM backend for embeddings/judgment
+	EmbeddingModel string  // model name stored alongside embeddings for stale detection
+	Threshold      float64 // minimum cosine similarity to include (0 = default 0.3)
+	MaxResults     int     // max query results returned (0 = default 10)
 }
 
-// KnowledgeBase provides persistent note storage backed by markdown files
-// and a SQLite tree-based semantic index for retrieval.
+// KnowledgeBase provides persistent statement storage backed by SQLite
+// with brute-force KNN search and background clustering.
 type KnowledgeBase struct {
 	db             *sql.DB
-	vaultDir       string
 	model          Model
-	embeddingModel string  // stored in node_embeddings.model for stale detection
-	threshold      float64 // minimum cosine similarity for node selection
-	maxSelect      int     // max nodes per tree level
+	embeddingModel string
+	threshold      float64
+	maxResults     int
+
+	// Worker lifecycle
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
-// QueryResult is a single search hit from the tree index.
+// QueryResult is a single search hit from KNN search.
 type QueryResult struct {
-	Path         string `json:"path"`
-	Title        string `json:"title"`
-	Summary      string `json:"summary"`
-	LastVerified string `json:"last_verified"`
+	ID           string  `json:"id"`
+	Title        string  `json:"title"`
+	Content      string  `json:"content"`
+	Source       string  `json:"source"`
+	Score        float64 `json:"score"`
+	LastVerified string  `json:"last_verified"`
 }
 
-// NoteInfo is minimal note metadata (for touch/lookup).
-type NoteInfo struct {
-	ID    int
-	Path  string
+// StatementInfo is minimal statement metadata.
+type StatementInfo struct {
+	ID    string
 	Title string
 }
 
-// Open opens (or creates) the knowledge base at the configured paths.
-// The vault directory and SQLite database are created on first use.
+// Open opens (or creates) the knowledge base at the configured path.
 func Open(cfg Config) (*KnowledgeBase, error) {
 	if cfg.Model == nil {
 		return nil, fmt.Errorf("kb: Model must not be nil")
-	}
-
-	if err := os.MkdirAll(cfg.VaultDir, 0700); err != nil {
-		return nil, fmt.Errorf("create vault dir: %w", err)
 	}
 
 	dsn := cfg.DBPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
@@ -82,23 +77,32 @@ func Open(cfg Config) (*KnowledgeBase, error) {
 	if threshold == 0 {
 		threshold = 0.3
 	}
-	maxSelect := cfg.MaxSelect
-	if maxSelect == 0 {
-		maxSelect = 5
+	maxResults := cfg.MaxResults
+	if maxResults == 0 {
+		maxResults = 10
 	}
 
 	return &KnowledgeBase{
 		db:             db,
-		vaultDir:       cfg.VaultDir,
 		model:          cfg.Model,
 		embeddingModel: cfg.EmbeddingModel,
 		threshold:      threshold,
-		maxSelect:      maxSelect,
+		maxResults:     maxResults,
+		stopCh:         make(chan struct{}),
 	}, nil
 }
 
-// Close closes the underlying database connection.
+// Close stops background workers and closes the database.
+// Workers get 5 seconds to finish; after that, the DB is closed regardless.
 func (kb *KnowledgeBase) Close() error {
+	close(kb.stopCh)
+	done := make(chan struct{})
+	go func() { kb.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		slog.Warn("kb: workers did not stop in time, forcing close")
+	}
 	return kb.db.Close()
 }
 

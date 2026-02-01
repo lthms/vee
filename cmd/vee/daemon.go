@@ -23,9 +23,9 @@ type requestSuspendArgs struct{}
 type selfDropArgs struct{}
 
 type kbRememberArgs struct {
-	Title   string   `json:"title" jsonschema:"Title of the note"`
-	Content string   `json:"content" jsonschema:"Body of the note (markdown)"`
-	Sources []string `json:"sources" jsonschema:"required,Origins of the information (file paths, URLs, issue references, etc.)"`
+	Content    string `json:"content" jsonschema:"The statement to save. Must be a single atomic fact (max 2000 chars). Title is derived automatically."`
+	Source     string `json:"source" jsonschema:"Origin of the information (file path, URL, issue reference, etc.)"`
+	SourceType string `json:"source_type,omitempty" jsonschema:"Type of source (default: manual)"`
 }
 
 type kbQueryArgs struct {
@@ -33,11 +33,11 @@ type kbQueryArgs struct {
 }
 
 type kbFetchArgs struct {
-	Path string `json:"path" jsonschema:"Relative path of the note in the vault (as returned by kb_query)"`
+	ID string `json:"id" jsonschema:"Statement ID (as returned by kb_query)"`
 }
 
 type kbTouchArgs struct {
-	Path string `json:"path" jsonschema:"Relative path of the note in the vault (as returned by kb_query)"`
+	ID string `json:"id" jsonschema:"Statement ID (as returned by kb_query)"`
 }
 
 // newMCPServer creates a fresh MCP server with all tools registered.
@@ -117,32 +117,25 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 	// Knowledge base tools — available to all modes
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
-		Description: "Save a note to the persistent knowledge base. Writes an Obsidian-compatible markdown file. Tags, summaries, and tree indexing are handled automatically in the background.",
+		Description: "Save a statement to the persistent knowledge base. Clustering and contradiction detection are handled automatically in the background.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("kb_remember called", "title", args.Title)
+		slog.Debug("kb_remember called")
 
-		noteID, path, err := kbase.AddNote(args.Title, args.Content, args.Sources)
+		id, err := kbase.AddStatement(args.Content, args.Source, args.SourceType)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
 
-		// Register indexing task and launch background indexer
-		app.Indexing.add(noteID, args.Title)
-		go func() {
-			defer app.Indexing.remove(noteID)
-			kbase.IndexNote(noteID)
-		}()
-
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Note saved: %s (indexing in background)", path)},
+				&mcp.TextContent{Text: fmt.Sprintf("Statement saved (id: %s)", id)},
 			},
 		}, nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_query",
-		Description: "Search the knowledge base using semantic tree traversal. Returns matching notes with summaries. Use specific search terms, not wildcards.",
+		Description: "Search the knowledge base using semantic similarity. Returns matching statements with scores. Use specific search terms, not wildcards.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbQueryArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_query called", "query", args.Query)
 		results, err := kbase.Query(args.Query)
@@ -158,10 +151,10 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_fetch",
-		Description: "Fetch the full content of a note by its path. Use paths returned by kb_query. Multiple notes can be fetched in parallel.",
+		Description: "Fetch the full content of a statement by its ID. Use IDs returned by kb_query. Multiple statements can be fetched in parallel.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbFetchArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("kb_fetch called", "path", args.Path)
-		content, err := kbase.FetchNote(args.Path)
+		slog.Debug("kb_fetch called", "id", args.ID)
+		content, err := kbase.FetchStatement(args.ID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_fetch: %w", err)
 		}
@@ -174,23 +167,16 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_touch",
-		Description: "Bump the last_verified timestamp of a note to today, confirming the information is still accurate. Use paths returned by kb_query.",
+		Description: "Bump the last_verified timestamp of a statement to today, confirming the information is still accurate. Use IDs returned by kb_query.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbTouchArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("kb_touch called", "path", args.Path)
-		note, err := kbase.GetNoteByPath(args.Path)
-		if err != nil {
-			return nil, nil, fmt.Errorf("kb_touch: note not found: %w", err)
+		slog.Debug("kb_touch called", "id", args.ID)
+		if err := kbase.TouchStatement(args.ID); err != nil {
+			return nil, nil, fmt.Errorf("kb_touch: %w", err)
 		}
-
-		app.Indexing.add(note.ID, note.Title)
-		go func() {
-			defer app.Indexing.remove(note.ID)
-			kbase.TouchNote(note.ID)
-		}()
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", note.Title)},
+				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", args.ID)},
 			},
 		}, nil, nil
 	})
@@ -207,7 +193,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 
 	mux := http.NewServeMux()
 	mux.Handle("/sse", sseHandler)
-	mux.HandleFunc("/api/state", handleState(app))
+	mux.HandleFunc("/api/state", handleState(app, kbase))
 	mux.HandleFunc("/api/sessions", handleSessions(app))
 	mux.HandleFunc("/api/config", handleConfig(app))
 	mux.HandleFunc("/api/suspend", handleSuspend(app))
@@ -225,12 +211,33 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	return mux
 }
 
-func handleState(app *App) http.HandlerFunc {
+func handleState(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
+	// taskTypeTitle maps queue task_type to a human-readable title.
+	taskTypeTitle := map[string]string{
+		"cluster_assign":     "Clustering",
+		"contradiction_check": "Contradiction check",
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		activeSessions := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
 		completedSessions := app.Sessions.completed()
+
+		// Merge two sources of indexing tasks:
+		// 1. In-memory evaluateAndIngest goroutines
 		indexingTasks := app.Indexing.list()
+
+		// 2. KB queue tasks currently being processed by workers
+		for _, qt := range kbase.ProcessingTasks() {
+			title := taskTypeTitle[qt.TaskType]
+			if title == "" {
+				title = qt.TaskType
+			}
+			indexingTasks = append(indexingTasks, IndexingTask{
+				TaskID: fmt.Sprintf("queue-%d", qt.ID),
+				Title:  title,
+			})
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -666,7 +673,12 @@ func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 
 		slog.Debug("kb-ingest: received", "session", req.SessionID, "subagent_type", req.SubagentType)
 
-		go evaluateAndIngest(kbase, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
+		taskID := newUUID()
+		app.Indexing.add(taskID, "Evaluating: "+req.Description)
+		go func() {
+			defer app.Indexing.remove(taskID)
+			evaluateAndIngest(kbase, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
+		}()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
@@ -674,7 +686,7 @@ func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 }
 
 // evaluateAndIngest calls the judgment model to evaluate whether a task result
-// contains KB-worthy information, and if so, extracts and ingests the notes.
+// contains KB-worthy information, and if so, extracts and ingests the statements.
 func evaluateAndIngest(kbase *kb.KnowledgeBase, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
 	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
 
@@ -687,11 +699,11 @@ Subagent type: %s
 Task result:
 %s
 
-Decide whether this result contains knowledge worth persisting. If yes, extract atomic notes (each covering one concept). Each note needs a title and markdown content.
+Decide whether this result contains knowledge worth persisting. If yes, extract atomic statements (each covering one concept). Each statement is a self-contained string.
 
 Reply with ONLY valid JSON in one of these formats:
 {"ingest": false}
-{"ingest": true, "notes": [{"title": "Note title", "content": "Markdown content..."}]}`,
+{"ingest": true, "statements": ["Statement text..."]}`,
 		taskPrompt, description, subagentType, taskResponse)
 
 	response, err := kbase.CallModel(prompt)
@@ -704,38 +716,29 @@ Reply with ONLY valid JSON in one of these formats:
 	response = stripCodeFence(response)
 
 	var result struct {
-		Ingest bool `json:"ingest"`
-		Notes  []struct {
-			Title   string `json:"title"`
-			Content string `json:"content"`
-		} `json:"notes"`
+		Ingest     bool     `json:"ingest"`
+		Statements []string `json:"statements"`
 	}
 	if err := json.Unmarshal([]byte(response), &result); err != nil {
 		slog.Warn("kb-ingest: failed to parse judgment response", "session", sessionID, "raw", response, "error", err)
 		return
 	}
 
-	if !result.Ingest || len(result.Notes) == 0 {
-		slog.Debug("kb-ingest: no notes to ingest", "session", sessionID)
+	if !result.Ingest || len(result.Statements) == 0 {
+		slog.Debug("kb-ingest: no statements to ingest", "session", sessionID)
 		return
 	}
 
 	source := fmt.Sprintf("task:%s (session %s)", subagentType, sessionID)
 
-	for _, note := range result.Notes {
-		noteID, _, err := kbase.AddNote(note.Title, note.Content, []string{source})
+	for _, stmt := range result.Statements {
+		id, err := kbase.AddStatement(stmt, source, "auto-ingest")
 		if err != nil {
-			slog.Warn("kb-ingest: failed to add note", "title", note.Title, "error", err)
+			slog.Warn("kb-ingest: failed to add statement", "error", err)
 			continue
 		}
 
-		app.Indexing.add(noteID, note.Title)
-		go func() {
-			defer app.Indexing.remove(noteID)
-			kbase.IndexNote(noteID)
-		}()
-
-		slog.Info("kb-ingest: note ingested", "session", sessionID, "title", note.Title, "noteID", noteID)
+		slog.Info("kb-ingest: statement ingested", "session", sessionID, "id", id)
 	}
 }
 
@@ -778,8 +781,8 @@ func (cmd *DaemonCmd) Run() error {
 	}
 	defer kbase.Close()
 
-	go kbase.BackfillSummaries()
-	go kbase.BackfillEmbeddings()
+	kbase.RecoverStaleTasks()
+	kbase.StartWorkers()
 
 	app := newApp()
 	mux := setupHTTPMux(app, kbase)
@@ -823,8 +826,8 @@ func handleKBQuery(kbase *kb.KnowledgeBase) http.HandlerFunc {
 	}
 }
 
-// handleKBFetch handles GET /api/kb/fetch?path=<path>.
-// Returns the raw note markdown content as plain text.
+// handleKBFetch handles GET /api/kb/fetch?id=<id>.
+// Returns the formatted statement content as plain text.
 func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -832,13 +835,13 @@ func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
 			return
 		}
 
-		notePath := r.URL.Query().Get("path")
-		if notePath == "" {
-			http.Error(w, "missing path query parameter", http.StatusBadRequest)
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing id query parameter", http.StatusBadRequest)
 			return
 		}
 
-		content, err := kbase.FetchNote(notePath)
+		content, err := kbase.FetchStatement(id)
 		if err != nil {
 			http.Error(w, "fetch failed: "+err.Error(), http.StatusNotFound)
 			return

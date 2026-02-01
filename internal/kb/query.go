@@ -3,150 +3,91 @@ package kb
 import (
 	"fmt"
 	"log/slog"
-	"sync"
 )
 
-// Query performs a tree traversal to find relevant notes for a query.
-// Uses embedding-based routing when embeddings are available, falling back
-// to including all children when embeddings fail.
+// Query performs brute-force KNN search over active statement embeddings.
+// Returns results sorted by cosine similarity descending, filtered by threshold.
 func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
-	roots, err := kb.getRootNodes()
+	// Embed the query
+	queryEmb, err := kb.embedText(query)
 	if err != nil {
-		return nil, fmt.Errorf("get roots: %w", err)
-	}
-
-	if len(roots) == 0 {
+		slog.Warn("query: failed to embed query, returning empty", "error", err)
 		return nil, nil
 	}
 
-	// Embed the query once for the entire traversal
-	queryEmb, err := kb.embedQuery(query)
+	// Load all active statement embeddings
+	rows, err := kb.db.Query(
+		`SELECT id, title, content, source, last_verified, embedding
+		 FROM statements
+		 WHERE status = 'active' AND embedding IS NOT NULL`,
+	)
 	if err != nil {
-		slog.Warn("query: failed to embed query, will include all roots", "error", err)
+		return nil, fmt.Errorf("query statements: %w", err)
 	}
+	defer rows.Close()
 
-	// Select relevant roots via embeddings
-	selectedRoots := kb.selectNodes(roots, queryEmb)
-	if len(selectedRoots) == 0 {
-		return nil, nil
+	type scored struct {
+		result QueryResult
+		score  float64
 	}
+	var candidates []scored
 
-	var mu sync.Mutex
-	noteIDs := make(map[int]struct{})
-	var wg sync.WaitGroup
-
-	for _, node := range selectedRoots {
-		wg.Add(1)
-		go func(node *treeNode) {
-			defer wg.Done()
-			ids, err := kb.descendTree(node.id, queryEmb)
-			if err != nil {
-				slog.Warn("query: descent failed", "node", node.label, "error", err)
-				return
-			}
-			mu.Lock()
-			for _, id := range ids {
-				noteIDs[id] = struct{}{}
-			}
-			mu.Unlock()
-		}(node)
-	}
-	wg.Wait()
-
-	if len(noteIDs) == 0 {
-		return nil, nil
-	}
-
-	var results []QueryResult
-	for id := range noteIDs {
-		var r QueryResult
-		err := kb.db.QueryRow(
-			`SELECT path, title, summary, last_verified FROM notes WHERE id = ?`, id,
-		).Scan(&r.Path, &r.Title, &r.Summary, &r.LastVerified)
-		if err != nil {
+	for rows.Next() {
+		var id, title, content, source, lastVerified string
+		var embBlob []byte
+		if err := rows.Scan(&id, &title, &content, &source, &lastVerified, &embBlob); err != nil {
+			slog.Warn("query: scan row", "error", err)
 			continue
 		}
-		results = append(results, r)
+
+		emb := blobToEmbedding(embBlob)
+		score := cosineSimilarity(queryEmb, emb)
+
+		if score < kb.threshold {
+			continue
+		}
+
+		// Truncate content for result preview
+		preview := content
+		if len(preview) > 200 {
+			preview = preview[:200] + "..."
+		}
+
+		candidates = append(candidates, scored{
+			result: QueryResult{
+				ID:           id,
+				Title:        title,
+				Content:      preview,
+				Source:       source,
+				Score:        score,
+				LastVerified: lastVerified,
+			},
+			score: score,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate statements: %w", err)
 	}
 
+	// Sort by score descending (insertion sort, fine for small N)
+	for i := 1; i < len(candidates); i++ {
+		for j := i; j > 0 && candidates[j].score > candidates[j-1].score; j-- {
+			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+		}
+	}
+
+	// Cap at maxResults
+	if len(candidates) > kb.maxResults {
+		candidates = candidates[:kb.maxResults]
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	results := make([]QueryResult, len(candidates))
+	for i, c := range candidates {
+		results[i] = c.result
+	}
 	return results, nil
-}
-
-// descendTree recursively traverses the tree to collect note IDs matching a query.
-// queryEmb is the pre-computed query embedding (may be nil if embedding failed).
-func (kb *KnowledgeBase) descendTree(nodeID int, queryEmb []float64) ([]int, error) {
-	var isLeaf bool
-	err := kb.db.QueryRow(`SELECT is_leaf FROM tree_nodes WHERE id = ?`, nodeID).Scan(&isLeaf)
-	if err != nil {
-		return nil, err
-	}
-
-	if isLeaf {
-		return kb.getLeafNoteIDs(nodeID)
-	}
-
-	children, err := kb.getNodeChildren(nodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(children) == 0 {
-		return nil, nil
-	}
-
-	selected := kb.selectNodes(children, queryEmb)
-	if len(selected) == 0 {
-		return nil, nil
-	}
-
-	var mu sync.Mutex
-	var allIDs []int
-	var wg sync.WaitGroup
-
-	for _, child := range selected {
-		wg.Add(1)
-		go func(child *treeNode) {
-			defer wg.Done()
-			ids, err := kb.descendTree(child.id, queryEmb)
-			if err != nil {
-				slog.Warn("query: recursive descent failed", "node", child.label, "error", err)
-				return
-			}
-			mu.Lock()
-			allIDs = append(allIDs, ids...)
-			mu.Unlock()
-		}(child)
-	}
-	wg.Wait()
-
-	return allIDs, nil
-}
-
-// embedQuery embeds the query text. Returns nil on failure.
-func (kb *KnowledgeBase) embedQuery(query string) ([]float64, error) {
-	embeddings, err := kb.model.Embed([]string{query})
-	if err != nil {
-		return nil, err
-	}
-	if len(embeddings) == 0 {
-		return nil, fmt.Errorf("empty embedding result")
-	}
-	return embeddings[0], nil
-}
-
-// selectNodes picks the most relevant nodes using embedding similarity.
-// Falls back to returning all nodes if queryEmb is nil or no embeddings available.
-func (kb *KnowledgeBase) selectNodes(nodes []*treeNode, queryEmb []float64) []*treeNode {
-	if queryEmb == nil {
-		// No query embedding → include everything
-		return nodes
-	}
-
-	embeddings := kb.loadNodeEmbeddings(nodes)
-	if len(embeddings) == 0 {
-		// No embeddings available → include everything
-		return nodes
-	}
-
-	return selectByThreshold(queryEmb, nodes, embeddings, kb.threshold, kb.maxSelect)
 }

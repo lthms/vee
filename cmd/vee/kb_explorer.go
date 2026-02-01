@@ -21,10 +21,12 @@ type KBExplorerCmd struct {
 
 // explorerResult is a single search hit from the KB query API.
 type explorerResult struct {
-	Path         string `json:"path"`
-	Title        string `json:"title"`
-	Summary      string `json:"summary"`
-	LastVerified string `json:"last_verified"`
+	ID           string  `json:"id"`
+	Title        string  `json:"title"`
+	Content      string  `json:"content"`
+	Source       string  `json:"source"`
+	Score        float64 `json:"score"`
+	LastVerified string  `json:"last_verified"`
 }
 
 const (
@@ -165,7 +167,7 @@ func (es *explorerState) handleSearchInput(input []byte) bool {
 			return true
 		case 10, 13: // Enter — open selected result
 			if len(es.results) > 0 && es.selected >= 0 && es.selected < len(es.results) {
-				es.openNote(es.results[es.selected].Path, es.results[es.selected].Title)
+				es.openNote(es.results[es.selected].ID, es.results[es.selected].Title)
 			}
 		case 127, 8: // Backspace
 			if len(es.query) > 0 {
@@ -297,8 +299,8 @@ func (es *explorerState) search() {
 	es.searched = true
 }
 
-func (es *explorerState) openNote(path, title string) {
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/kb/fetch?path=%s", es.port, url.QueryEscape(path)))
+func (es *explorerState) openNote(id, title string) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/kb/fetch?id=%s", es.port, url.QueryEscape(id)))
 	if err != nil {
 		return
 	}
@@ -316,7 +318,7 @@ func (es *explorerState) openNote(path, title string) {
 		}
 	}
 
-	es.noteStack = append(es.noteStack, noteView{title: title, path: path})
+	es.noteStack = append(es.noteStack, noteView{title: title, path: id})
 	es.prepareNoteView(sb.String())
 	es.state = explorerStateViewing
 }
@@ -505,27 +507,13 @@ func (es *explorerState) followLink(title string) {
 	// Find this title in the results first
 	for _, r := range es.results {
 		if r.Title == title {
-			es.openNote(r.Path, r.Title)
+			es.openNote(r.ID, r.Title)
 			return
 		}
 	}
-	// Otherwise, search for it
-	path := sanitizeLinkToPath(title)
-	es.openNote(path, title)
-}
-
-// sanitizeLinkToPath converts a wiki-link title to a vault file path.
-func sanitizeLinkToPath(title string) string {
-	replacer := strings.NewReplacer(
-		"/", "-", "\\", "-", ":", "-",
-		"*", "", "?", "", "\"", "",
-		"<", "", ">", "", "|", "",
-	)
-	name := strings.TrimSpace(replacer.Replace(title))
-	if name == "" {
-		name = "untitled"
-	}
-	return name + ".md"
+	// Link following with new statement-based model doesn't apply the same way.
+	// Wiki-links no longer exist in the new model, but keep this path for
+	// graceful degradation in case old content still has them.
 }
 
 // wrapLine wraps a long line at word boundaries to fit within maxWidth.
@@ -663,9 +651,9 @@ func (es *explorerState) renderSearch(sb *strings.Builder) {
 				sb.WriteString(ansiReset)
 				sb.WriteString("\r\n")
 
-				// Summary line
-				if r.Summary != "" {
-					summary := r.Summary
+				// Content preview line
+				if r.Content != "" {
+					summary := r.Content
 					maxSummary := w - 6
 					if len(summary) > maxSummary {
 						summary = summary[:maxSummary-3] + "..."

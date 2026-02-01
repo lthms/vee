@@ -15,9 +15,9 @@ type AppConfig struct {
 	ProjectConfig string   `json:"project_config"`
 }
 
-// IndexingTask represents a background note indexing operation.
+// IndexingTask represents a background processing operation.
 type IndexingTask struct {
-	NoteID    int       `json:"note_id"`
+	TaskID    string    `json:"task_id"`
 	Title     string    `json:"title"`
 	StartedAt time.Time `json:"started_at"`
 }
@@ -25,29 +25,29 @@ type IndexingTask struct {
 // indexingStore is a thread-safe store for active indexing tasks.
 type indexingStore struct {
 	mu    sync.RWMutex
-	tasks map[int]*IndexingTask
+	tasks map[string]*IndexingTask
 }
 
 func newIndexingStore() *indexingStore {
 	return &indexingStore{
-		tasks: make(map[int]*IndexingTask),
+		tasks: make(map[string]*IndexingTask),
 	}
 }
 
-func (s *indexingStore) add(noteID int, title string) {
+func (s *indexingStore) add(taskID string, title string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[noteID] = &IndexingTask{
-		NoteID:    noteID,
+	s.tasks[taskID] = &IndexingTask{
+		TaskID:    taskID,
 		Title:     title,
 		StartedAt: time.Now(),
 	}
 }
 
-func (s *indexingStore) remove(noteID int) {
+func (s *indexingStore) remove(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.tasks, noteID)
+	delete(s.tasks, taskID)
 }
 
 func (s *indexingStore) list() []IndexingTask {
@@ -64,12 +64,6 @@ func (s *indexingStore) list() []IndexingTask {
 		}
 	}
 	return result
-}
-
-func (s *indexingStore) count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.tasks)
 }
 
 // App holds the shared application state passed to all subsystems.

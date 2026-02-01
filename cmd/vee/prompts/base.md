@@ -57,7 +57,7 @@ ALWAYS refuses to use an online platform if the user has not set up an account f
 <knowledge-base>
 You have access to a persistent knowledge base via MCP tools:
 
-- `kb_remember` — Save a statement to the knowledge base. Takes a single `content` string (the statement text) and a `source` string. Each statement is an atomic fact. The title is derived automatically. Clustering and contradiction detection happen automatically in the background. Every statement MUST include a source — the origin of the information (e.g., a file path, URL, issue reference, commit hash, conversation). Statements sourced from files get git provenance automatically.
+- `kb_remember` — Save a statement to the knowledge base. Takes a single `content` string (the statement text) and a `source` string. Each statement is an atomic fact. Clustering and contradiction detection happen automatically in the background. Every statement MUST include a source — the origin of the information (e.g., a file path, URL, issue reference, commit hash, conversation). Statements sourced from files get git provenance automatically.
 - `kb_query` — Semantic search across all saved statements. Uses embedding-based similarity to find relevant statements. Returns matches with IDs, scores, and `last_verified` dates. Results are sorted by relevance score.
 - `kb_fetch` — Fetch the full content of a statement by its ID (as returned by `kb_query`). Use this to read statements you need after querying. Multiple statements can be fetched in parallel.
 - `kb_touch` — Bump the `last_verified` timestamp of a statement to today. Call this after confirming a statement's information is still accurate (e.g., after verifying a codebase convention still holds).

@@ -22,11 +22,21 @@ type KBExplorerCmd struct {
 // explorerResult is a single search hit from the KB query API.
 type explorerResult struct {
 	ID           string  `json:"id"`
-	Title        string  `json:"title"`
 	Content      string  `json:"content"`
 	Source       string  `json:"source"`
 	Score        float64 `json:"score"`
 	LastVerified string  `json:"last_verified"`
+}
+
+// explorerStatement is a full statement returned by the KB fetch API.
+type explorerStatement struct {
+	ID           string `json:"id"`
+	Content      string `json:"content"`
+	Source       string `json:"source"`
+	SourceType   string `json:"source_type"`
+	Status       string `json:"status"`
+	CreatedAt    string `json:"created_at"`
+	LastVerified string `json:"last_verified"`
 }
 
 const (
@@ -35,8 +45,6 @@ const (
 )
 
 var (
-	// wikiLinkRe matches [[wiki-links]] in note content.
-	wikiLinkRe = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
 	boldRe     = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	italicRe   = regexp.MustCompile(`\*([^*]+)\*`)
 	codeSpanRe = regexp.MustCompile("`([^`]+)`")
@@ -52,19 +60,17 @@ type explorerState struct {
 	searched bool // true after at least one search has been performed
 
 	// Note viewing state
-	noteStack  []noteView // navigation stack
-	noteLines  []string   // rendered lines of current note
-	noteScroll int        // top line offset
-	links      []string   // wiki-link titles extracted from current note
-	linkIdx    int        // currently focused link (-1 = none)
+	noteStack  []noteView         // navigation stack
+	noteStmt   *explorerStatement // current statement being viewed
+	noteLines  []string           // rendered lines of current note
+	noteScroll int                // top line offset
 
 	termWidth  int
 	termHeight int
 }
 
 type noteView struct {
-	title string
-	path  string
+	id string
 }
 
 func (cmd *KBExplorerCmd) Run() error {
@@ -89,7 +95,6 @@ func (cmd *KBExplorerCmd) Run() error {
 		port:       cmd.Port,
 		termWidth:  w,
 		termHeight: h,
-		linkIdx:    -1,
 	}
 
 	es.render()
@@ -167,7 +172,7 @@ func (es *explorerState) handleSearchInput(input []byte) bool {
 			return true
 		case 10, 13: // Enter — open selected result
 			if len(es.results) > 0 && es.selected >= 0 && es.selected < len(es.results) {
-				es.openNote(es.results[es.selected].ID, es.results[es.selected].Title)
+				es.openNote(es.results[es.selected].ID)
 			}
 		case 127, 8: // Backspace
 			if len(es.query) > 0 {
@@ -216,14 +221,6 @@ func (es *explorerState) handleViewInput(input []byte) bool {
 			es.scrollNote(1)
 		case 'k':
 			es.scrollNote(-1)
-		case 9: // Tab — next link
-			if len(es.links) > 0 {
-				es.linkIdx = (es.linkIdx + 1) % len(es.links)
-			}
-		case 10, 13: // Enter — follow focused link
-			if es.linkIdx >= 0 && es.linkIdx < len(es.links) {
-				es.followLink(es.links[es.linkIdx])
-			}
 		}
 	} else if len(input) == 3 && input[0] == 27 && input[1] == 91 {
 		switch input[2] {
@@ -239,14 +236,6 @@ func (es *explorerState) handleViewInput(input []byte) bool {
 		}
 		// Esc + char — treat as Esc
 		es.popNote()
-	} else if len(input) == 4 && input[0] == 27 && input[1] == 91 && input[2] == 90 {
-		// Shift-Tab (CSI Z)
-		if len(es.links) > 0 {
-			es.linkIdx--
-			if es.linkIdx < 0 {
-				es.linkIdx = len(es.links) - 1
-			}
-		}
 	}
 	return false
 }
@@ -299,27 +288,21 @@ func (es *explorerState) search() {
 	es.searched = true
 }
 
-func (es *explorerState) openNote(id, title string) {
+func (es *explorerState) openNote(id string) {
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/kb/fetch?id=%s", es.port, url.QueryEscape(id)))
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
 
-	var sb strings.Builder
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			sb.Write(buf[:n])
-		}
-		if err != nil {
-			break
-		}
+	var stmt explorerStatement
+	if err := json.NewDecoder(resp.Body).Decode(&stmt); err != nil {
+		return
 	}
 
-	es.noteStack = append(es.noteStack, noteView{title: title, path: id})
-	es.prepareNoteView(sb.String())
+	es.noteStack = append(es.noteStack, noteView{id: id})
+	es.noteStmt = &stmt
+	es.prepareNoteView(&stmt)
 	es.state = explorerStateViewing
 }
 
@@ -331,51 +314,13 @@ func renderInlineMarkdown(line string) string {
 	return line
 }
 
-func (es *explorerState) prepareNoteView(raw string) {
-	body, meta := parseFrontmatter(raw)
+func (es *explorerState) prepareNoteView(stmt *explorerStatement) {
 	contentWidth := es.termWidth - 6
 
 	var lines []string
-	inCodeBlock := false
 
-	for _, line := range strings.Split(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(trimmed, "```") {
-			inCodeBlock = !inCodeBlock
-			lines = append(lines, "")
-			continue
-		}
-
-		if inCodeBlock {
-			lines = append(lines, ansiDim+line+ansiReset)
-			continue
-		}
-
-		// Headers
-		if strings.HasPrefix(line, "### ") {
-			text := strings.TrimPrefix(line, "### ")
-			lines = append(lines, ansiItalic+ansiBold+text+ansiReset)
-			continue
-		}
-		if strings.HasPrefix(line, "## ") {
-			text := strings.TrimPrefix(line, "## ")
-			lines = append(lines, ansiBold+text+ansiReset)
-			continue
-		}
-		if strings.HasPrefix(line, "# ") {
-			text := strings.TrimPrefix(line, "# ")
-			lines = append(lines, ansiBold+ansiAccent+text+ansiReset)
-			continue
-		}
-
-		// Horizontal rules
-		if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-			lines = append(lines, ansiDim+strings.Repeat("─", contentWidth)+ansiReset)
-			continue
-		}
-
-		// Regular lines: wrap then apply inline formatting
+	// Render content with word wrapping
+	for _, line := range strings.Split(stmt.Content, "\n") {
 		if len(line) <= contentWidth {
 			lines = append(lines, renderInlineMarkdown(line))
 		} else {
@@ -387,105 +332,19 @@ func (es *explorerState) prepareNoteView(raw string) {
 
 	// Metadata footer
 	lines = append(lines, "")
-	if meta.tags != "" {
-		lines = append(lines, ansiMuted+"Tags: "+meta.tags+ansiReset)
+	lines = append(lines, ansiDim+strings.Repeat("─", contentWidth)+ansiReset)
+	if stmt.Source != "" {
+		lines = append(lines, ansiMuted+"Source: "+stmt.Source+ansiReset)
 	}
-	if meta.sources != "" {
-		lines = append(lines, ansiMuted+"Sources: "+meta.sources+ansiReset)
+	if stmt.LastVerified != "" {
+		lines = append(lines, ansiMuted+"Verified: "+stmt.LastVerified+ansiReset)
 	}
-	if meta.lastVerified != "" {
-		lines = append(lines, ansiMuted+"Last verified: "+meta.lastVerified+ansiReset)
+	if stmt.CreatedAt != "" {
+		lines = append(lines, ansiMuted+"Created: "+stmt.CreatedAt+ansiReset)
 	}
 
 	es.noteLines = lines
 	es.noteScroll = 0
-
-	// Extract wiki-links from raw body (before markdown rendering)
-	es.links = nil
-	es.linkIdx = -1
-	matches := wikiLinkRe.FindAllStringSubmatch(body, -1)
-	seen := make(map[string]bool)
-	for _, m := range matches {
-		if len(m) > 1 && !seen[m[1]] {
-			es.links = append(es.links, m[1])
-			seen[m[1]] = true
-		}
-	}
-	if len(es.links) > 0 {
-		es.linkIdx = 0
-	}
-}
-
-type noteMeta struct {
-	tags         string
-	sources      string
-	lastVerified string
-}
-
-// parseFrontmatter strips YAML frontmatter and returns the body and parsed metadata.
-func parseFrontmatter(raw string) (string, noteMeta) {
-	var meta noteMeta
-
-	if !strings.HasPrefix(raw, "---\n") {
-		return raw, meta
-	}
-
-	end := strings.Index(raw[4:], "\n---\n")
-	if end < 0 {
-		return raw, meta
-	}
-
-	frontmatter := raw[4 : 4+end]
-	body := strings.TrimLeft(raw[4+end+5:], "\n")
-
-	for _, line := range strings.Split(frontmatter, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "tags:") {
-			meta.tags = strings.TrimSpace(strings.TrimPrefix(line, "tags:"))
-			// Clean up YAML array syntax
-			meta.tags = strings.Trim(meta.tags, "[]")
-			meta.tags = strings.ReplaceAll(meta.tags, "\"", "")
-		} else if strings.HasPrefix(line, "last_verified:") {
-			meta.lastVerified = strings.TrimSpace(strings.TrimPrefix(line, "last_verified:"))
-		} else if strings.HasPrefix(line, "sources:") {
-			val := strings.TrimSpace(strings.TrimPrefix(line, "sources:"))
-			if val != "" && val != "[]" {
-				meta.sources = strings.Trim(val, "[]")
-				meta.sources = strings.ReplaceAll(meta.sources, "\"", "")
-			}
-		} else if strings.HasPrefix(line, "- ") && meta.sources == "" {
-			// Multi-line sources list — collect
-		}
-	}
-
-	// Re-parse for multi-line sources
-	inSources := false
-	var sourceItems []string
-	for _, line := range strings.Split(frontmatter, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "sources:") {
-			inSources = true
-			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "sources:"))
-			if val != "" && val != "[]" && !strings.HasPrefix(val, "[") {
-				sourceItems = append(sourceItems, strings.Trim(val, "\""))
-			}
-			continue
-		}
-		if inSources {
-			if strings.HasPrefix(trimmed, "- ") {
-				item := strings.TrimPrefix(trimmed, "- ")
-				item = strings.Trim(item, "\"")
-				sourceItems = append(sourceItems, item)
-			} else {
-				inSources = false
-			}
-		}
-	}
-	if len(sourceItems) > 0 {
-		meta.sources = strings.Join(sourceItems, ", ")
-	}
-
-	return body, meta
 }
 
 func (es *explorerState) popNote() {
@@ -494,26 +353,14 @@ func (es *explorerState) popNote() {
 		es.noteStack = es.noteStack[:len(es.noteStack)-1]
 		prev := es.noteStack[len(es.noteStack)-1]
 		es.noteStack = es.noteStack[:len(es.noteStack)-1]
-		es.openNote(prev.path, prev.title)
+		es.openNote(prev.id)
 	} else {
 		// Back to search results
 		es.noteStack = nil
+		es.noteStmt = nil
 		es.noteLines = nil
 		es.state = explorerStateSearch
 	}
-}
-
-func (es *explorerState) followLink(title string) {
-	// Find this title in the results first
-	for _, r := range es.results {
-		if r.Title == title {
-			es.openNote(r.ID, r.Title)
-			return
-		}
-	}
-	// Link following with new statement-based model doesn't apply the same way.
-	// Wiki-links no longer exist in the new model, but keep this path for
-	// graceful degradation in case old content still has them.
 }
 
 // wrapLine wraps a long line at word boundaries to fit within maxWidth.
@@ -587,8 +434,8 @@ func (es *explorerState) renderSearch(sb *strings.Builder) {
 			sb.WriteString("\r\n")
 		} else {
 			// Calculate visible results based on terminal height
-			// header(3) + search(2) + footer(3) = 8 lines overhead, each result = 3 lines
-			maxVisible := (es.termHeight - 8) / 3
+			// header(3) + search(2) + footer(3) = 8 lines overhead, each result = 2 lines
+			maxVisible := (es.termHeight - 8) / 2
 			if maxVisible < 1 {
 				maxVisible = 1
 			}
@@ -624,24 +471,27 @@ func (es *explorerState) renderSearch(sb *strings.Builder) {
 					sb.WriteString("    ")
 				}
 
-				// Title (left) + date (right)
-				title := r.Title
+				// Content preview: first line only + date (right)
+				preview := r.Content
+				if nl := strings.IndexByte(preview, '\n'); nl >= 0 {
+					preview = preview[:nl]
+				}
 				date := formatVerifiedDate(r.LastVerified)
-				maxTitle := w - 6 - len(date) - 2
-				if maxTitle > 0 && len(title) > maxTitle {
-					title = title[:maxTitle-3] + "..."
+				maxPreview := w - 6 - len(date) - 2
+				if maxPreview > 0 && len(preview) > maxPreview {
+					preview = preview[:maxPreview-3] + "..."
 				}
 
 				if i == es.selected {
 					sb.WriteString(ansiBold)
 				}
-				sb.WriteString(title)
+				sb.WriteString(preview)
 				if i == es.selected {
 					sb.WriteString(ansiReset)
 				}
 
 				// Right-align date
-				padding := w - 4 - len(title) - len(date) - 2
+				padding := w - 4 - len(preview) - len(date) - 2
 				if padding < 2 {
 					padding = 2
 				}
@@ -649,20 +499,6 @@ func (es *explorerState) renderSearch(sb *strings.Builder) {
 				sb.WriteString(ansiMuted)
 				sb.WriteString(date)
 				sb.WriteString(ansiReset)
-				sb.WriteString("\r\n")
-
-				// Content preview line
-				if r.Content != "" {
-					summary := r.Content
-					maxSummary := w - 6
-					if len(summary) > maxSummary {
-						summary = summary[:maxSummary-3] + "..."
-					}
-					sb.WriteString("    ")
-					sb.WriteString(ansiDim)
-					sb.WriteString(summary)
-					sb.WriteString(ansiReset)
-				}
 				sb.WriteString("\r\n\r\n")
 			}
 		}
@@ -682,27 +518,27 @@ func (es *explorerState) renderSearch(sb *strings.Builder) {
 func (es *explorerState) renderNote(sb *strings.Builder) {
 	w := es.termWidth
 
-	// Header: back nav + title
+	// Header: back nav + source label
 	sb.WriteString("\r\n  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("← Esc back")
 	sb.WriteString(ansiReset)
 
-	current := es.noteStack[len(es.noteStack)-1]
-	title := current.title
-	maxTitle := w - 16
-	if maxTitle > 0 && len(title) > maxTitle {
-		title = title[:maxTitle-3] + "..."
+	if es.noteStmt != nil && es.noteStmt.Source != "" {
+		label := es.noteStmt.Source
+		maxLabel := w - 16
+		if maxLabel > 0 && len(label) > maxLabel {
+			label = label[:maxLabel-3] + "..."
+		}
+		padding := w - 12 - len(label) - 2
+		if padding < 2 {
+			padding = 2
+		}
+		sb.WriteString(strings.Repeat(" ", padding))
+		sb.WriteString(ansiMuted)
+		sb.WriteString(label)
+		sb.WriteString(ansiReset)
 	}
-	padding := w - 12 - len(title) - 2
-	if padding < 2 {
-		padding = 2
-	}
-	sb.WriteString(strings.Repeat(" ", padding))
-	sb.WriteString(ansiBold)
-	sb.WriteString(ansiAccent)
-	sb.WriteString(title)
-	sb.WriteString(ansiReset)
 	sb.WriteString("\r\n\r\n")
 
 	// Note content (scrolled)
@@ -718,19 +554,8 @@ func (es *explorerState) renderNote(sb *strings.Builder) {
 	}
 
 	for i := start; i < end; i++ {
-		line := es.noteLines[i]
-
-		// Style wiki-links: focused gets bold, others get accent color
-		line = wikiLinkRe.ReplaceAllStringFunc(line, func(match string) string {
-			inner := match[2 : len(match)-2]
-			if es.linkIdx >= 0 && es.linkIdx < len(es.links) && inner == es.links[es.linkIdx] {
-				return ansiBold + ansiAccent + inner + ansiReset
-			}
-			return ansiAccent + inner + ansiReset
-		})
-
 		sb.WriteString("   ")
-		sb.WriteString(line)
+		sb.WriteString(es.noteLines[i])
 		sb.WriteString("\r\n")
 	}
 
@@ -742,10 +567,7 @@ func (es *explorerState) renderNote(sb *strings.Builder) {
 	// Footer
 	sb.WriteString("\r\n  ")
 	sb.WriteString(ansiMuted)
-	if len(es.links) > 0 {
-		sb.WriteString("Tab/S-Tab links  ")
-	}
-	sb.WriteString("↑↓/jk scroll  Enter follow  Esc back  q quit")
+	sb.WriteString("↑↓/jk scroll  Esc back  q quit")
 	sb.WriteString(ansiReset)
 	sb.WriteString("\r\n")
 

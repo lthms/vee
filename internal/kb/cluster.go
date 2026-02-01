@@ -58,13 +58,17 @@ func (kb *KnowledgeBase) AssignToCluster(stmtID string) error {
 	// Create a new cluster with this statement as founding member
 	clusterID := contentAddressedClusterID(stmtID)
 
-	// Get statement title for initial cluster label
-	var title string
-	kb.db.QueryRow(`SELECT title FROM statements WHERE id = ?`, stmtID).Scan(&title)
+	// Get statement content for initial cluster label
+	var content string
+	kb.db.QueryRow(`SELECT content FROM statements WHERE id = ?`, stmtID).Scan(&content)
+	label := content
+	if len(label) > 120 {
+		label = label[:120] + "..."
+	}
 
 	_, err = kb.db.Exec(
 		`INSERT INTO clusters (id, label, summary, embedding, model) VALUES (?, ?, '', ?, ?)`,
-		clusterID, title, embBlob, kb.embeddingModel,
+		clusterID, label, embBlob, kb.embeddingModel,
 	)
 	if err != nil {
 		return fmt.Errorf("create cluster: %w", err)

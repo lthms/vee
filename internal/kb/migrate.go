@@ -10,7 +10,6 @@ func migrate(db *sql.DB) error {
 		// Atomic facts with inline embedding
 		`CREATE TABLE IF NOT EXISTS statements (
 			id            TEXT PRIMARY KEY,
-			title         TEXT NOT NULL,
 			content       TEXT NOT NULL,
 			source        TEXT NOT NULL DEFAULT '',
 			source_type   TEXT NOT NULL DEFAULT 'manual',
@@ -105,6 +104,10 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("exec %q: %w", truncate(s, 60), err)
 		}
 	}
+
+	// Drop title column from statements (added pre-v2, now redundant).
+	// Safe to ignore error: column may already be absent on fresh DBs.
+	db.Exec(`ALTER TABLE statements DROP COLUMN title`)
 
 	// Drop old tables from previous schema (safe to ignore errors)
 	dropStmts := []string{

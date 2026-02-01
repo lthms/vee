@@ -23,7 +23,7 @@ type requestSuspendArgs struct{}
 type selfDropArgs struct{}
 
 type kbRememberArgs struct {
-	Content    string `json:"content" jsonschema:"The statement to save. Must be a single atomic fact (max 2000 chars). Title is derived automatically."`
+	Content    string `json:"content" jsonschema:"The statement to save. Must be a single atomic fact (max 2000 chars)."`
 	Source     string `json:"source" jsonschema:"Origin of the information (file path, URL, issue reference, etc.)"`
 	SourceType string `json:"source_type,omitempty" jsonschema:"Type of source (default: manual)"`
 }
@@ -827,7 +827,7 @@ func handleKBQuery(kbase *kb.KnowledgeBase) http.HandlerFunc {
 }
 
 // handleKBFetch handles GET /api/kb/fetch?id=<id>.
-// Returns the formatted statement content as plain text.
+// Returns the statement as JSON.
 func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -841,14 +841,14 @@ func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
 			return
 		}
 
-		content, err := kbase.FetchStatement(id)
+		s, err := kbase.GetStatement(id)
 		if err != nil {
 			http.Error(w, "fetch failed: "+err.Error(), http.StatusNotFound)
 			return
 		}
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, content)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(s)
 	}
 }
 

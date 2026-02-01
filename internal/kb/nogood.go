@@ -28,7 +28,7 @@ func (kb *KnowledgeBase) DetectContradictions(stmtID string) error {
 
 	// Find top-5 most similar active statements (excluding self)
 	rows, err := kb.db.Query(
-		`SELECT id, title, content, embedding FROM statements
+		`SELECT id, content, embedding FROM statements
 		 WHERE status = 'active' AND id != ? AND embedding IS NOT NULL`,
 		stmtID,
 	)
@@ -39,20 +39,19 @@ func (kb *KnowledgeBase) DetectContradictions(stmtID string) error {
 
 	type candidate struct {
 		id      string
-		title   string
 		content string
 		score   float64
 	}
 	var candidates []candidate
 
 	for rows.Next() {
-		var id, title, content string
+		var id, content string
 		var cBlob []byte
-		if err := rows.Scan(&id, &title, &content, &cBlob); err != nil {
+		if err := rows.Scan(&id, &content, &cBlob); err != nil {
 			continue
 		}
 		score := cosineSimilarity(stmtEmb, blobToEmbedding(cBlob))
-		candidates = append(candidates, candidate{id: id, title: title, content: content, score: score})
+		candidates = append(candidates, candidate{id: id, content: content, score: score})
 	}
 
 	// Sort by similarity descending, take top 5
@@ -86,12 +85,12 @@ func (kb *KnowledgeBase) DetectContradictions(stmtID string) error {
 		response, err := kb.model.Generate(fmt.Sprintf(
 			`Do these two statements contradict each other? Answer ONLY "yes" or "no", followed by a brief explanation.
 
-Statement A: %s
+Statement A:
 %s
 
-Statement B: %s
+Statement B:
 %s`,
-			stmt.Title, stmt.Content, c.title, c.content,
+			stmt.Content, c.content,
 		))
 		durationMs := int(time.Since(startTime).Milliseconds())
 		kb.LogModelCall(kb.embeddingModel, "contradiction_check", "statement", stmtID, durationMs)

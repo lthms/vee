@@ -151,14 +151,11 @@ func TestAddStatement_CreatesRow(t *testing.T) {
 		t.Error("expected non-empty ID")
 	}
 
-	// Verify DB row — title should be derived as first sentence
-	var title, content, status string
-	err = kbase.db.QueryRow(`SELECT title, content, status FROM statements WHERE id = ?`, id).Scan(&title, &content, &status)
+	// Verify DB row
+	var content, status string
+	err = kbase.db.QueryRow(`SELECT content, status FROM statements WHERE id = ?`, id).Scan(&content, &status)
 	if err != nil {
 		t.Fatalf("query DB: %v", err)
-	}
-	if title != "Test Statement." {
-		t.Errorf("expected title 'Test Statement.', got %q", title)
 	}
 	if content != "Test Statement. Some content" {
 		t.Errorf("expected content 'Test Statement. Some content', got %q", content)
@@ -247,9 +244,6 @@ func TestGetStatement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatement: %v", err)
 	}
-	if s.Title != "Get Test." {
-		t.Errorf("expected title 'Get Test.', got %q", s.Title)
-	}
 	if s.Content != "Get Test. Content here" {
 		t.Errorf("expected content 'Get Test. Content here', got %q", s.Content)
 	}
@@ -281,10 +275,7 @@ func TestFetchStatement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchStatement: %v", err)
 	}
-	if !strings.Contains(content, "# Fetch Test.") {
-		t.Error("expected formatted title")
-	}
-	if !strings.Contains(content, "Detailed content") {
+	if !strings.Contains(content, "Fetch Test. Detailed content") {
 		t.Error("expected content body")
 	}
 	if !strings.Contains(content, "Source: src.go") {
@@ -366,7 +357,7 @@ func TestQuery_FindsSimilarStatements(t *testing.T) {
 	// Should contain Go statement, sorted by score
 	foundGo := false
 	for _, r := range results {
-		if r.Title == "Go Pointers." {
+		if strings.Contains(r.Content, "Go pointers") {
 			foundGo = true
 			if r.Score <= 0 {
 				t.Error("expected positive score")
@@ -377,7 +368,7 @@ func TestQuery_FindsSimilarStatements(t *testing.T) {
 		}
 	}
 	if !foundGo {
-		t.Error("expected 'Go Pointers.' in results")
+		t.Error("expected Go pointers statement in results")
 	}
 }
 
@@ -612,7 +603,7 @@ func TestQueryResultsJSON_Empty(t *testing.T) {
 
 func TestQueryResultsJSON_WithResults(t *testing.T) {
 	results := []QueryResult{
-		{ID: "abc123", Title: "A", Content: "content", Score: 0.95, LastVerified: "2025-01-01"},
+		{ID: "abc123", Content: "content", Score: 0.95, LastVerified: "2025-01-01"},
 	}
 	got := QueryResultsJSON(results)
 	if !strings.Contains(got, `"id":"abc123"`) {
@@ -638,54 +629,6 @@ func TestCallModel_DelegatesToModel(t *testing.T) {
 	}
 	if stub.callCount() != 1 {
 		t.Errorf("expected 1 call, got %d", stub.callCount())
-	}
-}
-
-// --- deriveTitle tests ---
-
-func TestDeriveTitle_FirstSentence(t *testing.T) {
-	got := deriveTitle("Sessions move through three statuses. Active, suspended, completed.")
-	if got != "Sessions move through three statuses." {
-		t.Errorf("expected first sentence, got %q", got)
-	}
-}
-
-func TestDeriveTitle_NewlineBoundary(t *testing.T) {
-	got := deriveTitle("First line\nSecond line")
-	if got != "First line" {
-		t.Errorf("expected first line, got %q", got)
-	}
-}
-
-func TestDeriveTitle_NewlineBeforeDot(t *testing.T) {
-	got := deriveTitle("Short line\nThen a sentence. More text.")
-	if got != "Short line" {
-		t.Errorf("expected newline to win over dot, got %q", got)
-	}
-}
-
-func TestDeriveTitle_LongNoBoundary(t *testing.T) {
-	long := strings.Repeat("a", 200)
-	got := deriveTitle(long)
-	if len(got) != 121 { // 120 + "…" (3 bytes in UTF-8, but len counts runes... actually len counts bytes)
-		// "…" is 3 bytes in UTF-8
-		if got != long[:120]+"…" {
-			t.Errorf("expected truncated with ellipsis, got %q (len %d)", got, len(got))
-		}
-	}
-}
-
-func TestDeriveTitle_ShortString(t *testing.T) {
-	got := deriveTitle("Hello world")
-	if got != "Hello world" {
-		t.Errorf("expected full string, got %q", got)
-	}
-}
-
-func TestDeriveTitle_Empty(t *testing.T) {
-	got := deriveTitle("")
-	if got != "" {
-		t.Errorf("expected empty, got %q", got)
 	}
 }
 

@@ -43,17 +43,10 @@ type KnowledgeBase struct {
 // QueryResult is a single search hit from KNN search.
 type QueryResult struct {
 	ID           string  `json:"id"`
-	Title        string  `json:"title"`
 	Content      string  `json:"content"`
 	Source       string  `json:"source"`
 	Score        float64 `json:"score"`
 	LastVerified string  `json:"last_verified"`
-}
-
-// StatementInfo is minimal statement metadata.
-type StatementInfo struct {
-	ID    string
-	Title string
 }
 
 // Open opens (or creates) the knowledge base at the configured path.

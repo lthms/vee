@@ -17,47 +17,17 @@ var ErrStatementTooLarge = errors.New("statement exceeds 2000 character limit")
 
 // Statement represents a full statement row.
 type Statement struct {
-	ID           string
-	Title        string
-	Content      string
-	Source       string
-	SourceType   string
-	Status       string
-	CreatedAt    string
-	LastVerified string
-}
-
-// deriveTitle extracts a short title from a statement string.
-// Uses the first sentence (to the first '.' or '\n'), capped at 120 chars.
-// Falls back to the first 120 chars + "…" if no sentence boundary is found.
-func deriveTitle(statement string) string {
-	s := strings.TrimSpace(statement)
-	if s == "" {
-		return ""
-	}
-
-	// Find first sentence boundary
-	cut := -1
-	if i := strings.Index(s, "."); i >= 0 && i < 120 {
-		cut = i + 1
-	}
-	if i := strings.Index(s, "\n"); i >= 0 && (cut < 0 || i < cut) && i < 120 {
-		cut = i
-	}
-
-	if cut > 0 {
-		return strings.TrimSpace(s[:cut])
-	}
-
-	if len(s) <= 120 {
-		return s
-	}
-	return s[:120] + "…"
+	ID           string `json:"id"`
+	Content      string `json:"content"`
+	Source       string `json:"source"`
+	SourceType   string `json:"source_type"`
+	Status       string `json:"status"`
+	CreatedAt    string `json:"created_at"`
+	LastVerified string `json:"last_verified"`
 }
 
 // AddStatement creates a new statement, computes its embedding synchronously,
 // and enqueues background tasks (cluster_assign, contradiction_check).
-// The title is derived automatically from the statement text.
 // Returns the statement ID.
 func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (string, error) {
 	if len(statement) > MaxStatementSize {
@@ -68,15 +38,11 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (str
 		sourceType = "manual"
 	}
 
-	title := deriveTitle(statement)
-	content := statement
-
 	id := newStatementID()
 	now := time.Now().Format("2006-01-02")
 
 	// Compute embedding synchronously (~50ms for local model)
-	embText := title + "\n" + content
-	emb, err := kb.embedText(embText)
+	emb, err := kb.embedText(statement)
 	if err != nil {
 		slog.Warn("add-statement: embedding failed, storing without", "id", id, "error", err)
 	}
@@ -87,9 +53,9 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (str
 	}
 
 	_, err = kb.db.Exec(
-		`INSERT INTO statements (id, title, content, source, source_type, status, embedding, model, created_at, last_verified)
-		 VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
-		id, title, content, source, sourceType, embBlob, kb.embeddingModel, now, now,
+		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified)
+		 VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+		id, statement, source, sourceType, embBlob, kb.embeddingModel, now, now,
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert statement: %w", err)
@@ -99,7 +65,11 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (str
 	kb.Enqueue("cluster_assign", id, 5)
 	kb.Enqueue("contradiction_check", id, 1)
 
-	slog.Info("statement added", "id", id, "title", title)
+	preview := statement
+	if len(preview) > 80 {
+		preview = preview[:80] + "..."
+	}
+	slog.Info("statement added", "id", id, "content", preview)
 	return id, nil
 }
 
@@ -107,9 +77,9 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (str
 func (kb *KnowledgeBase) GetStatement(id string) (*Statement, error) {
 	var s Statement
 	err := kb.db.QueryRow(
-		`SELECT id, title, content, source, source_type, status, created_at, last_verified
+		`SELECT id, content, source, source_type, status, created_at, last_verified
 		 FROM statements WHERE id = ?`, id,
-	).Scan(&s.ID, &s.Title, &s.Content, &s.Source, &s.SourceType, &s.Status, &s.CreatedAt, &s.LastVerified)
+	).Scan(&s.ID, &s.Content, &s.Source, &s.SourceType, &s.Status, &s.CreatedAt, &s.LastVerified)
 	if err != nil {
 		return nil, fmt.Errorf("get statement %s: %w", id, err)
 	}
@@ -124,7 +94,6 @@ func (kb *KnowledgeBase) FetchStatement(id string) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("# %s\n\n", s.Title))
 	sb.WriteString(s.Content)
 	sb.WriteString(fmt.Sprintf("\n\n---\nSource: %s\n", s.Source))
 	sb.WriteString(fmt.Sprintf("Status: %s\n", s.Status))

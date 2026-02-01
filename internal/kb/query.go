@@ -17,7 +17,7 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 
 	// Load all active statement embeddings
 	rows, err := kb.db.Query(
-		`SELECT id, title, content, source, last_verified, embedding
+		`SELECT id, content, source, last_verified, embedding
 		 FROM statements
 		 WHERE status = 'active' AND embedding IS NOT NULL`,
 	)
@@ -33,9 +33,9 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 	var candidates []scored
 
 	for rows.Next() {
-		var id, title, content, source, lastVerified string
+		var id, content, source, lastVerified string
 		var embBlob []byte
-		if err := rows.Scan(&id, &title, &content, &source, &lastVerified, &embBlob); err != nil {
+		if err := rows.Scan(&id, &content, &source, &lastVerified, &embBlob); err != nil {
 			slog.Warn("query: scan row", "error", err)
 			continue
 		}
@@ -56,7 +56,6 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 		candidates = append(candidates, scored{
 			result: QueryResult{
 				ID:           id,
-				Title:        title,
 				Content:      preview,
 				Source:       source,
 				Score:        score,

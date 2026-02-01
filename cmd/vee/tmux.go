@@ -203,6 +203,12 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 		return fmt.Errorf("tmux bind-key l: %w", err)
 	}
 
+	// Ctrl-b /: knowledge base explorer popup
+	explorerCmd := fmt.Sprintf("%s _kb-explorer --port %d", shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "/", "display-popup", "-E", "-w", "90", "-h", "30", explorerCmd); err != nil {
+		return fmt.Errorf("tmux bind-key /: %w", err)
+	}
+
 	return nil
 }
 

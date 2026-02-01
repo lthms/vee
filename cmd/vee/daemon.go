@@ -220,6 +220,8 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
 	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kbase))
 	mux.HandleFunc("/api/session", handleSession(app))
+	mux.HandleFunc("/api/kb/query", handleKBQuery(kbase))
+	mux.HandleFunc("/api/kb/fetch", handleKBFetch(kbase))
 	return mux
 }
 
@@ -789,6 +791,62 @@ func (cmd *DaemonCmd) Run() error {
 
 	slog.Info("daemon listening", "addr", ln.Addr().String())
 	return http.Serve(ln, mux)
+}
+
+// handleKBQuery handles GET /api/kb/query?q=<query>.
+// Returns a JSON array of QueryResult objects.
+func handleKBQuery(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			http.Error(w, "missing q query parameter", http.StatusBadRequest)
+			return
+		}
+
+		results, err := kbase.Query(query)
+		if err != nil {
+			http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if results == nil {
+			results = []kb.QueryResult{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	}
+}
+
+// handleKBFetch handles GET /api/kb/fetch?path=<path>.
+// Returns the raw note markdown content as plain text.
+func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		notePath := r.URL.Query().Get("path")
+		if notePath == "" {
+			http.Error(w, "missing path query parameter", http.StatusBadRequest)
+			return
+		}
+
+		content, err := kbase.FetchNote(notePath)
+		if err != nil {
+			http.Error(w, "fetch failed: "+err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, content)
+	}
 }
 
 // stripCodeFence extracts content from within a markdown code fence if present.

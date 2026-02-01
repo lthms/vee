@@ -115,6 +115,7 @@ type CLI struct {
 	UpdateWindow  UpdateWindowCmd  `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
 	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
 	KBIngest      KBIngestCmd      `cmd:"" name:"_kb-ingest" hidden:"" help:"Internal: KB ingest hook handler."`
+	KBExplorer    KBExplorerCmd    `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
 	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
 }
 

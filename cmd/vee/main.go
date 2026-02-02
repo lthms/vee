@@ -201,6 +201,15 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	// Attach to tmux — blocks until detach or session end
 	err = tmuxAttach()
 	fmt.Print("\033[H\033[2J")
+
+	if err != nil && !tmuxSessionExists() {
+		// Server was killed (e.g. Ctrl-b x shutdown). The _shutdown command
+		// runs inside tmux via run-shell, so it gets killed before it can
+		// clean up the socket file. Do it here instead.
+		os.Remove(tmuxSocketPath())
+		return nil
+	}
+
 	return err
 }
 
@@ -736,9 +745,11 @@ func (cmd *ShutdownCmd) Run() error {
 	slog.Debug("shutdown: cleaning stale temp files")
 	cleanStaleTempFiles()
 
-	// Kill the tmux session
-	slog.Debug("shutdown: killing tmux session")
-	tmuxRun("kill-session", "-t", tmuxSessionName)
+	// Kill the entire tmux server for this socket. Each vee instance has
+	// its own socket, so this is safe and also cleans up the background
+	// session ("vee-bg") used by tmuxGracefulClose.
+	slog.Debug("shutdown: killing tmux server")
+	tmuxRun("kill-server")
 	return nil
 }
 

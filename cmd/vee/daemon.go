@@ -117,18 +117,26 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 	// Knowledge base tools — available to all modes
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
-		Description: "Save a statement to the persistent knowledge base. Clustering and contradiction detection are handled automatically in the background.",
+		Description: "Save a statement to the persistent knowledge base. Near-duplicate detection and contradiction candidate queueing happen synchronously.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_remember called")
 
-		id, err := kbase.AddStatement(args.Content, args.Source, args.SourceType)
+		result, err := kbase.AddStatement(args.Content, args.Source, args.SourceType)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
 
+		msg := fmt.Sprintf("Statement saved (id: %s)", result.ID)
+		if len(result.NearDuplicates) > 0 {
+			msg += fmt.Sprintf("\nNear-duplicates: %s", strings.Join(result.NearDuplicates, ", "))
+		}
+		if result.CandidatePairs > 0 {
+			msg += fmt.Sprintf("\nCandidate pairs queued for review: %d", result.CandidatePairs)
+		}
+
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Statement saved (id: %s)", id)},
+				&mcp.TextContent{Text: msg},
 			},
 		}, nil, nil
 	})
@@ -193,7 +201,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 
 	mux := http.NewServeMux()
 	mux.Handle("/sse", sseHandler)
-	mux.HandleFunc("/api/state", handleState(app, kbase))
+	mux.HandleFunc("/api/state", handleState(app))
 	mux.HandleFunc("/api/sessions", handleSessions(app))
 	mux.HandleFunc("/api/config", handleConfig(app))
 	mux.HandleFunc("/api/suspend", handleSuspend(app))
@@ -211,33 +219,12 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	return mux
 }
 
-func handleState(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
-	// taskTypeTitle maps queue task_type to a human-readable title.
-	taskTypeTitle := map[string]string{
-		"cluster_assign":     "Clustering",
-		"contradiction_check": "Contradiction check",
-	}
-
+func handleState(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		activeSessions := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
 		completedSessions := app.Sessions.completed()
-
-		// Merge two sources of indexing tasks:
-		// 1. In-memory evaluateAndIngest goroutines
 		indexingTasks := app.Indexing.list()
-
-		// 2. KB queue tasks currently being processed by workers
-		for _, qt := range kbase.ProcessingTasks() {
-			title := taskTypeTitle[qt.TaskType]
-			if title == "" {
-				title = qt.TaskType
-			}
-			indexingTasks = append(indexingTasks, IndexingTask{
-				TaskID: fmt.Sprintf("queue-%d", qt.ID),
-				Title:  title,
-			})
-		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -732,13 +719,13 @@ Reply with ONLY valid JSON in one of these formats:
 	source := fmt.Sprintf("task:%s (session %s)", subagentType, sessionID)
 
 	for _, stmt := range result.Statements {
-		id, err := kbase.AddStatement(stmt, source, "auto-ingest")
+		result, err := kbase.AddStatement(stmt, source, "auto-ingest")
 		if err != nil {
 			slog.Warn("kb-ingest: failed to add statement", "error", err)
 			continue
 		}
 
-		slog.Info("kb-ingest: statement ingested", "session", sessionID, "id", id)
+		slog.Info("kb-ingest: statement ingested", "session", sessionID, "id", result.ID)
 	}
 }
 
@@ -780,9 +767,6 @@ func (cmd *DaemonCmd) Run() error {
 		return fmt.Errorf("open knowledge base: %w", err)
 	}
 	defer kbase.Close()
-
-	kbase.RecoverStaleTasks()
-	kbase.StartWorkers()
 
 	app := newApp()
 	mux := setupHTTPMux(app, kbase)

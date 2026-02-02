@@ -156,9 +156,6 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer kbase.Close()
 
-	kbase.RecoverStaleTasks()
-	kbase.StartWorkers()
-
 	app := newApp()
 
 	srv, port, err := startHTTPServerInBackground(app, kbase)

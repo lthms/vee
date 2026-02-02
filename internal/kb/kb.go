@@ -4,9 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"sync"
-	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,17 +24,13 @@ type Config struct {
 }
 
 // KnowledgeBase provides persistent statement storage backed by SQLite
-// with brute-force KNN search and background clustering.
+// with brute-force KNN search and synchronous contradiction detection.
 type KnowledgeBase struct {
 	db             *sql.DB
 	model          Model
 	embeddingModel string
 	threshold      float64
 	maxResults     int
-
-	// Worker lifecycle
-	stopCh chan struct{}
-	wg     sync.WaitGroup
 }
 
 // QueryResult is a single search hit from KNN search.
@@ -81,21 +74,11 @@ func Open(cfg Config) (*KnowledgeBase, error) {
 		embeddingModel: cfg.EmbeddingModel,
 		threshold:      threshold,
 		maxResults:     maxResults,
-		stopCh:         make(chan struct{}),
 	}, nil
 }
 
-// Close stops background workers and closes the database.
-// Workers get 5 seconds to finish; after that, the DB is closed regardless.
+// Close closes the database.
 func (kb *KnowledgeBase) Close() error {
-	close(kb.stopCh)
-	done := make(chan struct{})
-	go func() { kb.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		slog.Warn("kb: workers did not stop in time, forcing close")
-	}
 	return kb.db.Close()
 }
 

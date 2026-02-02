@@ -978,7 +978,6 @@ func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) 
 		return "", err
 	}
 
-	cleanupCmd := fmt.Sprintf("rm -rf %s", shelljoin(dir))
 	updateBase := fmt.Sprintf("%s _update-window --port %d --session-id %s",
 		veeBinary, port, sessionID)
 
@@ -989,16 +988,6 @@ func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) 
 
 	settings := map[string]any{
 		"hooks": map[string]any{
-			"SessionStart": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": cleanupCmd,
-						},
-					},
-				},
-			},
 			"UserPromptSubmit": []map[string]any{
 				{
 					"hooks": []map[string]any{

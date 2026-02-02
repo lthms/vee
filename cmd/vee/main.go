@@ -540,7 +540,7 @@ func (cmd *ResumeMenuCmd) Run() error {
 	args := []string{"display-menu", "-T", "Resume Session"}
 
 	for _, sess := range state.Suspended {
-		label := fmt.Sprintf("%s %s", sess.Indicator, sess.Mode)
+		label := fmt.Sprintf("⏣ ⊙ %s %s", sess.Indicator, sess.Mode)
 		if sess.Preview != "" {
 			preview := sess.Preview
 			if len(preview) > 40 {

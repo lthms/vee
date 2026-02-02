@@ -76,13 +76,15 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			sb.WriteString("\r\n")
 		}
 
+		sb.WriteString("\r\n")
+
 		// Ephemeral toggle (only shown when available)
 		if canEphemeral {
-			sb.WriteString("\r\n  ")
+			sb.WriteString("  ")
 			if ephemeral {
-				sb.WriteString("\033[38;2;249;226;175m📦 Ephemeral\033[0m")
+				sb.WriteString("\033[38;2;249;226;175m⏣ Ephemeral\033[0m")
 			} else {
-				sb.WriteString("\033[2m   Local\033[0m")
+				sb.WriteString("\033[2m⏣ Local\033[0m")
 			}
 			sb.WriteString("\r\n")
 		}
@@ -92,7 +94,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 		if kbIngest {
 			sb.WriteString("\033[38;2;115;218;202m⊙ KB ingest\033[0m")
 		} else {
-			sb.WriteString("\033[2m  No KB ingest\033[0m")
+			sb.WriteString("\033[2m⊙ No KB ingest\033[0m")
 		}
 		sb.WriteString("\r\n")
 

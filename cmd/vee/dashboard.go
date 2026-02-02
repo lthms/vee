@@ -178,22 +178,38 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 	for _, sess := range sessions {
 		age := formatAge(time.Since(sess.StartedAt))
 
-		// Visible widths: indent(4) + emoji(2) + [ephemeral badge(2)] + space(1) + mode + age
+		// Layout: indent(4) + ⏣(1) + space(1) + ⊙(1) + space(1) + indicator(2) + space(1) + mode + gap + preview + gap + age
 		const indent = 4
-		emojiWidth := 2
-		if sess.Ephemeral {
-			emojiWidth += 2 // 📦 takes 2 columns
-		}
-		leftFixed := indent + emojiWidth + 1 + len(sess.Mode)
+		const badgeWidth = 3    // ephemeral(1) + space(1) + kbIngest(1)
+		const indicatorWidth = 2 // emoji
+		leftFixed := indent + badgeWidth + 1 + indicatorWidth + 1 + len(sess.Mode)
 		rightFixed := len(age) + 2 // +2 for right margin
 
-		// Write left part: indicator + mode (+ ephemeral badge)
 		sb.WriteString("    ")
+
+		// Ephemeral badge (always shown, colored when active, dim when not)
+		if sess.Ephemeral {
+			sb.WriteString(ansiYellow)
+		} else {
+			sb.WriteString(ansiDim)
+		}
+		sb.WriteString("⏣")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" ")
+
+		// KB ingest badge (always shown, colored when active, dim when not)
+		if sess.KBIngest {
+			sb.WriteString(ansiTeal)
+		} else {
+			sb.WriteString(ansiDim)
+		}
+		sb.WriteString("⊙")
+		sb.WriteString(ansiReset)
+
+		// Indicator + mode name
+		sb.WriteString(" ")
 		sb.WriteString(color)
 		sb.WriteString(sess.Indicator)
-		if sess.Ephemeral {
-			sb.WriteString("📦")
-		}
 		sb.WriteString(" ")
 		sb.WriteString(ansiBold)
 		sb.WriteString(sess.Mode)
@@ -203,7 +219,6 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 
 		// Preview (between mode and age)
 		if sess.Preview != "" {
-			// 2 chars gap before preview, 2 chars min gap before age
 			maxPreview := termWidth - leftFixed - rightFixed - 4
 			if maxPreview > 3 {
 				preview := sess.Preview
@@ -235,6 +250,7 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 }
 
 const ansiCyan = "\033[38;2;137;220;235m" // #89dceb
+const ansiTeal = "\033[38;2;115;218;202m" // #73daca
 
 func (cmd *DashboardCmd) renderIndexingSection(sb *strings.Builder, tasks []IndexingTask, termWidth int) {
 	sb.WriteString("  ")

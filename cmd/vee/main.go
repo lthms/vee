@@ -150,7 +150,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		}
 	}
 
-	kbase, err := openKB(userCfg)
+	kbase, judgmentModel, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("failed to open knowledge base: %w", err)
 	}
@@ -158,7 +158,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 
 	app := newApp()
 
-	srv, port, err := startHTTPServerInBackground(app, kbase)
+	srv, port, err := startHTTPServerInBackground(app, kbase, judgmentModel)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}

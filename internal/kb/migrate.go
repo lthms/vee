@@ -18,16 +18,6 @@ func migrate(db *sql.DB) error {
 			created_at    TEXT NOT NULL,
 			last_verified TEXT NOT NULL DEFAULT ''
 		)`,
-
-		`CREATE TABLE IF NOT EXISTS nogoods (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			stmt_a_id    TEXT NOT NULL REFERENCES statements(id),
-			stmt_b_id    TEXT NOT NULL REFERENCES statements(id),
-			explanation  TEXT NOT NULL DEFAULT '',
-			status       TEXT NOT NULL DEFAULT 'pending',
-			detected_at  TEXT NOT NULL,
-			UNIQUE(stmt_a_id, stmt_b_id)
-		)`,
 	}
 
 	for _, s := range stmts {
@@ -39,11 +29,9 @@ func migrate(db *sql.DB) error {
 	// Drop title column from statements (added pre-v2, now redundant).
 	db.Exec(`ALTER TABLE statements DROP COLUMN title`)
 
-	// Add status column to nogoods (idempotent for existing DBs).
-	db.Exec(`ALTER TABLE nogoods ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`)
-
 	// Drop removed tables (safe on fresh DBs via IF EXISTS)
 	dropStmts := []string{
+		`DROP TABLE IF EXISTS nogoods`,
 		`DROP TABLE IF EXISTS root_exclusions`,
 		`DROP TABLE IF EXISTS cluster_members`,
 		`DROP TABLE IF EXISTS hierarchy`,

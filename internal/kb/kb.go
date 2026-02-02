@@ -82,12 +82,6 @@ func (kb *KnowledgeBase) Close() error {
 	return kb.db.Close()
 }
 
-// CallModel exposes the underlying model for callers that need
-// judgment calls outside the KB package (e.g. ingest evaluation).
-func (kb *KnowledgeBase) CallModel(prompt string) (string, error) {
-	return kb.model.Generate(prompt)
-}
-
 // QueryResultsJSON marshals query results to JSON text suitable for MCP responses.
 func QueryResultsJSON(results []QueryResult) string {
 	if results == nil {

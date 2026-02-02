@@ -418,177 +418,6 @@ func TestQuery_ContentTruncated(t *testing.T) {
 	}
 }
 
-// --- Near-duplicate detection tests ---
-
-func TestAddStatement_DetectsNearDuplicates(t *testing.T) {
-	stub := newStub("ok")
-	// All embeddings identical -> cosine similarity = 1.0
-	stub.embedFn = func(texts []string) ([][]float64, error) {
-		results := make([][]float64, len(texts))
-		for i := range texts {
-			results[i] = []float64{0.9, 0.1, 0}
-		}
-		return results, nil
-	}
-	kbase := openTestKB(t, stub)
-
-	r1, _ := kbase.AddStatement("First content", "src", "manual")
-	r2, _ := kbase.AddStatement("Second content", "src", "manual")
-
-	if len(r2.NearDuplicates) == 0 {
-		t.Fatal("expected near-duplicates for second statement")
-	}
-	found := false
-	for _, id := range r2.NearDuplicates {
-		if id == r1.ID {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected first statement %s in near-duplicates, got %v", r1.ID, r2.NearDuplicates)
-	}
-
-	// Verify a pending nogood was queued
-	var count int
-	var status string
-	kbase.db.QueryRow(`SELECT COUNT(*) FROM nogoods WHERE status = 'pending'`).Scan(&count)
-	if count != 1 {
-		t.Errorf("expected 1 pending nogood, got %d", count)
-	}
-	kbase.db.QueryRow(
-		`SELECT status FROM nogoods WHERE (stmt_a_id = ? AND stmt_b_id = ?) OR (stmt_a_id = ? AND stmt_b_id = ?)`,
-		r2.ID, r1.ID, r1.ID, r2.ID,
-	).Scan(&status)
-	if status != "pending" {
-		t.Errorf("expected nogood status 'pending', got %q", status)
-	}
-
-	// No model.Generate calls should have been made during ingestion
-	if stub.callCount() > 0 {
-		t.Errorf("expected no model.Generate calls, got %d", stub.callCount())
-	}
-}
-
-func TestAddStatement_NoCandidatesBelowThreshold(t *testing.T) {
-	stub := newStub("ok")
-	callIdx := 0
-	stub.embedFn = func(texts []string) ([][]float64, error) {
-		callIdx++
-		results := make([][]float64, len(texts))
-		for i := range texts {
-			if callIdx == 1 {
-				results[i] = []float64{1, 0, 0}
-			} else {
-				results[i] = []float64{0, 0, 1}
-			}
-		}
-		return results, nil
-	}
-	kbase := openTestKB(t, stub)
-
-	kbase.AddStatement("First orthogonal", "src", "manual")
-	r2, _ := kbase.AddStatement("Second orthogonal", "src", "manual")
-
-	if len(r2.NearDuplicates) > 0 {
-		t.Errorf("expected no near-duplicates for orthogonal statements, got %v", r2.NearDuplicates)
-	}
-	if r2.CandidatePairs > 0 {
-		t.Errorf("expected no candidate pairs, got %d", r2.CandidatePairs)
-	}
-
-	var count int
-	kbase.db.QueryRow(`SELECT COUNT(*) FROM nogoods`).Scan(&count)
-	if count != 0 {
-		t.Errorf("expected 0 nogoods, got %d", count)
-	}
-}
-
-func TestAddStatement_QueuesCandidatePairs(t *testing.T) {
-	stub := newStub("ok")
-	stub.embedFn = func(texts []string) ([][]float64, error) {
-		results := make([][]float64, len(texts))
-		for i := range texts {
-			results[i] = []float64{0.9, 0.1, 0}
-		}
-		return results, nil
-	}
-	kbase := openTestKB(t, stub)
-
-	r1, _ := kbase.AddStatement("Statement A", "src", "manual")
-	r2, _ := kbase.AddStatement("Statement B", "src", "manual")
-	r3, _ := kbase.AddStatement("Statement C", "src", "manual")
-
-	// r2 should have queued 1 pair (with r1)
-	if r2.CandidatePairs != 1 {
-		t.Errorf("expected 1 candidate pair for r2, got %d", r2.CandidatePairs)
-	}
-
-	// r3 should have queued 2 pairs (with r1 and r2)
-	if r3.CandidatePairs != 2 {
-		t.Errorf("expected 2 candidate pairs for r3, got %d", r3.CandidatePairs)
-	}
-
-	// Total nogoods should be 3: (r2,r1), (r3,r1), (r3,r2)
-	var count int
-	kbase.db.QueryRow(`SELECT COUNT(*) FROM nogoods`).Scan(&count)
-	if count != 3 {
-		t.Errorf("expected 3 nogoods total, got %d", count)
-	}
-
-	// All should be pending
-	kbase.db.QueryRow(`SELECT COUNT(*) FROM nogoods WHERE status = 'pending'`).Scan(&count)
-	if count != 3 {
-		t.Errorf("expected 3 pending nogoods, got %d", count)
-	}
-
-	// No model.Generate calls
-	if stub.callCount() > 0 {
-		t.Errorf("expected no model.Generate calls, got %d", stub.callCount())
-	}
-
-	_ = r1
-}
-
-func TestAddStatement_SkipsExistingNogoods(t *testing.T) {
-	stub := newStub("ok")
-	stub.embedFn = func(texts []string) ([][]float64, error) {
-		results := make([][]float64, len(texts))
-		for i := range texts {
-			results[i] = []float64{0.9, 0.1, 0}
-		}
-		return results, nil
-	}
-	kbase := openTestKB(t, stub)
-
-	r1, _ := kbase.AddStatement("First content", "src", "manual")
-
-	// Pre-insert a nogood for (r1, placeholder) — won't match the real pair
-	kbase.db.Exec(
-		`INSERT INTO nogoods (stmt_a_id, stmt_b_id, status, detected_at) VALUES (?, 'placeholder', 'pending', '2025-01-01')`,
-		r1.ID,
-	)
-
-	r2, _ := kbase.AddStatement("Second content", "src", "manual")
-
-	// r2 should still queue a pair with r1 since the existing nogood is for a different pair
-	if r2.CandidatePairs != 1 {
-		t.Errorf("expected 1 candidate pair, got %d", r2.CandidatePairs)
-	}
-
-	// Now add r3 — the pair (r3, r1) and (r3, r2) should be new, but (r2, r1) already exists
-	r3, _ := kbase.AddStatement("Third content", "src", "manual")
-	if r3.CandidatePairs != 2 {
-		t.Errorf("expected 2 candidate pairs for r3, got %d", r3.CandidatePairs)
-	}
-
-	// Total: 1 pre-inserted + 1 from r2 + 2 from r3 = 4
-	var count int
-	kbase.db.QueryRow(`SELECT COUNT(*) FROM nogoods`).Scan(&count)
-	if count != 4 {
-		t.Errorf("expected 4 nogoods total, got %d", count)
-	}
-}
-
 // --- QueryResultsJSON ---
 
 func TestQueryResultsJSON_Empty(t *testing.T) {
@@ -608,24 +437,6 @@ func TestQueryResultsJSON_WithResults(t *testing.T) {
 	}
 	if !strings.Contains(got, `"score":0.95`) {
 		t.Errorf("QueryResultsJSON missing score: %s", got)
-	}
-}
-
-// --- CallModel ---
-
-func TestCallModel_DelegatesToModel(t *testing.T) {
-	stub := newStub("model response")
-	kbase := openTestKB(t, stub)
-
-	resp, err := kbase.CallModel("test prompt")
-	if err != nil {
-		t.Fatalf("CallModel: %v", err)
-	}
-	if resp != "model response" {
-		t.Errorf("expected 'model response', got %q", resp)
-	}
-	if stub.callCount() != 1 {
-		t.Errorf("expected 1 call, got %d", stub.callCount())
 	}
 }
 
@@ -656,5 +467,42 @@ func TestAddStatement_AcceptsExactLimit(t *testing.T) {
 	}
 	if result.ID == "" {
 		t.Error("expected non-empty ID")
+	}
+}
+
+// --- Embedding failure degradation ---
+
+func TestAddStatement_EmbeddingFailure(t *testing.T) {
+	stub := newStub("ok")
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		return nil, fmt.Errorf("embedding service unavailable")
+	}
+	kbase := openTestKB(t, stub)
+
+	result, err := kbase.AddStatement("Survives embedding failure", "src", "manual")
+	if err != nil {
+		t.Fatalf("AddStatement should succeed even when embedding fails: %v", err)
+	}
+	if result.ID == "" {
+		t.Error("expected non-empty ID")
+	}
+
+	// Verify the row exists with NULL embedding
+	var embBlob []byte
+	err = kbase.db.QueryRow(`SELECT embedding FROM statements WHERE id = ?`, result.ID).Scan(&embBlob)
+	if err != nil {
+		t.Fatalf("query row: %v", err)
+	}
+	if embBlob != nil {
+		t.Error("expected NULL embedding when embed fails")
+	}
+
+	// Query should not crash on an empty/NULL-embedding DB
+	results, err := kbase.Query("anything")
+	if err != nil {
+		t.Fatalf("Query should not error: %v", err)
+	}
+	if results != nil {
+		t.Errorf("expected nil results (embed fails for query too), got %v", results)
 	}
 }

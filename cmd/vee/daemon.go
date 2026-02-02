@@ -127,12 +127,6 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 		}
 
 		msg := fmt.Sprintf("Statement saved (id: %s)", result.ID)
-		if len(result.NearDuplicates) > 0 {
-			msg += fmt.Sprintf("\nNear-duplicates: %s", strings.Join(result.NearDuplicates, ", "))
-		}
-		if result.CandidatePairs > 0 {
-			msg += fmt.Sprintf("\nCandidate pairs queued for review: %d", result.CandidatePairs)
-		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -193,7 +187,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
+func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model kb.Model) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		sessionID := r.URL.Query().Get("session")
 		return newMCPServer(app, kbase, sessionID)
@@ -212,7 +206,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
 	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
-	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kbase))
+	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kbase, model))
 	mux.HandleFunc("/api/session", handleSession(app))
 	mux.HandleFunc("/api/kb/query", handleKBQuery(kbase))
 	mux.HandleFunc("/api/kb/fetch", handleKBFetch(kbase))
@@ -500,8 +494,8 @@ func handleHookPreview(app *App) http.HandlerFunc {
 		}
 
 		preview := hookData.Prompt
-		if len(preview) > 200 {
-			preview = preview[:200]
+		if r := []rune(preview); len(r) > 200 {
+			preview = string(r[:200])
 		}
 
 		app.Sessions.setPreview(sessionID, preview)
@@ -589,8 +583,8 @@ func handleHookWindowState(app *App) http.HandlerFunc {
 		}
 
 		preview := req.Prompt
-		if len(preview) > 200 {
-			preview = preview[:200]
+		if r := []rune(preview); len(r) > 200 {
+			preview = string(r[:200])
 		}
 
 		app.Sessions.setWindowState(sessionID, req.Working, req.Notification, req.PermissionMode, preview)
@@ -637,7 +631,7 @@ func handleSession(app *App) http.HandlerFunc {
 // handleHookKBIngest handles POST /api/hook/kb-ingest. Accepts task results
 // from the PostToolUse hook, returns immediately, and evaluates the results
 // for KB-worthy notes in the background.
-func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
+func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase, model kb.Model) http.HandlerFunc {
 	type ingestReq struct {
 		SessionID    string `json:"session_id"`
 		TaskPrompt   string `json:"task_prompt"`
@@ -664,7 +658,7 @@ func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 		app.Indexing.add(taskID, "Evaluating: "+req.Description)
 		go func() {
 			defer app.Indexing.remove(taskID)
-			evaluateAndIngest(kbase, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
+			evaluateAndIngest(kbase, model, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
 		}()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -674,7 +668,7 @@ func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 
 // evaluateAndIngest calls the judgment model to evaluate whether a task result
 // contains KB-worthy information, and if so, extracts and ingests the statements.
-func evaluateAndIngest(kbase *kb.KnowledgeBase, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
+func evaluateAndIngest(kbase *kb.KnowledgeBase, model kb.Model, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
 	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
 
 The knowledge base stores reusable facts about codebases, conventions, architecture, and patterns — things that would help future sessions. It does NOT store task-specific details, debugging logs, or ephemeral information.
@@ -693,7 +687,7 @@ Reply with ONLY valid JSON in one of these formats:
 {"ingest": true, "statements": ["Statement text..."]}`,
 		taskPrompt, description, subagentType, taskResponse)
 
-	response, err := kbase.CallModel(prompt)
+	response, err := model.Generate(prompt)
 	if err != nil {
 		slog.Warn("kb-ingest: judgment evaluation failed", "session", sessionID, "error", err)
 		return
@@ -731,8 +725,8 @@ Reply with ONLY valid JSON in one of these formats:
 
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase) (*http.Server, int, error) {
-	mux := setupHTTPMux(app, kbase)
+func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase, model kb.Model) (*http.Server, int, error) {
+	mux := setupHTTPMux(app, kbase, model)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -762,14 +756,14 @@ func (cmd *DaemonCmd) Run() error {
 		}
 	}
 
-	kbase, err := openKB(userCfg)
+	kbase, judgmentModel, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("open knowledge base: %w", err)
 	}
 	defer kbase.Close()
 
 	app := newApp()
-	mux := setupHTTPMux(app, kbase)
+	mux := setupHTTPMux(app, kbase, judgmentModel)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {

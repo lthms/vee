@@ -3,6 +3,7 @@ package kb
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 )
 
 // Query performs brute-force KNN search over active statement embeddings.
@@ -15,22 +16,19 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 		return nil, nil
 	}
 
-	// Load all active statement embeddings
+	// Load all active statement embeddings matching the current model
 	rows, err := kb.db.Query(
 		`SELECT id, content, source, last_verified, embedding
 		 FROM statements
-		 WHERE status = 'active' AND embedding IS NOT NULL`,
+		 WHERE status = 'active' AND embedding IS NOT NULL AND model = ?`,
+		kb.embeddingModel,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query statements: %w", err)
 	}
 	defer rows.Close()
 
-	type scored struct {
-		result QueryResult
-		score  float64
-	}
-	var candidates []scored
+	var candidates []QueryResult
 
 	for rows.Next() {
 		var id, content, source, lastVerified string
@@ -47,33 +45,21 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 			continue
 		}
 
-		// Truncate content for result preview
-		preview := content
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
-		}
-
-		candidates = append(candidates, scored{
-			result: QueryResult{
-				ID:           id,
-				Content:      preview,
-				Source:       source,
-				Score:        score,
-				LastVerified: lastVerified,
-			},
-			score: score,
+		candidates = append(candidates, QueryResult{
+			ID:           id,
+			Content:      truncateRunes(content, 200),
+			Source:       source,
+			Score:        score,
+			LastVerified: lastVerified,
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate statements: %w", err)
 	}
 
-	// Sort by score descending (insertion sort, fine for small N)
-	for i := 1; i < len(candidates); i++ {
-		for j := i; j > 0 && candidates[j].score > candidates[j-1].score; j-- {
-			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
-		}
-	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
 
 	// Cap at maxResults
 	if len(candidates) > kb.maxResults {
@@ -84,9 +70,5 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 		return nil, nil
 	}
 
-	results := make([]QueryResult, len(candidates))
-	for i, c := range candidates {
-		results[i] = c.result
-	}
-	return results, nil
+	return candidates, nil
 }

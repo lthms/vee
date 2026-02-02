@@ -210,8 +210,9 @@ func ensureOllamaModel(baseURL, model string) error {
 }
 
 // openKB creates the OllamaModel, ensures required models are available,
-// and opens the knowledge base.
-func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, error) {
+// and opens the knowledge base. Returns the KB and the judgment model separately
+// so callers that need model.Generate don't go through the KB.
+func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, kb.Model, error) {
 	model := &OllamaModel{
 		URL:            userCfg.Judgment.URL,
 		Model:          userCfg.Judgment.Model,
@@ -219,21 +220,26 @@ func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, error) {
 	}
 
 	if err := ensureModels(model); err != nil {
-		return nil, fmt.Errorf("ensure ollama models: %w", err)
+		return nil, nil, fmt.Errorf("ensure ollama models: %w", err)
 	}
 
 	stateDir, err := stateDir()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return kb.Open(kb.Config{
+	kbase, err := kb.Open(kb.Config{
 		DBPath:         filepath.Join(stateDir, "kb.db"),
 		Model:          model,
 		EmbeddingModel: userCfg.Knowledge.EmbeddingModel,
 		Threshold:      userCfg.Knowledge.Threshold,
 		MaxResults:     userCfg.Knowledge.MaxResults,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return kbase, model, nil
 }
 
 func stateDir() (string, error) {

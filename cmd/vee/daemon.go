@@ -187,7 +187,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model kb.Model) *http.ServeMux {
+func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model Generator) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		sessionID := r.URL.Query().Get("session")
 		return newMCPServer(app, kbase, sessionID)
@@ -631,7 +631,7 @@ func handleSession(app *App) http.HandlerFunc {
 // handleHookKBIngest handles POST /api/hook/kb-ingest. Accepts task results
 // from the PostToolUse hook, returns immediately, and evaluates the results
 // for KB-worthy notes in the background.
-func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase, model kb.Model) http.HandlerFunc {
+func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase, model Generator) http.HandlerFunc {
 	type ingestReq struct {
 		SessionID    string `json:"session_id"`
 		TaskPrompt   string `json:"task_prompt"`
@@ -668,7 +668,7 @@ func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase, model kb.Model) http.
 
 // evaluateAndIngest calls the judgment model to evaluate whether a task result
 // contains KB-worthy information, and if so, extracts and ingests the statements.
-func evaluateAndIngest(kbase *kb.KnowledgeBase, model kb.Model, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
+func evaluateAndIngest(kbase *kb.KnowledgeBase, model Generator, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
 	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
 
 The knowledge base stores reusable facts about codebases, conventions, architecture, and patterns — things that would help future sessions. It does NOT store task-specific details, debugging logs, or ephemeral information.
@@ -725,7 +725,7 @@ Reply with ONLY valid JSON in one of these formats:
 
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase, model kb.Model) (*http.Server, int, error) {
+func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase, model Generator) (*http.Server, int, error) {
 	mux := setupHTTPMux(app, kbase, model)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
@@ -751,7 +751,7 @@ func (cmd *DaemonCmd) Run() error {
 	if err != nil {
 		slog.Warn("failed to load user config, using defaults", "error", err)
 		userCfg = &UserConfig{
-			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "qwen2.5:7b"},
+			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "claude:haiku"},
 			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
 		}
 	}

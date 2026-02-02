@@ -145,7 +145,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	if err != nil {
 		slog.Warn("failed to load user config, using defaults", "error", err)
 		userCfg = &UserConfig{
-			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "qwen2.5:7b"},
+			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "claude:haiku"},
 			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
 		}
 	}

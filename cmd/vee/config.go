@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,12 +10,20 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/lthms/vee/internal/kb"
 )
+
+// Generator is the interface for text generation (judgment evaluation).
+// This is separate from kb.Model which also requires Embed().
+type Generator interface {
+	Generate(prompt string) (string, error)
+}
 
 // UserConfig holds user-level configuration loaded from ~/.config/vee/config.toml.
 type UserConfig struct {
@@ -49,7 +58,7 @@ func loadUserConfig() (*UserConfig, error) {
 	cfg := &UserConfig{
 		Judgment: JudgmentConfig{
 			URL:   "http://localhost:11434",
-			Model: "qwen2.5:7b",
+			Model: "claude:haiku",
 		},
 		Knowledge: KnowledgeConfig{
 			EmbeddingModel: "nomic-embed-text",
@@ -70,7 +79,7 @@ func loadUserConfig() (*UserConfig, error) {
 		cfg.Judgment.URL = "http://localhost:11434"
 	}
 	if cfg.Judgment.Model == "" {
-		cfg.Judgment.Model = "qwen2.5:7b"
+		cfg.Judgment.Model = "claude:haiku"
 	}
 	if cfg.Knowledge.EmbeddingModel == "" {
 		cfg.Knowledge.EmbeddingModel = "nomic-embed-text"
@@ -93,6 +102,7 @@ type OllamaModel struct {
 }
 
 // Generate sends a prompt to Ollama and returns the trimmed response text.
+// Uses a 2-minute timeout to prevent hanging indefinitely.
 func (o *OllamaModel) Generate(prompt string) (string, error) {
 	reqBody, err := json.Marshal(map[string]any{
 		"model":  o.Model,
@@ -103,7 +113,16 @@ func (o *OllamaModel) Generate(prompt string) (string, error) {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := http.Post(o.URL+"/api/generate", "application/json", bytes.NewReader(reqBody))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.URL+"/api/generate", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("ollama request: %w", err)
 	}
@@ -126,6 +145,36 @@ func (o *OllamaModel) Generate(prompt string) (string, error) {
 	}
 
 	return strings.TrimSpace(result.Response), nil
+}
+
+// ClaudeModel implements Generator by shelling out to the Claude CLI.
+type ClaudeModel struct {
+	Model string // e.g. "haiku", "sonnet", "opus"
+}
+
+// Generate sends a prompt to Claude CLI via stdin and returns the response.
+func (c *ClaudeModel) Generate(prompt string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "claude", "-p", "--model", c.Model)
+	cmd.Stdin = strings.NewReader(prompt)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("claude cli: %w", err)
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
+
+// parseJudgmentModel returns a Generator based on the configured model string.
+// Models prefixed with "claude:" use the Claude CLI; everything else uses Ollama.
+func parseJudgmentModel(model, ollamaURL string) Generator {
+	if after, ok := strings.CutPrefix(model, "claude:"); ok {
+		return &ClaudeModel{Model: after}
+	}
+	return &OllamaModel{URL: ollamaURL, Model: model}
 }
 
 // Embed sends texts to Ollama's embedding endpoint and returns the embeddings.
@@ -168,22 +217,6 @@ func (o *OllamaModel) Embed(texts []string) ([][]float64, error) {
 	return result.Embeddings, nil
 }
 
-// ensureModels checks that both the judgment and embedding models are available
-// in Ollama, pulling them if necessary.
-func ensureModels(o *OllamaModel) error {
-	models := []string{o.Model}
-	if o.EmbeddingModel != "" && o.EmbeddingModel != o.Model {
-		models = append(models, o.EmbeddingModel)
-	}
-
-	for _, model := range models {
-		if err := ensureOllamaModel(o.URL, model); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func ensureOllamaModel(baseURL, model string) error {
 	reqBody, err := json.Marshal(map[string]string{"name": model})
 	if err != nil {
@@ -209,18 +242,30 @@ func ensureOllamaModel(baseURL, model string) error {
 	return fmt.Errorf("ollama /api/show returned unexpected status %d for %s", resp.StatusCode, model)
 }
 
-// openKB creates the OllamaModel, ensures required models are available,
-// and opens the knowledge base. Returns the KB and the judgment model separately
-// so callers that need model.Generate don't go through the KB.
-func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, kb.Model, error) {
-	model := &OllamaModel{
+// openKB creates the embedding model (always Ollama), a judgment Generator
+// (Ollama or Claude CLI depending on config), ensures required Ollama models
+// are available, and opens the knowledge base.
+func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, Generator, error) {
+	// Embedding model is always Ollama
+	embedModel := &OllamaModel{
 		URL:            userCfg.Judgment.URL,
-		Model:          userCfg.Judgment.Model,
 		EmbeddingModel: userCfg.Knowledge.EmbeddingModel,
 	}
 
-	if err := ensureModels(model); err != nil {
-		return nil, nil, fmt.Errorf("ensure ollama models: %w", err)
+	if err := ensureOllamaModel(embedModel.URL, userCfg.Knowledge.EmbeddingModel); err != nil {
+		return nil, nil, fmt.Errorf("ensure ollama embedding model: %w", err)
+	}
+
+	// Judgment generator: Claude CLI or Ollama depending on prefix
+	judgment := parseJudgmentModel(userCfg.Judgment.Model, userCfg.Judgment.URL)
+
+	// If judgment is Ollama, ensure that model too
+	if om, ok := judgment.(*OllamaModel); ok {
+		if om.Model != userCfg.Knowledge.EmbeddingModel {
+			if err := ensureOllamaModel(om.URL, om.Model); err != nil {
+				return nil, nil, fmt.Errorf("ensure ollama judgment model: %w", err)
+			}
+		}
 	}
 
 	stateDir, err := stateDir()
@@ -230,7 +275,7 @@ func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, kb.Model, error) {
 
 	kbase, err := kb.Open(kb.Config{
 		DBPath:         filepath.Join(stateDir, "kb.db"),
-		Model:          model,
+		Model:          embedModel,
 		EmbeddingModel: userCfg.Knowledge.EmbeddingModel,
 		Threshold:      userCfg.Knowledge.Threshold,
 		MaxResults:     userCfg.Knowledge.MaxResults,
@@ -239,7 +284,7 @@ func openKB(userCfg *UserConfig) (*kb.KnowledgeBase, kb.Model, error) {
 		return nil, nil, err
 	}
 
-	return kbase, model, nil
+	return kbase, judgment, nil
 }
 
 func stateDir() (string, error) {

@@ -12,3 +12,5 @@ install: build
 	install -m 755 vee $(BINDIR)/vee
 	install -d $(DATADIR)/plugins
 	cp -r plugins/vee $(DATADIR)/plugins/vee
+	install -d $(DATADIR)/modes
+	cp modes/*.md $(DATADIR)/modes/

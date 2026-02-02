@@ -24,7 +24,8 @@ type Mode struct {
 	Name        string
 	Indicator   string
 	Description string
-	Prompt      string // embedded mode prompt content
+	Priority    int
+	Prompt      string // composed system prompt content
 	NoPrompt    bool   // skip --append-system-prompt entirely (vanilla claude)
 }
 
@@ -88,55 +89,8 @@ func waitForDaemon(timeout time.Duration) (int, error) {
 // modeRegistry holds all known modes, keyed by name.
 var modeRegistry map[string]Mode
 
-// modeOrder defines the display order for help output.
-var modeOrder = []string{"claude", "normal", "vibe", "contradictor"}
-
-func initModeRegistry() error {
-	basePrompt, err := promptFS.ReadFile("prompts/base.md")
-	if err != nil {
-		return fmt.Errorf("read base prompt: %w", err)
-	}
-
-	modes := []struct {
-		name        string
-		file        string
-		indicator   string
-		description string
-	}{
-		{"normal", "prompts/normal.md", "🦊", "Read-only exploration (default)"},
-		{"vibe", "prompts/vibe.md", "⚡", "Perform tasks with side-effects"},
-		{"contradictor", "prompts/contradictor.md", "😈", "Devil's advocate mode"},
-	}
-
-	modeRegistry = make(map[string]Mode, len(modes)+1)
-	for _, m := range modes {
-		modeContent, err := promptFS.ReadFile(m.file)
-		if err != nil {
-			return fmt.Errorf("read mode prompt %s: %w", m.file, err)
-		}
-
-		// Compose: base + mode
-		composed := string(basePrompt) + "\n\n" + string(modeContent)
-
-		modeRegistry[m.name] = Mode{
-			Name:        m.name,
-			Indicator:   m.indicator,
-			Description: m.description,
-			Prompt:      composed,
-		}
-	}
-
-	// Vanilla Claude mode — inject only the KB section so Claude knows about the tools
-	kbPrompt := extractSection(string(basePrompt), "<knowledge-base>", "</knowledge-base>")
-	modeRegistry["claude"] = Mode{
-		Name:        "claude",
-		Indicator:   "🤖",
-		Description: "Vanilla Claude Code session",
-		Prompt:      kbPrompt,
-	}
-
-	return nil
-}
+// modeOrder defines the display order, populated by initModeRegistry.
+var modeOrder []string
 
 // extractSection returns the content between start and end markers (inclusive).
 func extractSection(s, start, end string) string {
@@ -261,7 +215,7 @@ type ServeCmd struct {
 func (cmd *ServeCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
 
-	if err := initModeRegistry(); err != nil {
+	if err := initModeRegistry(cmd.VeePath); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
 	}
 
@@ -336,7 +290,7 @@ type NewPaneCmd struct {
 // Run creates a new tmux window with a Claude session for the given mode.
 func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
-	if err := initModeRegistry(); err != nil {
+	if err := initModeRegistry(cmd.VeePath); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
 	}
 
@@ -570,24 +524,35 @@ type ResumeSessionCmd struct {
 // Run resumes a suspended session.
 func (cmd *ResumeSessionCmd) Run() error {
 	tmuxSocketName = cmd.TmuxSocket
-	if err := initModeRegistry(); err != nil {
-		return fmt.Errorf("failed to init mode registry: %w", err)
-	}
-
-	mode, ok := modeRegistry[cmd.Mode]
-	if !ok {
-		return fmt.Errorf("unknown mode: %s", cmd.Mode)
-	}
 
 	veeBinary, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	// Fetch config from daemon
+	// Fetch config from daemon (needed for VeePath before loading modes).
 	cfg, err := fetchAppConfig(cmd.Port)
 	if err != nil {
 		return fmt.Errorf("failed to fetch config from daemon: %w", err)
+	}
+
+	if err := initModeRegistry(cfg.VeePath); err != nil {
+		return fmt.Errorf("failed to init mode registry: %w", err)
+	}
+
+	mode, ok := modeRegistry[cmd.Mode]
+	if !ok {
+		// Mode file may have been removed since the session was created.
+		// Construct a minimal fallback — --resume strips the system prompt
+		// anyway, so the body isn't needed.
+		mode = Mode{
+			Name:      cmd.Mode,
+			Indicator: "?",
+		}
+		// Try to recover the indicator from the stored session.
+		if sess, err := fetchSession(cmd.Port, cmd.SessionID); err == nil {
+			mode.Indicator = sess.Indicator
+		}
 	}
 
 	// Fetch session state from daemon to get KBIngest flag

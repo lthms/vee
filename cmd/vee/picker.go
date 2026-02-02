@@ -25,7 +25,7 @@ type pickerMode struct {
 
 func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
-	if err := initModeRegistry(); err != nil {
+	if err := initModeRegistry(cmd.VeePath); err != nil {
 		return err
 	}
 
@@ -54,6 +54,13 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	kbIngest := false
 	canEphemeral := ephemeralAvailable()
 
+	maxNameLen := 0
+	for _, m := range modes {
+		if len(m.name) > maxNameLen {
+			maxNameLen = len(m.name)
+		}
+	}
+
 	render := func() {
 		var sb strings.Builder
 		sb.WriteString("\033[2J\033[H")
@@ -68,7 +75,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			}
 			sb.WriteString(m.indicator)
 			sb.WriteString(" \033[1m")
-			sb.WriteString(m.name)
+			fmt.Fprintf(&sb, "%-*s", maxNameLen, m.name)
 			sb.WriteString("\033[0m")
 			sb.WriteString("  \033[2m")
 			sb.WriteString(m.desc)

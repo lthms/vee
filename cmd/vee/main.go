@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
@@ -26,8 +28,62 @@ type Mode struct {
 	NoPrompt    bool   // skip --append-system-prompt entirely (vanilla claude)
 }
 
-// veeLogFile is the fixed log path for the Vee daemon.
-const veeLogFile = "/tmp/vee.log"
+// logFilePath returns the log path for this Vee instance.
+func logFilePath() string {
+	return filepath.Join(os.TempDir(), tmuxSocketName+".log")
+}
+
+// instanceSocket computes a unique tmux socket name from the absolute CWD.
+func instanceSocket() string {
+	abs, err := filepath.Abs(".")
+	if err != nil {
+		abs = "."
+	}
+	h := sha256.Sum256([]byte(abs))
+	return fmt.Sprintf("vee-%x", h[:8])
+}
+
+// discoverDaemonPort reads VEE_PORT from the tmux environment.
+func discoverDaemonPort() (int, error) {
+	out, err := tmuxRun("show-environment", "VEE_PORT")
+	if err != nil {
+		return 0, fmt.Errorf("show-environment: %w", err)
+	}
+	// Output format: "VEE_PORT=12345"
+	parts := strings.SplitN(out, "=", 2)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("unexpected output: %s", out)
+	}
+	var port int
+	if _, err := fmt.Sscanf(parts[1], "%d", &port); err != nil {
+		return 0, fmt.Errorf("parse port: %w", err)
+	}
+	return port, nil
+}
+
+// daemonAlive checks whether the daemon is responding on the given port.
+func daemonAlive(port int) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", port))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// waitForDaemon polls until the daemon is reachable or the timeout expires.
+func waitForDaemon(timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		port, err := discoverDaemonPort()
+		if err == nil && daemonAlive(port) {
+			return port, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("daemon did not start within %s", timeout)
+}
 
 // modeRegistry holds all known modes, keyed by name.
 var modeRegistry map[string]Mode
@@ -117,6 +173,7 @@ type CLI struct {
 	KBIngest      KBIngestCmd      `cmd:"" name:"_kb-ingest" hidden:"" help:"Internal: KB ingest hook handler."`
 	KBExplorer    KBExplorerCmd    `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
 	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
+	Serve         ServeCmd         `cmd:"" name:"_serve" hidden:"" help:"Internal: daemon + dashboard inside tmux."`
 }
 
 // StartCmd runs the in-process server and manages the tmux session.
@@ -124,10 +181,71 @@ type StartCmd struct {
 	VeePath string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 }
 
-// Run starts the Vee tmux session with an in-process HTTP/MCP server.
+// Run starts (or reattaches to) a Vee instance for the current directory.
 func (cmd *StartCmd) Run(args claudeArgs) error {
-	// Clean up stale temp directories and old-style temp files from previous runs
+	// Compute instance-specific socket name
+	socketName := instanceSocket()
+	tmuxSocketName = socketName
+
+	// Resolve own binary path
+	veeBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
+	// If a tmux session already exists for this project, try to reclaim it
+	if tmuxSessionExists() {
+		port, err := discoverDaemonPort()
+		if err == nil && daemonAlive(port) {
+			// Daemon is alive — just reattach
+			err = tmuxAttach()
+			fmt.Print("\033[H\033[2J")
+			return err
+		}
+		// Stale session — clean up
+		tmuxRun("kill-session", "-t", tmuxSessionName)
+	}
+
+	// Clean up stale temp directories from previous runs
 	cleanStaleTempFiles()
+
+	// Build the _serve command for window 0
+	absVeePath, _ := filepath.Abs(cmd.VeePath)
+	serveShellCmd := fmt.Sprintf("%s _serve --vee-path %s --tmux-socket %s",
+		shelljoin(veeBinary), shelljoin(absVeePath), socketName)
+	if len(args) > 0 {
+		serveShellCmd += " --"
+		for _, a := range args {
+			serveShellCmd += " " + shelljoin(a)
+		}
+	}
+
+	// Create tmux session with _serve in window 0
+	if err := tmuxCreateSession(serveShellCmd); err != nil {
+		return fmt.Errorf("failed to create tmux session: %w", err)
+	}
+
+	// Wait for the daemon to come up
+	if _, err := waitForDaemon(10 * time.Second); err != nil {
+		return fmt.Errorf("daemon failed to start: %w", err)
+	}
+
+	// Attach to tmux — blocks until detach or session end
+	err = tmuxAttach()
+	fmt.Print("\033[H\033[2J")
+	return err
+}
+
+// ServeCmd is the internal command that runs inside tmux window 0.
+// It starts the daemon, configures tmux, and runs the dashboard.
+type ServeCmd struct {
+	VeePath    string `required:"" type:"path" name:"vee-path"`
+	TmuxSocket string `required:"" name:"tmux-socket"`
+}
+
+// Run starts the daemon, publishes the port, configures tmux, and runs the dashboard.
+func (cmd *ServeCmd) Run(args claudeArgs) error {
+	tmuxSocketName = cmd.TmuxSocket
 
 	if err := initModeRegistry(); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
@@ -138,8 +256,7 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to read project config: %w", err)
 	}
 
-	// Redirect slog to a file so it can be viewed in the logs window
-	setupFileLogger(veeLogFile)
+	setupFileLogger(logFilePath())
 
 	userCfg, err := loadUserConfig()
 	if err != nil {
@@ -164,13 +281,14 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 	}
 	defer srv.Close()
 
-	// Resolve own binary path for _new-pane invocations
+	// Publish port so StartCmd can discover it on reattach
+	tmuxRun("set-environment", "VEE_PORT", fmt.Sprintf("%d", port))
+
 	veeBinary, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	// Store config so _new-pane can fetch it via /api/config
 	app.SetConfig(&AppConfig{
 		VeePath:       cmd.VeePath,
 		Port:          port,
@@ -178,42 +296,32 @@ func (cmd *StartCmd) Run(args claudeArgs) error {
 		ProjectConfig: projectConfig,
 	})
 
-	// Build the dashboard command
-	dashboardShellCmd := fmt.Sprintf("%s _dashboard --port %d", shelljoin(veeBinary), port)
+	// Resolve project directory for status bar
+	projectDir, _ := filepath.Abs(".")
 
-	// Create or reuse tmux session
-	if tmuxSessionExists() {
-		// Kill the stale session so we start fresh with a dashboard
-		tmuxRun("kill-session", "-t", "vee")
-	}
-	if err := tmuxCreateSession(dashboardShellCmd); err != nil {
-		return fmt.Errorf("failed to create tmux session: %w", err)
-	}
-
-	// Apply tmux configuration (idempotent)
-	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, []string(args)); err != nil {
+	// Apply tmux configuration
+	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, []string(args), projectDir); err != nil {
 		return fmt.Errorf("failed to configure tmux: %w", err)
 	}
 
-	// Attach to tmux — blocks until detach or session end
-	err = tmuxAttach()
-	// Clear the terminal to suppress tmux's [exited] message
-	fmt.Print("\033[H\033[2J")
-	return err
+	// Run dashboard inline — blocks until the session ends
+	return (&DashboardCmd{Port: port}).Run()
 }
 
 // NewPaneCmd is the internal subcommand called by tmux display-menu entries.
 type NewPaneCmd struct {
-	VeePath   string `required:"" type:"path" name:"vee-path"`
-	Port      int    `short:"p" default:"2700" name:"port"`
-	Mode      string `required:"" name:"mode"`
-	Prompt    string `name:"prompt" help:"Initial prompt for the session."`
-	Ephemeral bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
-	KBIngest  bool   `name:"kb-ingest" help:"Enable KB ingest hook on Task completion."`
+	VeePath    string `required:"" type:"path" name:"vee-path"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	Mode       string `required:"" name:"mode"`
+	Prompt     string `name:"prompt" help:"Initial prompt for the session."`
+	Ephemeral  bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
+	KBIngest   bool   `name:"kb-ingest" help:"Enable KB ingest hook on Task completion."`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run creates a new tmux window with a Claude session for the given mode.
 func (cmd *NewPaneCmd) Run(args claudeArgs) error {
+	tmuxSocketName = cmd.TmuxSocket
 	if err := initModeRegistry(); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
 	}
@@ -322,12 +430,14 @@ func registerSession(port int, sessionID string, mode Mode, windowTarget string,
 
 // SuspendWindowCmd suspends the session running in a given tmux window.
 type SuspendWindowCmd struct {
-	Port     int    `short:"p" default:"2700" name:"port"`
-	WindowID string `required:"" name:"window-id"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	WindowID   string `required:"" name:"window-id"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run suspends the session by its tmux window ID.
 func (cmd *SuspendWindowCmd) Run() error {
+	tmuxSocketName = cmd.TmuxSocket
 	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
 
 	resp, err := http.Post(
@@ -351,12 +461,14 @@ func (cmd *SuspendWindowCmd) Run() error {
 
 // CompleteWindowCmd marks the session running in a given tmux window as completed.
 type CompleteWindowCmd struct {
-	Port     int    `short:"p" default:"2700" name:"port"`
-	WindowID string `required:"" name:"window-id"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	WindowID   string `required:"" name:"window-id"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run marks the session as completed by its tmux window ID.
 func (cmd *CompleteWindowCmd) Run() error {
+	tmuxSocketName = cmd.TmuxSocket
 	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
 
 	resp, err := http.Post(
@@ -379,11 +491,13 @@ func (cmd *CompleteWindowCmd) Run() error {
 
 // ResumeMenuCmd shows a tmux display-menu of suspended sessions.
 type ResumeMenuCmd struct {
-	Port int `short:"p" default:"2700" name:"port"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run fetches suspended sessions and shows a tmux picker.
 func (cmd *ResumeMenuCmd) Run() error {
+	tmuxSocketName = cmd.TmuxSocket
 	// Fetch state from daemon
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
 	if err != nil {
@@ -421,8 +535,8 @@ func (cmd *ResumeMenuCmd) Run() error {
 			label += "  " + preview
 		}
 
-		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --mode %s",
-			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Mode)
+		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --mode %s --tmux-socket %s",
+			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Mode, tmuxSocketName)
 
 		args = append(args, label, "", "run-shell "+shelljoin(resumeCmd))
 	}
@@ -433,13 +547,15 @@ func (cmd *ResumeMenuCmd) Run() error {
 
 // ResumeSessionCmd resumes a suspended session in a new tmux window.
 type ResumeSessionCmd struct {
-	Port      int    `short:"p" default:"2700" name:"port"`
-	SessionID string `required:"" name:"session-id"`
-	Mode      string `required:"" name:"mode"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	SessionID  string `required:"" name:"session-id"`
+	Mode       string `required:"" name:"mode"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run resumes a suspended session.
 func (cmd *ResumeSessionCmd) Run() error {
+	tmuxSocketName = cmd.TmuxSocket
 	if err := initModeRegistry(); err != nil {
 		return fmt.Errorf("failed to init mode registry: %w", err)
 	}
@@ -517,8 +633,8 @@ func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArg
 	}
 
 	claudeCmd := strings.Join(cmdParts, " ")
-	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --session-id %s",
-		shelljoin(veeBinary), port, sessionID)
+	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s",
+		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
 
 	return "printf '\\033[?25h'; " + claudeCmd + "; " + cleanupCmd
 }
@@ -528,11 +644,13 @@ type SessionEndedCmd struct {
 	Port        int    `short:"p" default:"2700" name:"port"`
 	SessionID   string `required:"" name:"session-id"`
 	WaitForUser bool   `name:"wait-for-user" help:"Pause for user input before closing (used for ephemeral sessions)."`
+	TmuxSocket  string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run notifies the daemon that a Claude process has exited and cleans up temp files.
 func (cmd *SessionEndedCmd) Run() error {
-	setupFileLogger(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	setupFileLogger(logFilePath())
 
 	if cmd.WaitForUser {
 		fmt.Print("\n\033[1mPress Enter to close...\033[0m")
@@ -570,11 +688,13 @@ func (cmd *SessionEndedCmd) Run() error {
 // ShutdownCmd gracefully shuts down the Vee session: suspends all active
 // sessions so they can be resumed later, cleans up temp files, then kills tmux.
 type ShutdownCmd struct {
-	Port int `short:"p" default:"2700" name:"port"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 func (cmd *ShutdownCmd) Run() error {
-	setupFileLogger(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	setupFileLogger(logFilePath())
 	slog.Debug("shutdown: starting graceful shutdown")
 
 	// Fetch state from the daemon
@@ -639,20 +759,22 @@ func (cmd *ShutdownCmd) Run() error {
 
 	// Kill the tmux session
 	slog.Debug("shutdown: killing tmux session")
-	tmuxRun("kill-session", "-t", "vee")
+	tmuxRun("kill-session", "-t", tmuxSessionName)
 	return nil
 }
 
 // UpdatePreviewCmd is the hook handler that reads the user prompt from stdin
 // and updates the session preview via the daemon API.
 type UpdatePreviewCmd struct {
-	Port      int    `short:"p" default:"2700" name:"port"`
-	SessionID string `required:"" name:"session-id"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	SessionID  string `required:"" name:"session-id"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run reads the hook JSON from stdin, extracts the prompt, and POSTs it to the daemon.
 func (cmd *UpdatePreviewCmd) Run() error {
-	setupFileLogger(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	setupFileLogger(logFilePath())
 	var hookData struct {
 		Prompt string `json:"prompt"`
 	}
@@ -701,12 +823,14 @@ type UpdateWindowCmd struct {
 	Notification    bool   `name:"notification" help:"Set notification=true."`
 	NoNotification  bool   `name:"no-notification" help:"Clear notification flag."`
 	OnlyOnInterrupt bool   `name:"only-on-interrupt" help:"Only apply the update when the hook payload contains is_interrupt=true."`
+	TmuxSocket      string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run reads the hook JSON from stdin, extracts permission_mode and prompt,
 // then POSTs the combined state update to the daemon.
 func (cmd *UpdateWindowCmd) Run() error {
-	setupFileLogger(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	setupFileLogger(logFilePath())
 
 	var hookData struct {
 		PermissionMode string `json:"permission_mode"`
@@ -776,13 +900,15 @@ func (cmd *UpdateWindowCmd) Run() error {
 // tool completes and KB ingest is enabled. It reads the hook JSON from stdin,
 // extracts relevant fields, and POSTs them to the daemon for async evaluation.
 type KBIngestCmd struct {
-	Port      int    `short:"p" default:"2700" name:"port"`
-	SessionID string `required:"" name:"session-id"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	SessionID  string `required:"" name:"session-id"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run reads the PostToolUse hook JSON from stdin and fires it to the daemon.
 func (cmd *KBIngestCmd) Run() error {
-	setupFileLogger(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	setupFileLogger(logFilePath())
 
 	var hookData struct {
 		ToolInput struct {
@@ -978,8 +1104,8 @@ func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) 
 		return "", err
 	}
 
-	updateBase := fmt.Sprintf("%s _update-window --port %d --session-id %s",
-		veeBinary, port, sessionID)
+	updateBase := fmt.Sprintf("%s _update-window --port %d --tmux-socket %s --session-id %s",
+		veeBinary, port, tmuxSocketName, sessionID)
 
 	promptSubmitCmd := updateBase + " --working --no-notification"
 	stopCmd := updateBase + " --no-working"
@@ -1032,7 +1158,7 @@ func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) 
 	}
 
 	if kbIngest {
-		kbIngestCmd := fmt.Sprintf("%s _kb-ingest --port %d --session-id %s", veeBinary, port, sessionID)
+		kbIngestCmd := fmt.Sprintf("%s _kb-ingest --port %d --tmux-socket %s --session-id %s", veeBinary, port, tmuxSocketName, sessionID)
 		hooks := settings["hooks"].(map[string]any)
 		hooks["PostToolUse"] = []map[string]any{
 			{

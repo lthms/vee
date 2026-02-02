@@ -12,8 +12,9 @@ import (
 // SessionPickerCmd is the internal subcommand that shows an interactive
 // mode picker with a prompt input, rendered inside tmux display-popup.
 type SessionPickerCmd struct {
-	VeePath string `required:"" type:"path" name:"vee-path"`
-	Port    int    `short:"p" default:"2700" name:"port"`
+	VeePath    string `required:"" type:"path" name:"vee-path"`
+	Port       int    `short:"p" default:"2700" name:"port"`
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 type pickerMode struct {
@@ -23,6 +24,7 @@ type pickerMode struct {
 }
 
 func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
+	tmuxSocketName = cmd.TmuxSocket
 	if err := initModeRegistry(); err != nil {
 		return err
 	}
@@ -197,6 +199,7 @@ func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral, kbIng
 	cmdParts = append(cmdParts, "_new-pane")
 	cmdParts = append(cmdParts, "--vee-path", cmd.VeePath)
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", cmd.Port))
+	cmdParts = append(cmdParts, "--tmux-socket", tmuxSocketName)
 	cmdParts = append(cmdParts, "--mode", mode)
 	if prompt != "" {
 		cmdParts = append(cmdParts, "--prompt", prompt)

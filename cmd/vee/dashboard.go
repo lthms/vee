@@ -279,10 +279,13 @@ func (cmd *DashboardCmd) renderIndexingSection(sb *strings.Builder, tasks []Inde
 }
 
 // LogViewerCmd tails the log file in a popup, exiting on Esc or q.
-type LogViewerCmd struct{}
+type LogViewerCmd struct {
+	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
+}
 
 func (cmd *LogViewerCmd) Run() error {
-	f, err := os.Open(veeLogFile)
+	tmuxSocketName = cmd.TmuxSocket
+	f, err := os.Open(logFilePath())
 	if err != nil {
 		return err
 	}

@@ -4,13 +4,20 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-// tmuxCmd builds an exec.Cmd for tmux using the "vee" named socket.
+// tmuxSocketName is the tmux socket name for this instance (set at startup).
+var tmuxSocketName = "vee"
+
+// tmuxSessionName is the tmux session name (always "vee" — one session per socket).
+var tmuxSessionName = "vee"
+
+// tmuxCmd builds an exec.Cmd for tmux using the instance socket.
 func tmuxCmd(args ...string) *exec.Cmd {
-	return exec.Command("tmux", append([]string{"-L", "vee"}, args...)...)
+	return exec.Command("tmux", append([]string{"-L", tmuxSocketName}, args...)...)
 }
 
 // tmuxRun executes a tmux command and returns its combined output.
@@ -20,37 +27,37 @@ func tmuxRun(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// tmuxSessionExists checks whether the "vee" tmux session exists.
+// tmuxSessionExists checks whether the tmux session exists.
 func tmuxSessionExists() bool {
-	cmd := tmuxCmd("has-session", "-t", "vee")
+	cmd := tmuxCmd("has-session", "-t", tmuxSessionName)
 	return cmd.Run() == nil
 }
 
-// tmuxCreateSession creates a new detached tmux session named "vee" with a dashboard window.
-func tmuxCreateSession(dashboardCmd string) error {
-	_, err := tmuxRun("new-session", "-d", "-s", "vee", "-n", "dashboard", dashboardCmd)
+// tmuxCreateSession creates a new detached tmux session with a given window 0 command.
+func tmuxCreateSession(windowCmd string) error {
+	_, err := tmuxRun("new-session", "-d", "-s", tmuxSessionName, "-n", "dashboard", windowCmd)
 	return err
 }
 
-// tmuxAttach attaches to the "vee" session, taking over the current terminal.
+// tmuxAttach attaches to the tmux session, taking over the current terminal.
 // This call blocks until the user detaches or the session ends.
 func tmuxAttach() error {
-	cmd := tmuxCmd("attach-session", "-t", "vee")
+	cmd := tmuxCmd("attach-session", "-t", tmuxSessionName)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-// tmuxNewWindow creates a new window in the "vee" session running shellCmd.
+// tmuxNewWindow creates a new window in the tmux session running shellCmd.
 // Returns the tmux window ID (e.g. "@3") which is stable across renumbering.
 func tmuxNewWindow(name, shellCmd string) (string, error) {
-	return tmuxRun("new-window", "-t", "vee", "-n", name, "-P", "-F", "#{window_id}", shellCmd)
+	return tmuxRun("new-window", "-t", tmuxSessionName, "-n", name, "-P", "-F", "#{window_id}", shellCmd)
 }
 
-// tmuxKillWindow kills a specific window in the "vee" session.
+// tmuxKillWindow kills a specific window in the tmux session.
 func tmuxKillWindow(target string) error {
-	_, err := tmuxRun("kill-window", "-t", "vee:"+target)
+	_, err := tmuxRun("kill-window", "-t", tmuxSessionName+":"+target)
 	return err
 }
 
@@ -67,11 +74,12 @@ func tmuxKillWindowByID(windowID string) error {
 func tmuxGracefulClose(windowID string) {
 	// Move window to a hidden background session so it disappears
 	// from the status bar and Ctrl-b n/p navigation immediately
-	if cmd := tmuxCmd("has-session", "-t", "vee-bg"); cmd.Run() != nil {
-		tmuxRun("new-session", "-d", "-s", "vee-bg")
+	bgName := tmuxSessionName + "-bg"
+	if cmd := tmuxCmd("has-session", "-t", bgName); cmd.Run() != nil {
+		tmuxRun("new-session", "-d", "-s", bgName)
 	}
-	tmuxRun("move-window", "-s", windowID, "-t", "vee-bg:")
-	tmuxRun("select-window", "-t", "vee:0")
+	tmuxRun("move-window", "-s", windowID, "-t", bgName+":")
+	tmuxRun("select-window", "-t", tmuxSessionName+":0")
 
 	// Send /exit to the (now hidden) window — window IDs are global
 	tmuxRun("send-keys", "-t", windowID, "-l", "/exit")
@@ -127,7 +135,8 @@ func syncWindowOptions(sess *Session) error {
 }
 
 // tmuxConfigure applies all tmux configuration for the Vee session.
-func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []string) error {
+// projectDir is the absolute path shown in the status bar.
+func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []string, projectDir string) error {
 	// Window status format strings with dynamic indicators.
 	// Indicators use per-window @vee-* user options:
 	//   @vee-ephemeral:  ⏣ (inherits tab fg)
@@ -141,24 +150,24 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 	// Each entry is a slice of tmux set-option/bind-key args.
 	commands := [][]string{
 		// True color support
-		{"set-option", "-t", "vee", "-g", "default-terminal", "tmux-256color"},
-		{"set-option", "-t", "vee", "-ga", "terminal-overrides", ",*256col*:Tc,alacritty:Tc,xterm-kitty:Tc"},
+		{"set-option", "-t", tmuxSessionName, "-g", "default-terminal", "tmux-256color"},
+		{"set-option", "-t", tmuxSessionName, "-ga", "terminal-overrides", ",*256col*:Tc,alacritty:Tc,xterm-kitty:Tc"},
 
 		// Status bar — Tokyo Night theme
-		{"set-option", "-t", "vee", "-g", "status-style", "bg=#1a1b26,fg=#a9b1d6"},
-		{"set-option", "-t", "vee", "-g", "status-left", ""},
-		{"set-option", "-t", "vee", "-g", "status-right", " #S "},
-		{"set-option", "-t", "vee", "-g", "status-interval", "1"},
-		{"set-option", "-t", "vee", "-g", "window-status-format", windowStatusFmt},
-		{"set-option", "-t", "vee", "-g", "window-status-current-format", windowStatusCurrentFmt},
+		{"set-option", "-t", tmuxSessionName, "-g", "status-style", "bg=#1a1b26,fg=#a9b1d6"},
+		{"set-option", "-t", tmuxSessionName, "-g", "status-left", ""},
+		{"set-option", "-t", tmuxSessionName, "-g", "status-right", " " + filepath.Base(projectDir) + " "},
+		{"set-option", "-t", tmuxSessionName, "-g", "status-interval", "1"},
+		{"set-option", "-t", tmuxSessionName, "-g", "window-status-format", windowStatusFmt},
+		{"set-option", "-t", tmuxSessionName, "-g", "window-status-current-format", windowStatusCurrentFmt},
 
 		// Window behavior
-		{"set-option", "-t", "vee", "-g", "allow-rename", "off"},
-		{"set-option", "-t", "vee", "-g", "mouse", "on"},
-		{"set-option", "-t", "vee", "-g", "history-limit", "50000"},
+		{"set-option", "-t", tmuxSessionName, "-g", "allow-rename", "off"},
+		{"set-option", "-t", tmuxSessionName, "-g", "mouse", "on"},
+		{"set-option", "-t", tmuxSessionName, "-g", "history-limit", "50000"},
 
 		// Renumber windows on close so indices stay compact
-		{"set-option", "-t", "vee", "-g", "renumber-windows", "on"},
+		{"set-option", "-t", tmuxSessionName, "-g", "renumber-windows", "on"},
 	}
 
 	for _, args := range commands {
@@ -174,31 +183,31 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 	}
 
 	// Ctrl-b q: graceful shutdown (suspend all sessions, clean up, kill tmux)
-	shutdownCmd := fmt.Sprintf("%s _shutdown --port %d", shelljoin(veeBinary), port)
+	shutdownCmd := fmt.Sprintf("%s _shutdown --port %d --tmux-socket %s", shelljoin(veeBinary), port, tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "q", "run-shell", shutdownCmd); err != nil {
 		return fmt.Errorf("tmux bind-key q: %w", err)
 	}
 
 	// Ctrl-b x: suspend the session in the current window
-	suspendCmd := fmt.Sprintf("%s _suspend-window --port %d --window-id #{window_id}", shelljoin(veeBinary), port)
+	suspendCmd := fmt.Sprintf("%s _suspend-window --port %d --tmux-socket %s --window-id #{window_id}", shelljoin(veeBinary), port, tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "x", "run-shell", suspendCmd); err != nil {
 		return fmt.Errorf("tmux bind-key x: %w", err)
 	}
 
 	// Ctrl-b k: complete (kill) the session in the current window
-	completeCmd := fmt.Sprintf("%s _complete-window --port %d --window-id #{window_id}", shelljoin(veeBinary), port)
+	completeCmd := fmt.Sprintf("%s _complete-window --port %d --tmux-socket %s --window-id #{window_id}", shelljoin(veeBinary), port, tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "k", "run-shell", completeCmd); err != nil {
 		return fmt.Errorf("tmux bind-key k: %w", err)
 	}
 
 	// Ctrl-b r: resume a suspended session
-	resumeCmd := fmt.Sprintf("%s _resume-menu --port %d", shelljoin(veeBinary), port)
+	resumeCmd := fmt.Sprintf("%s _resume-menu --port %d --tmux-socket %s", shelljoin(veeBinary), port, tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "r", "run-shell", resumeCmd); err != nil {
 		return fmt.Errorf("tmux bind-key r: %w", err)
 	}
 
 	// Ctrl-b l: show logs in a popup (Esc or q to dismiss)
-	logPopupCmd := fmt.Sprintf("%s _log-viewer", shelljoin(veeBinary))
+	logPopupCmd := fmt.Sprintf("%s _log-viewer --tmux-socket %s", shelljoin(veeBinary), tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "l", "display-popup", "-E", "-w", "90%", "-h", "80%", logPopupCmd); err != nil {
 		return fmt.Errorf("tmux bind-key l: %w", err)
 	}
@@ -219,6 +228,7 @@ func buildPickerPopupCmd(veeBinary string, port int, veePath string, passthrough
 	cmdParts = append(cmdParts, "_session-picker")
 	cmdParts = append(cmdParts, "--vee-path", shelljoin(veePath))
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", port))
+	cmdParts = append(cmdParts, "--tmux-socket", tmuxSocketName)
 
 	if len(passthrough) > 0 {
 		cmdParts = append(cmdParts, "--")

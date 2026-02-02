@@ -218,8 +218,8 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 	runCmd := strings.Join(runParts, " ")
 
 	// Cleanup command — runs on host after Docker exits
-	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --session-id %s --wait-for-user",
-		shelljoin(veeBinary), port, sessionID)
+	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s --wait-for-user",
+		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
 
 	return "printf '\\033[?25h'; " + buildCmd + " && " + runCmd + "; " + cleanupCmd
 }

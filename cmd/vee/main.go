@@ -26,7 +26,6 @@ type Mode struct {
 	Description string
 	Priority    int
 	Prompt      string // composed system prompt content
-	NoPrompt    bool   // skip --append-system-prompt entirely (vanilla claude)
 }
 
 // logFilePath returns the log path for this Vee instance.
@@ -91,19 +90,6 @@ var modeRegistry map[string]Mode
 
 // modeOrder defines the display order, populated by initModeRegistry.
 var modeOrder []string
-
-// extractSection returns the content between start and end markers (inclusive).
-func extractSection(s, start, end string) string {
-	i := strings.Index(s, start)
-	if i < 0 {
-		return ""
-	}
-	j := strings.Index(s[i:], end)
-	if j < 0 {
-		return ""
-	}
-	return s[i : i+j+len(end)]
-}
 
 // claudeArgs holds the arguments after "--" that are forwarded to claude.
 type claudeArgs []string
@@ -1046,16 +1032,22 @@ func readProjectConfig() (string, error) {
 	return string(content), nil
 }
 
-func composeSystemPrompt(base, projectConfig string) string {
-	if projectConfig == "" {
-		return base
-	}
-
+func composeSystemPrompt(base, projectConfig string, ephemeral bool) string {
 	var sb strings.Builder
 	sb.WriteString(base)
-	sb.WriteString("\n\n<project_setup>\n")
-	sb.WriteString(projectConfig)
-	sb.WriteString("\n</project_setup>\n")
+
+	if ephemeral {
+		sb.WriteString("\n\n<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.\n</environment>")
+	} else {
+		sb.WriteString("\n\n<environment type=\"host\">\nThis session is run directly on the user's host.\n</environment>")
+	}
+
+	if projectConfig != "" {
+		sb.WriteString("\n\n<project_setup>\n")
+		sb.WriteString(projectConfig)
+		sb.WriteString("\n</project_setup>\n")
+	}
+
 	return sb.String()
 }
 
@@ -1268,12 +1260,8 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig st
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		if mode.NoPrompt {
-			args = append(args, passthrough...)
-		} else {
-			fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
-			args = buildArgs(passthrough, fullPrompt)
-		}
+		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig, false)
+		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}
 

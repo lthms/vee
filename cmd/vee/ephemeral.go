@@ -110,12 +110,8 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 
 	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
 	var claudeArgs []string
-	if mode.NoPrompt {
-		claudeArgs = append(claudeArgs, passthrough...)
-	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig)
-		claudeArgs = buildArgs(passthrough, fullPrompt)
-	}
+	fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig, true)
+	claudeArgs = buildArgs(passthrough, fullPrompt)
 	claudeArgs = append(claudeArgs, "--session-id", sessionID)
 	if mcpConfigFile != "" {
 		claudeArgs = append(claudeArgs, "--mcp-config", mcpConfigFile)

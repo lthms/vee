@@ -34,20 +34,18 @@ You are in read-only mode.`,
 			},
 		},
 		{
-			name:     "no_prompt mode",
+			name:     "mode with empty body",
 			filename: "claude.md",
 			content: `---
 indicator: "🤖"
 description: "Vanilla session"
 priority: 0
-no_prompt: true
 ---`,
 			wantMode: Mode{
 				Name:        "claude",
 				Indicator:   "🤖",
 				Description: "Vanilla session",
 				Priority:    0,
-				NoPrompt:    true,
 				Prompt:      "",
 			},
 		},
@@ -123,9 +121,6 @@ Body text.`,
 			if mode.Priority != tt.wantMode.Priority {
 				t.Errorf("Priority = %d, want %d", mode.Priority, tt.wantMode.Priority)
 			}
-			if mode.NoPrompt != tt.wantMode.NoPrompt {
-				t.Errorf("NoPrompt = %v, want %v", mode.NoPrompt, tt.wantMode.NoPrompt)
-			}
 			if mode.Prompt != tt.wantMode.Prompt {
 				t.Errorf("Prompt = %q, want %q", mode.Prompt, tt.wantMode.Prompt)
 			}
@@ -134,13 +129,12 @@ Body text.`,
 }
 
 func TestWrapModeBody(t *testing.T) {
-	got := wrapModeBody("normal", "🦊", "Read-only mode.")
-	want := `<mode name="normal"><indicator value="🦊" />
-
-Read-only mode.
-</mode>`
-	if got != want {
-		t.Errorf("wrapModeBody:\ngot:  %q\nwant: %q", got, want)
+	got := wrapModeBody("Read-only mode.")
+	if !strings.Contains(got, `<rule object="Script">`) {
+		t.Error("wrapModeBody should include the script rule")
+	}
+	if !strings.Contains(got, "<script>\nRead-only mode.\n</script>") {
+		t.Error("wrapModeBody should wrap body in script tags")
 	}
 }
 
@@ -205,7 +199,6 @@ func writeTestModes(t *testing.T) string {
 indicator: "🤖"
 description: "Vanilla Claude Code session"
 priority: 0
-no_prompt: true
 ---`), 0644)
 
 	os.WriteFile(filepath.Join(modesDir, "normal.md"), []byte(`---
@@ -273,32 +266,23 @@ func TestInitModeRegistryFromInstalledModes(t *testing.T) {
 
 	// Verify prompt composition for a regular mode.
 	normal := modeRegistry["normal"]
-	if normal.NoPrompt {
-		t.Error("normal should not be NoPrompt")
+	if !strings.Contains(normal.Prompt, "Knowledge base") {
+		t.Error("normal prompt should contain base prompt (Knowledge base rule)")
 	}
-	if !strings.Contains(normal.Prompt, "<identity>") {
-		t.Error("normal prompt should contain base prompt (<identity> tag)")
-	}
-	if !strings.Contains(normal.Prompt, `<mode name="normal">`) {
+	if !strings.Contains(normal.Prompt, `<script>`) {
 		t.Error("normal prompt should contain wrapped mode body")
-	}
-	if !strings.Contains(normal.Prompt, `<indicator value="🦊"`) {
-		t.Error("normal prompt should contain indicator in XML wrapper")
 	}
 	if !strings.Contains(normal.Prompt, "Read-only exploration mode") {
 		t.Error("normal prompt should contain mode body text")
 	}
 
-	// Verify no_prompt mode gets only KB section.
+	// Verify claude mode (empty body) gets base prompt without script wrapper.
 	claude := modeRegistry["claude"]
-	if !claude.NoPrompt {
-		t.Error("claude should be NoPrompt")
+	if !strings.Contains(claude.Prompt, "Knowledge base") {
+		t.Error("claude prompt should contain base prompt (Knowledge base rule)")
 	}
-	if !strings.Contains(claude.Prompt, "<knowledge-base>") {
-		t.Error("claude prompt should contain KB section")
-	}
-	if strings.Contains(claude.Prompt, "<identity>") {
-		t.Error("claude prompt should NOT contain identity/base prompt")
+	if strings.Contains(claude.Prompt, "<script>") {
+		t.Error("claude prompt should not contain script wrapper (empty body)")
 	}
 }
 

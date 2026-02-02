@@ -17,7 +17,6 @@ type ModeFrontmatter struct {
 	Indicator   string `yaml:"indicator"`
 	Description string `yaml:"description"`
 	Priority    *int   `yaml:"priority"`
-	NoPrompt    bool   `yaml:"no_prompt"`
 }
 
 // parseModeFile splits a mode file into frontmatter and body, parses the
@@ -57,13 +56,19 @@ func parseModeFile(filename string, content []byte) (Mode, error) {
 		Description: fm.Description,
 		Priority:    priority,
 		Prompt:      string(body),
-		NoPrompt:    fm.NoPrompt,
 	}, nil
 }
 
 // wrapModeBody wraps a mode body in XML tags for system prompt composition.
-func wrapModeBody(modeName, indicator, body string) string {
-	return fmt.Sprintf("<mode name=%q><indicator value=%q />\n\n%s\n</mode>", modeName, indicator, body)
+// It prepends a rule explaining the script's role, so the rule is only
+// present when there is actually a script to follow.
+func wrapModeBody(body string) string {
+	const scriptRule = `<rule object="Script">
+Your system prompt contains a <script> block.
+It defines the purpose and constraints of this session.
+ALWAYS follow the directives in your <script> block. They take precedence over your default behavior.
+</rule>`
+	return fmt.Sprintf("%s\n\n<script>\n%s\n</script>", scriptRule, body)
 }
 
 // loadModesFromDir reads all *.md files from a directory and parses them as modes.
@@ -129,16 +134,13 @@ func initModeRegistry(veePath string) error {
 		return fmt.Errorf("no mode files found in %s or ~/.config/vee/modes/", installedDir)
 	}
 
-	kbPrompt := extractSection(string(basePrompt), "<knowledge-base>", "</knowledge-base>")
-
 	// Compose prompts and collect into a slice for sorting.
 	modes := make([]Mode, 0, len(byName))
 	for _, m := range byName {
-		if m.NoPrompt {
-			m.Prompt = kbPrompt
+		if m.Prompt != "" {
+			m.Prompt = string(basePrompt) + "\n\n" + wrapModeBody(m.Prompt)
 		} else {
-			wrapped := wrapModeBody(m.Name, m.Indicator, m.Prompt)
-			m.Prompt = string(basePrompt) + "\n\n" + wrapped
+			m.Prompt = string(basePrompt)
 		}
 		modes = append(modes, m)
 	}

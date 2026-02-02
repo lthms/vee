@@ -43,14 +43,16 @@ The Go binary enforces the modal system: it controls which MCP tools are availab
 
 ## Tmux Multiplexer
 
-Vee runs inside a tmux session (`-L vee` socket). The dashboard occupies the first window; each Claude session gets its own window.
+Each project gets its own tmux server via a unique socket name derived from the absolute CWD (`vee-<hash>`). The dashboard occupies the first window (running `_serve`); each Claude session gets its own window. Detaching (`Ctrl-b d`) keeps the daemon alive; rerunning `vee start` in the same directory reattaches.
 
 **Key bindings:**
 - `Ctrl-b c` — New session (opens mode picker)
-- `Ctrl-b x` — Suspend current session
+- `Ctrl-b q` — Suspend current session
+- `Ctrl-b k` — Kill current session
 - `Ctrl-b r` — Resume a suspended session
 - `Ctrl-b l` — View logs
-- `Ctrl-b q` — Graceful shutdown
+- `Ctrl-b d` — Detach (daemon stays alive)
+- `Ctrl-b x` — Exit (suspend all sessions, kill tmux)
 
 ## Session Lifecycle
 
@@ -58,7 +60,7 @@ Sessions move through statuses: **active** → **suspended** → **completed**.
 
 1. User picks a mode via the mode picker.
 2. CLI registers the session with the daemon and spawns Claude in a new tmux window.
-3. The session can be suspended (`Ctrl-b x` or MCP `request_suspend`) and later resumed (`Ctrl-b r`, using `--resume`).
+3. The session can be suspended (`Ctrl-b q` or MCP `request_suspend`) and later resumed (`Ctrl-b r`, using `--resume`).
 4. On Claude exit, the session is marked completed.
 
 ## Knowledge Base

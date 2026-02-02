@@ -182,22 +182,22 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 		return fmt.Errorf("tmux bind-key picker: %w", err)
 	}
 
-	// Ctrl-b q: graceful shutdown (suspend all sessions, clean up, kill tmux)
-	shutdownCmd := fmt.Sprintf("%s _shutdown --port %d --tmux-socket %s", shelljoin(veeBinary), port, tmuxSocketName)
-	if _, err := tmuxRun("bind-key", "-T", "prefix", "q", "run-shell", shutdownCmd); err != nil {
-		return fmt.Errorf("tmux bind-key q: %w", err)
-	}
-
-	// Ctrl-b x: suspend the session in the current window
+	// Ctrl-b q: suspend the session in the current window
 	suspendCmd := fmt.Sprintf("%s _suspend-window --port %d --tmux-socket %s --window-id #{window_id}", shelljoin(veeBinary), port, tmuxSocketName)
-	if _, err := tmuxRun("bind-key", "-T", "prefix", "x", "run-shell", suspendCmd); err != nil {
-		return fmt.Errorf("tmux bind-key x: %w", err)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "q", "run-shell", suspendCmd); err != nil {
+		return fmt.Errorf("tmux bind-key q: %w", err)
 	}
 
 	// Ctrl-b k: complete (kill) the session in the current window
 	completeCmd := fmt.Sprintf("%s _complete-window --port %d --tmux-socket %s --window-id #{window_id}", shelljoin(veeBinary), port, tmuxSocketName)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "k", "run-shell", completeCmd); err != nil {
 		return fmt.Errorf("tmux bind-key k: %w", err)
+	}
+
+	// Ctrl-b x: exit (suspend all sessions, clean up, kill tmux)
+	shutdownCmd := fmt.Sprintf("%s _shutdown --port %d --tmux-socket %s", shelljoin(veeBinary), port, tmuxSocketName)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "x", "run-shell", shutdownCmd); err != nil {
+		return fmt.Errorf("tmux bind-key x: %w", err)
 	}
 
 	// Ctrl-b r: resume a suspended session

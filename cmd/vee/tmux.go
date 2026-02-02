@@ -15,9 +15,29 @@ var tmuxSocketName = "vee"
 // tmuxSessionName is the tmux session name (always "vee" — one session per socket).
 var tmuxSessionName = "vee"
 
-// tmuxCmd builds an exec.Cmd for tmux using the instance socket.
+// veeRuntimeDir returns the base runtime directory for this vee instance.
+// Uses $XDG_RUNTIME_DIR/vee, falling back to /run/user/<uid>/vee.
+func veeRuntimeDir() string {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = fmt.Sprintf("/run/user/%d", os.Getuid())
+	}
+	return filepath.Join(dir, "vee")
+}
+
+// tmuxSocketPath returns the full path to the tmux socket file.
+func tmuxSocketPath() string {
+	return filepath.Join(veeRuntimeDir(), tmuxSocketName)
+}
+
+// ensureRuntimeDir creates the vee runtime directory if it doesn't exist.
+func ensureRuntimeDir() error {
+	return os.MkdirAll(veeRuntimeDir(), 0700)
+}
+
+// tmuxCmd builds an exec.Cmd for tmux using the instance socket path.
 func tmuxCmd(args ...string) *exec.Cmd {
-	return exec.Command("tmux", append([]string{"-L", tmuxSocketName}, args...)...)
+	return exec.Command("tmux", append([]string{"-S", tmuxSocketPath()}, args...)...)
 }
 
 // tmuxRun executes a tmux command and returns its combined output.

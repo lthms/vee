@@ -30,7 +30,7 @@ type Mode struct {
 
 // logFilePath returns the log path for this Vee instance.
 func logFilePath() string {
-	return filepath.Join(os.TempDir(), tmuxSocketName+".log")
+	return filepath.Join(veeRuntimeDir(), tmuxSocketName+".log")
 }
 
 // instanceSocket computes a unique tmux socket name from the absolute CWD.
@@ -178,14 +178,28 @@ type CLI struct {
 
 // StartCmd runs the in-process server and manages the tmux session.
 type StartCmd struct {
-	VeePath string `required:"" type:"path" help:"Path to the vee installation directory." name:"vee-path"`
+	VeePath string `type:"path" help:"Path to the vee installation directory." name:"vee-path"`
 }
 
 // Run starts (or reattaches to) a Vee instance for the current directory.
 func (cmd *StartCmd) Run(args claudeArgs) error {
+	// Default VeePath to ~/.local/share/vee if not provided
+	if cmd.VeePath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		cmd.VeePath = filepath.Join(home, ".local", "share", "vee")
+	}
+
 	// Compute instance-specific socket name
 	socketName := instanceSocket()
 	tmuxSocketName = socketName
+
+	// Ensure the tmux socket directory exists
+	if err := ensureRuntimeDir(); err != nil {
+		return fmt.Errorf("failed to create socket directory: %w", err)
+	}
 
 	// Resolve own binary path
 	veeBinary, err := os.Executable()
@@ -962,33 +976,21 @@ func (cmd *KBIngestCmd) Run() error {
 
 // sessionTempDir returns the per-session temp directory path.
 func sessionTempDir(sessionID string) string {
-	return filepath.Join(os.TempDir(), "vee-"+sessionID)
+	return filepath.Join(veeRuntimeDir(), "session-"+sessionID)
 }
 
-// cleanStaleTempFiles removes leftover session temp dirs and old-style temp files.
+// cleanStaleTempFiles removes leftover session temp dirs from the runtime directory.
 func cleanStaleTempFiles() {
-	tmpDir := os.TempDir()
-
-	// Session temp directories: /tmp/vee-UUID/
-	entries, _ := os.ReadDir(tmpDir)
+	rtDir := veeRuntimeDir()
+	entries, _ := os.ReadDir(rtDir)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if strings.HasPrefix(name, "vee-") && len(name) > 10 {
-			path := filepath.Join(tmpDir, name)
-			slog.Debug("cleanup: removing stale temp dir", "path", path)
+		if strings.HasPrefix(e.Name(), "session-") {
+			path := filepath.Join(rtDir, e.Name())
+			slog.Debug("cleanup: removing stale session dir", "path", path)
 			os.RemoveAll(path)
-		}
-	}
-
-	// Old-style temp files from before the per-session dir refactor
-	for _, pattern := range []string{"vee-mcp-*.json", "vee-settings-*.json"} {
-		matches, _ := filepath.Glob(filepath.Join(tmpDir, pattern))
-		for _, m := range matches {
-			slog.Debug("cleanup: removing old-style temp file", "path", m)
-			os.Remove(m)
 		}
 	}
 }

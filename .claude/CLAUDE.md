@@ -72,3 +72,5 @@ A shared knowledge base is available to all modes via MCP tools (`kb_remember`, 
 
 When the user highlights a breach in a mode policy, NEVER apologies.
 ALWAYS look for what may have prompted the mismatch in your context and suggest patches to the affected command.
+
+Prompts use one-line paragraphs (no hard wraps). The prompt viewer handles word wrapping at display time.

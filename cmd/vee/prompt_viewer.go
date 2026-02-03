@@ -80,7 +80,7 @@ func (cmd *PromptViewerCmd) Run() error {
 
 	// Wrap lines to terminal width
 	ps := &promptViewerState{
-		lines:      wrapText(result.SystemPrompt, w-2),
+		lines:      renderPromptLines(result.SystemPrompt, w-2),
 		termWidth:  w,
 		termHeight: h,
 		mode:       result.Mode,
@@ -257,11 +257,30 @@ func wrapText(text string, maxWidth int) []string {
 	return result
 }
 
-// truncateLine truncates a line to fit within maxWidth.
+// truncateLine truncates a line to fit within maxWidth visible characters,
+// skipping ANSI escape sequences when counting width.
 func truncateLine(line string, maxWidth int) string {
+	visible := 0
+	i := 0
 	runes := []rune(line)
-	if len(runes) > maxWidth {
-		return string(runes[:maxWidth])
+	for i < len(runes) {
+		if runes[i] == '\033' {
+			// Skip entire escape sequence: ESC [ ... letter
+			i++
+			for i < len(runes) {
+				c := runes[i]
+				i++
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+					break
+				}
+			}
+			continue
+		}
+		if visible >= maxWidth {
+			return string(runes[:i]) + ansiReset
+		}
+		visible++
+		i++
 	}
 	return line
 }

@@ -28,6 +28,7 @@ const (
 	ansiGreen  = "\033[38;2;166;227;161m" // #a6e3a1
 	ansiYellow = "\033[38;2;249;226;175m" // #f9e2af
 	ansiMuted  = "\033[38;2;147;153;178m" // #9399b2
+	ansiOrange = "\033[38;2;255;158;100m" // #ff9e64
 )
 
 // dashboardState mirrors the /api/state JSON response.

@@ -334,7 +334,6 @@ func (rs *resolverState) render() {
 	fmt.Print(sb.String())
 }
 
-const ansiOrange = "\033[38;2;255;158;100m" // #ff9e64
 
 func (rs *resolverState) renderList(sb *strings.Builder) {
 	w := rs.termWidth

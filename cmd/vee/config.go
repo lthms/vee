@@ -37,10 +37,17 @@ type IdentityConfig struct {
 	Disable bool
 }
 
+// PlatformsConfig holds the [platforms] section of .vee/config.
+type PlatformsConfig struct {
+	Forge  string
+	Issues string
+}
+
 // ProjectConfig represents the top-level .vee/config structure.
 type ProjectConfig struct {
 	Ephemeral *EphemeralConfig
 	Identity  *IdentityConfig
+	Platforms *PlatformsConfig
 }
 
 // readProjectTOML reads and parses .vee/config from the current directory.
@@ -301,6 +308,20 @@ func hydrateProjectConfig(m map[string][]string) *ProjectConfig {
 		cfg.Identity.Disable = disable == "true"
 	}
 
+	// [platforms]
+	if forge := lastValue(m, "platforms.forge"); forge != "" {
+		if cfg.Platforms == nil {
+			cfg.Platforms = &PlatformsConfig{}
+		}
+		cfg.Platforms.Forge = forge
+	}
+	if issues := lastValue(m, "platforms.issues"); issues != "" {
+		if cfg.Platforms == nil {
+			cfg.Platforms = &PlatformsConfig{}
+		}
+		cfg.Platforms.Issues = issues
+	}
+
 	return cfg
 }
 
@@ -445,6 +466,25 @@ func identityRule(cfg *IdentityConfig) string {
 		return ""
 	}
 	return fmt.Sprintf("<rule object=\"Identity\">\nYour name is %s.\nALWAYS use `git commit` with `--author \"%s <%s>\"`.\n</rule>", cfg.Name, cfg.Name, cfg.Email)
+}
+
+// platformsRule returns the rendered <rule> block for the system prompt,
+// or "" if cfg is nil or has no URLs configured.
+func platformsRule(cfg *PlatformsConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	var lines []string
+	if cfg.Forge != "" {
+		lines = append(lines, fmt.Sprintf("Use %s as the project's forge (source code, pull requests).", cfg.Forge))
+	}
+	if cfg.Issues != "" {
+		lines = append(lines, fmt.Sprintf("Use %s as the project's issue tracker.", cfg.Issues))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "<rule object=\"Platforms\">\n" + strings.Join(lines, "\n") + "\n</rule>"
 }
 
 // EmbeddingConfig configures the embedding backend and knowledge base settings.

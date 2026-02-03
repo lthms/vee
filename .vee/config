@@ -1,3 +1,7 @@
+[platforms]
+  forge = https://github.com/lthms/vee
+  issues = https://github.com/lthms/vee/issues
+
 [ephemeral]
   # Path to Dockerfile relative to .vee/ (defaults to "Dockerfile" → .vee/Dockerfile)
   # dockerfile = Dockerfile

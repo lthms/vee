@@ -77,7 +77,7 @@ func dockerfilePath(cfg *EphemeralConfig) string {
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
 //
 //	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
+func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, platformsRule, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
 	tag := ephemeralImageTag()
 	df := dockerfilePath(cfg)
 
@@ -93,7 +93,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 
 	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
 	var claudeArgs []string
-	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, "", projectConfig, true)
+	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, "", projectConfig, true)
 	claudeArgs = buildArgs(passthrough, fullPrompt)
 	claudeArgs = append(claudeArgs, "--session-id", sessionID)
 	if mcpConfigFile != "" {

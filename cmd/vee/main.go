@@ -232,10 +232,12 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 		userCfg = hydrateUserConfig(nil)
 	}
 
-	// Resolve identity: merge user + project configs
+	// Resolve identity + platforms from project config
 	var projectIdentity *IdentityConfig
+	var platRule string
 	if projCfg, err := readProjectTOML(); err == nil {
 		projectIdentity = projCfg.Identity
+		platRule = platformsRule(projCfg.Platforms)
 	}
 	resolvedIdentity := resolveIdentity(userCfg.Identity, projectIdentity)
 	if err := validateIdentity(resolvedIdentity); err != nil {
@@ -286,6 +288,7 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 		Passthrough:   []string(args),
 		ProjectConfig: projectConfig,
 		IdentityRule:  idRule,
+		PlatformsRule: platRule,
 		MaxExamples:   userCfg.Feedback.MaxExamples,
 	})
 
@@ -343,7 +346,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 
 	// Compose system prompt (for storage — lets prompt viewer display it later)
 	isEphemeral := cmd.Ephemeral
-	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral)
+	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral)
 
 	var shellCmd string
 	if isEphemeral {
@@ -354,9 +357,9 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		if cfg.Ephemeral == nil {
 			return fmt.Errorf("no [ephemeral] section in .vee/config")
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
 	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
+		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	}
 
@@ -570,7 +573,7 @@ func (cmd *ResumeSessionCmd) Run() error {
 	}
 
 	// Build claude args with --resume (feedback block is empty — system prompt is stripped on resume)
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.PlatformsRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -973,13 +976,18 @@ func readProjectConfig() (string, error) {
 	return string(content), nil
 }
 
-func composeSystemPrompt(base, identityRule, feedbackBlock, projectConfig string, ephemeral bool) string {
+func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, projectConfig string, ephemeral bool) string {
 	var sb strings.Builder
 	sb.WriteString(base)
 
 	if identityRule != "" {
 		sb.WriteString("\n\n")
 		sb.WriteString(identityRule)
+	}
+
+	if platformsRule != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(platformsRule)
 	}
 
 	if feedbackBlock != "" {
@@ -1246,14 +1254,14 @@ func formatFeedbackBlock(entries []struct {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule, platformsRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, feedbackBlock, projectConfig, false)
+		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false)
 		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}

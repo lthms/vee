@@ -14,6 +14,7 @@ type AppConfig struct {
 	Passthrough   []string `json:"passthrough"`
 	ProjectConfig string   `json:"project_config"`
 	IdentityRule  string   `json:"identity_rule"`
+	PlatformsRule string   `json:"platforms_rule"`
 	MaxExamples   int      `json:"max_examples"`
 }
 

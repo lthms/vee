@@ -32,10 +32,11 @@ const (
 
 // dashboardState mirrors the /api/state JSON response.
 type dashboardState struct {
-	Active    []*Session     `json:"active_sessions"`
-	Suspended []*Session     `json:"suspended_sessions"`
-	Completed []*Session     `json:"completed_sessions"`
-	Indexing  []IndexingTask `json:"indexing_tasks"`
+	Active     []*Session     `json:"active_sessions"`
+	Suspended  []*Session     `json:"suspended_sessions"`
+	Completed  []*Session     `json:"completed_sessions"`
+	Indexing   []IndexingTask `json:"indexing_tasks"`
+	IssueCount int            `json:"issue_count"`
 }
 
 // Run starts the dashboard TUI loop.
@@ -113,6 +114,17 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString(ansiDim)
 	sb.WriteString(" — Modal Code Assistant")
 	sb.WriteString(ansiReset)
+
+	if state != nil && state.IssueCount > 0 {
+		sb.WriteString("  ")
+		sb.WriteString(ansiYellow)
+		sb.WriteString(fmt.Sprintf("⚠ %d issue", state.IssueCount))
+		if state.IssueCount > 1 {
+			sb.WriteString("s")
+		}
+		sb.WriteString(ansiReset)
+	}
+
 	sb.WriteString("\r\n\r\n")
 
 	if state == nil {
@@ -140,11 +152,15 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString(ansiMuted)
 	sb.WriteString("Ctrl-b c")
 	sb.WriteString(ansiReset)
-	sb.WriteString(" new session  ")
+	sb.WriteString(" new  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("Ctrl-b /")
 	sb.WriteString(ansiReset)
-	sb.WriteString(" KB search  ")
+	sb.WriteString(" KB  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("Ctrl-b i")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" issues  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("Ctrl-b n/p")
 	sb.WriteString(ansiReset)
@@ -178,9 +194,9 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 	for _, sess := range sessions {
 		age := formatAge(time.Since(sess.StartedAt))
 
-		// Layout: indent(4) + ⏣(1) + space(1) + ⊙(1) + space(1) + indicator(2) + space(1) + mode + gap + preview + gap + age
+		// Layout: indent(4) + ⏣(1) + space(1) + indicator(2) + space(1) + mode + gap + preview + gap + age
 		const indent = 4
-		const badgeWidth = 3    // ephemeral(1) + space(1) + kbIngest(1)
+		const badgeWidth = 1    // ephemeral(1)
 		const indicatorWidth = 2 // emoji
 		leftFixed := indent + badgeWidth + 1 + indicatorWidth + 1 + len(sess.Mode)
 		rightFixed := len(age) + 2 // +2 for right margin
@@ -194,16 +210,6 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 			sb.WriteString(ansiDim)
 		}
 		sb.WriteString("⏣")
-		sb.WriteString(ansiReset)
-		sb.WriteString(" ")
-
-		// KB ingest badge (always shown, colored when active, dim when not)
-		if sess.KBIngest {
-			sb.WriteString(ansiTeal)
-		} else {
-			sb.WriteString(ansiDim)
-		}
-		sb.WriteString("⊙")
 		sb.WriteString(ansiReset)
 
 		// Indicator + mode name

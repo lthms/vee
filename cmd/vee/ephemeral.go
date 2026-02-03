@@ -77,7 +77,7 @@ func dockerfilePath(cfg *EphemeralConfig) string {
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
 //
 //	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, prompt string, port int, veePath, veeBinary string, passthrough []string, kbIngest bool) string {
+func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
 	tag := ephemeralImageTag()
 	df := dockerfilePath(cfg)
 
@@ -86,7 +86,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 	if err != nil {
 		slog.Error("failed to write docker MCP config", "error", err)
 	}
-	settingsFile, err := writeEphemeralSettings(sessionID, port, kbIngest)
+	settingsFile, err := writeEphemeralSettings(sessionID, port)
 	if err != nil {
 		slog.Error("failed to write ephemeral settings", "error", err)
 	}
@@ -226,7 +226,7 @@ func writeMCPConfigDocker(port int, sessionID string) (string, error) {
 // for use inside a Docker container (no vee binary required, just curl).
 // Uses a shell pipeline that reads stdin once, enriches it with flags, and
 // POSTs the combined JSON to /api/hook/window-state.
-func writeEphemeralSettings(sessionID string, port int, kbIngest bool) (string, error) {
+func writeEphemeralSettings(sessionID string, port int) (string, error) {
 	dir := sessionTempDir(sessionID)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -298,26 +298,6 @@ func writeEphemeralSettings(sessionID string, port int, kbIngest bool) (string, 
 				},
 			},
 		},
-	}
-
-	if kbIngest {
-		ingestURL := fmt.Sprintf("http://host.docker.internal:%d/api/hook/kb-ingest", port)
-		ingestCmd := fmt.Sprintf(
-			`jq -c '{session_id:"%s", task_prompt:.tool_input.prompt, task_response:.tool_response, subagent_type:(.tool_input.subagent_type // ""), description:(.tool_input.description // "")} | .task_prompt |= .[:4096] | .task_response |= .[:16384]' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
-			sessionID, ingestURL)
-
-		hooks := settings["hooks"].(map[string]any)
-		hooks["PostToolUse"] = []map[string]any{
-			{
-				"matcher": "Task",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": ingestCmd,
-					},
-				},
-			},
-		}
 	}
 
 	content, err := json.MarshalIndent(settings, "", "  ")

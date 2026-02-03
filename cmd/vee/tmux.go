@@ -158,16 +158,14 @@ func syncWindowOptions(sess *Session) error {
 // projectDir is the absolute path shown in the status bar.
 func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []string, projectDir string) error {
 	// Window status format strings with dynamic indicators.
-	// Layout: ⏣ ⊙ #W [working/notif] [perm]
-	// Badges (⏣ ephemeral, ⊙ kb-ingest) are always shown: colored when active, dim (#565f89) when not.
+	// Layout: ⏣ #W [working/notif] [perm]
 	// Per-window @vee-* user options drive the conditionals:
 	//   @vee-ephemeral:  ⏣ yellow #f9e2af / dim
-	//   @vee-kb-ingest:  ⊙ teal #73daca / dim
 	//   @vee-working:    ✱ (orange #ff9e64) — mutually exclusive with notif (working wins)
 	//   @vee-notif:      ♪ (blue #7aa2f7)
 	//   @vee-perm:       ⏸ for "plan" (yellow #e0af68), ⏵⏵ for "acceptEdits" (violet #bb9af7)
-	windowStatusFmt := ` #{?#{@vee-ephemeral},#[fg=#f9e2af]⏣#[fg=default],#[fg=#565f89]⏣#[fg=default]} #{?#{@vee-kb-ingest},#[fg=#73daca]⊙#[fg=default],#[fg=#565f89]⊙#[fg=default]} #W#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=default],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=default],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=default],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=default],} `
-	windowStatusCurrentFmt := `#[bg=#414868,fg=#a9b1d6] #{?#{@vee-ephemeral},#[fg=#f9e2af]⏣#[fg=#a9b1d6],#[fg=#565f89]⏣#[fg=#a9b1d6]} #{?#{@vee-kb-ingest},#[fg=#73daca]⊙#[fg=#a9b1d6],#[fg=#565f89]⊙#[fg=#a9b1d6]} #W#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=#a9b1d6],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=#a9b1d6],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=#a9b1d6],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=#a9b1d6],} #[default]`
+	windowStatusFmt := ` #{?#{@vee-ephemeral},#[fg=#f9e2af]⏣#[fg=default],#[fg=#565f89]⏣#[fg=default]} #W#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=default],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=default],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=default],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=default],} `
+	windowStatusCurrentFmt := `#[bg=#414868,fg=#a9b1d6] #{?#{@vee-ephemeral},#[fg=#f9e2af]⏣#[fg=#a9b1d6],#[fg=#565f89]⏣#[fg=#a9b1d6]} #W#{?#{@vee-working},#[fg=#ff9e64] ✱#[fg=#a9b1d6],#{?#{@vee-notif},#[fg=#7aa2f7] ♪#[fg=#a9b1d6],}}#{?#{==:#{@vee-perm},plan},#[fg=#e0af68] ⏸#[fg=#a9b1d6],}#{?#{==:#{@vee-perm},acceptEdits},#[fg=#bb9af7] ⏵⏵#[fg=#a9b1d6],} #[default]`
 
 	// Each entry is a slice of tmux set-option/bind-key args.
 	commands := [][]string{
@@ -243,6 +241,12 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 	explorerCmd := fmt.Sprintf("%s _kb-explorer --port %d", shelljoin(veeBinary), port)
 	if _, err := tmuxRun("bind-key", "-T", "prefix", "/", "display-popup", "-E", "-w", "90", "-h", "30", explorerCmd); err != nil {
 		return fmt.Errorf("tmux bind-key /: %w", err)
+	}
+
+	// Ctrl-b i: issue resolver popup
+	issueCmd := fmt.Sprintf("%s _issue-resolver --port %d", shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "i", "display-popup", "-E", "-w", "100", "-h", "40", issueCmd); err != nil {
+		return fmt.Errorf("tmux bind-key i: %w", err)
 	}
 
 	return nil

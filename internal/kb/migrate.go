@@ -12,11 +12,21 @@ func migrate(db *sql.DB) error {
 			content       TEXT NOT NULL,
 			source        TEXT NOT NULL DEFAULT '',
 			source_type   TEXT NOT NULL DEFAULT 'manual',
-			status        TEXT NOT NULL DEFAULT 'active',
+			status        TEXT NOT NULL DEFAULT 'pending',
 			embedding     BLOB,
 			model         TEXT NOT NULL DEFAULT '',
 			created_at    TEXT NOT NULL,
 			last_verified TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS issues (
+			id          TEXT PRIMARY KEY,
+			type        TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'open',
+			statement_a TEXT NOT NULL,
+			statement_b TEXT NOT NULL,
+			score       REAL NOT NULL DEFAULT 0,
+			created_at  TEXT NOT NULL,
+			resolved_at TEXT NOT NULL DEFAULT ''
 		)`,
 	}
 
@@ -24,33 +34,6 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("exec %q: %w", truncate(s, 60), err)
 		}
-	}
-
-	// Drop title column from statements (added pre-v2, now redundant).
-	db.Exec(`ALTER TABLE statements DROP COLUMN title`)
-
-	// Drop removed tables (safe on fresh DBs via IF EXISTS)
-	dropStmts := []string{
-		`DROP TABLE IF EXISTS nogoods`,
-		`DROP TABLE IF EXISTS root_exclusions`,
-		`DROP TABLE IF EXISTS cluster_members`,
-		`DROP TABLE IF EXISTS hierarchy`,
-		`DROP TABLE IF EXISTS roots`,
-		`DROP TABLE IF EXISTS clusters`,
-		`DROP TABLE IF EXISTS processing_queue`,
-		`DROP TABLE IF EXISTS model_audit`,
-		// Legacy tables from older schemas
-		`DROP TABLE IF EXISTS leaf_entries`,
-		`DROP TABLE IF EXISTS node_embeddings`,
-		`DROP TABLE IF EXISTS tree_nodes`,
-		`DROP TABLE IF EXISTS notes`,
-		`DROP TABLE IF EXISTS notes_fts`,
-		`DROP TRIGGER IF EXISTS notes_ai`,
-		`DROP TRIGGER IF EXISTS notes_ad`,
-		`DROP TRIGGER IF EXISTS notes_au`,
-	}
-	for _, s := range dropStmts {
-		db.Exec(s)
 	}
 
 	return nil

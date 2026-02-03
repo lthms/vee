@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"embed"
 	"encoding/json"
@@ -110,8 +111,8 @@ type CLI struct {
 	UpdatePreview UpdatePreviewCmd `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
 	UpdateWindow  UpdateWindowCmd  `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
 	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
-	KBIngest      KBIngestCmd      `cmd:"" name:"_kb-ingest" hidden:"" help:"Internal: KB ingest hook handler."`
 	KBExplorer    KBExplorerCmd    `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
+	IssueResolver IssueResolverCmd `cmd:"" name:"_issue-resolver" hidden:"" help:"Internal: KB issue resolver TUI."`
 	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
 	Serve         ServeCmd         `cmd:"" name:"_serve" hidden:"" help:"Internal: daemon + dashboard inside tmux."`
 }
@@ -224,10 +225,7 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 	userCfg, err := loadUserConfig()
 	if err != nil {
 		slog.Warn("failed to load user config, using defaults", "error", err)
-		userCfg = &UserConfig{
-			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "claude:haiku"},
-			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
-		}
+		userCfg = hydrateUserConfig(nil)
 	}
 
 	// Resolve identity: merge user + project configs
@@ -241,15 +239,20 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 	}
 	idRule := identityRule(resolvedIdentity)
 
-	kbase, judgmentModel, err := openKB(userCfg)
+	kbase, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("failed to open knowledge base: %w", err)
 	}
 	defer kbase.Close()
 
+	// Start the KB background worker for async embedding + duplicate detection
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	go kbase.RunWorker(workerCtx)
+
 	app := newApp()
 
-	srv, port, err := startHTTPServerInBackground(app, kbase, judgmentModel)
+	srv, port, err := startHTTPServerInBackground(app, kbase)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
@@ -290,7 +293,6 @@ type NewPaneCmd struct {
 	Mode       string `required:"" name:"mode"`
 	Prompt     string `name:"prompt" help:"Initial prompt for the session."`
 	Ephemeral  bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
-	KBIngest   bool   `name:"kb-ingest" help:"Enable KB ingest hook on Task completion."`
 	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
@@ -330,9 +332,9 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		if cfg.Ephemeral == nil {
 			return fmt.Errorf("no [ephemeral] section in .vee/config")
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args), cmd.KBIngest)
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
 	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Port, cmd.VeePath, []string(args), veeBinary, cmd.KBIngest)
+		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	}
 
@@ -349,13 +351,8 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
 	}
 
-	// Set @vee-kb-ingest on the window if KB ingest is enabled
-	if cmd.KBIngest {
-		tmuxSetWindowOption(windowID, "vee-kb-ingest", "1")
-	}
-
 	// Register session with daemon, including the window target
-	if err := registerSession(cmd.Port, sessionID, mode, windowID, cmd.Ephemeral, cmd.KBIngest); err != nil {
+	if err := registerSession(cmd.Port, sessionID, mode, windowID, cmd.Ephemeral); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -363,9 +360,9 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral, kbIngest bool) error {
-	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q,"ephemeral":%t,"kb_ingest":%t}`,
-		sessionID, mode.Name, mode.Indicator, windowTarget, ephemeral, kbIngest)
+func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool) error {
+	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q,"ephemeral":%t}`,
+		sessionID, mode.Name, mode.Indicator, windowTarget, ephemeral)
 
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port),
@@ -543,17 +540,8 @@ func (cmd *ResumeSessionCmd) Run() error {
 		}
 	}
 
-	// Fetch session state from daemon to get KBIngest flag
-	sess, err := fetchSession(cmd.Port, cmd.SessionID)
-	var kbIngest bool
-	if err != nil {
-		slog.Warn("failed to fetch session from daemon, assuming no kb-ingest", "error", err)
-	} else {
-		kbIngest = sess.KBIngest
-	}
-
 	// Build claude args with --resume
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary, kbIngest)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -561,11 +549,6 @@ func (cmd *ResumeSessionCmd) Run() error {
 	windowID, err := tmuxNewWindow(windowName, shellCmd)
 	if err != nil {
 		return fmt.Errorf("failed to create tmux window: %w", err)
-	}
-
-	// Set @vee-kb-ingest on the window if KB ingest is enabled
-	if kbIngest {
-		tmuxSetWindowOption(windowID, "vee-kb-ingest", "1")
 	}
 
 	// Activate the session with the new window target
@@ -865,70 +848,6 @@ func (cmd *UpdateWindowCmd) Run() error {
 	return nil
 }
 
-// KBIngestCmd is the hook handler called by the PostToolUse hook when a Task
-// tool completes and KB ingest is enabled. It reads the hook JSON from stdin,
-// extracts relevant fields, and POSTs them to the daemon for async evaluation.
-type KBIngestCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	SessionID  string `required:"" name:"session-id"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run reads the PostToolUse hook JSON from stdin and fires it to the daemon.
-func (cmd *KBIngestCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	setupFileLogger(logFilePath())
-
-	var hookData struct {
-		ToolInput struct {
-			Prompt       string `json:"prompt"`
-			SubagentType string `json:"subagent_type"`
-			Description  string `json:"description"`
-		} `json:"tool_input"`
-		ToolResponse json.RawMessage `json:"tool_response"`
-	}
-	if err := json.NewDecoder(os.Stdin).Decode(&hookData); err != nil {
-		slog.Debug("kb-ingest: failed to decode hook stdin", "error", err)
-		return nil
-	}
-
-	taskPrompt := hookData.ToolInput.Prompt
-	if len(taskPrompt) > 4096 {
-		taskPrompt = taskPrompt[:4096]
-	}
-	// tool_response is typically a JSON-encoded string (e.g. "\"actual text\"").
-	// Try to unwrap the outer quoting; fall back to the raw JSON bytes.
-	var taskResponse string
-	if err := json.Unmarshal(hookData.ToolResponse, &taskResponse); err != nil {
-		taskResponse = string(hookData.ToolResponse)
-	}
-	if len(taskResponse) > 16384 {
-		taskResponse = taskResponse[:16384]
-	}
-
-	body, _ := json.Marshal(map[string]string{
-		"session_id":    cmd.SessionID,
-		"task_prompt":   taskPrompt,
-		"task_response": taskResponse,
-		"subagent_type": hookData.ToolInput.SubagentType,
-		"description":   hookData.ToolInput.Description,
-	})
-
-	slog.Debug("kb-ingest: posting to daemon", "session", cmd.SessionID, "subagent_type", hookData.ToolInput.SubagentType)
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/hook/kb-ingest", cmd.Port),
-		"application/json",
-		strings.NewReader(string(body)),
-	)
-	if err != nil {
-		slog.Debug("kb-ingest: failed to post", "error", err)
-		return nil
-	}
-	resp.Body.Close()
-	return nil
-}
-
 // sessionTempDir returns the per-session temp directory path.
 func sessionTempDir(sessionID string) string {
 	return filepath.Join(veeRuntimeDir(), "session-"+sessionID)
@@ -1066,7 +985,7 @@ func writeMCPConfig(port int, sessionID string) (string, error) {
 	return path, nil
 }
 
-func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) (string, error) {
+func writeSettings(sessionID string, port int, veeBinary string) (string, error) {
 	dir := sessionTempDir(sessionID)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -1123,22 +1042,6 @@ func writeSettings(sessionID string, port int, veeBinary string, kbIngest bool) 
 				},
 			},
 		},
-	}
-
-	if kbIngest {
-		kbIngestCmd := fmt.Sprintf("%s _kb-ingest --port %d --tmux-socket %s --session-id %s", veeBinary, port, tmuxSocketName, sessionID)
-		hooks := settings["hooks"].(map[string]any)
-		hooks["PostToolUse"] = []map[string]any{
-			{
-				"matcher": "Task",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": kbIngestCmd,
-					},
-				},
-			},
-		}
 	}
 
 	content, err := json.MarshalIndent(settings, "", "  ")
@@ -1251,7 +1154,7 @@ func stripSystemPrompt(args []string) []string {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule string, port int, veePath string, passthrough []string, veeBinary string, kbIngest bool) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule string, port int, veePath string, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
@@ -1272,7 +1175,7 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, i
 	}
 
 	// Settings (includes per-session UserPromptSubmit hook)
-	settingsFile, err := writeSettings(sessionID, port, veeBinary, kbIngest)
+	settingsFile, err := writeSettings(sessionID, port, veeBinary)
 	if err != nil {
 		slog.Error("failed to write settings", "error", err)
 	} else {

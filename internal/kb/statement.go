@@ -40,7 +40,8 @@ type AddStatementResult struct {
 	ID string `json:"id"`
 }
 
-// AddStatement creates a new statement and computes its embedding synchronously.
+// AddStatement creates a new statement with status "pending" and no embedding.
+// The background worker will compute the embedding and promote the statement.
 func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*AddStatementResult, error) {
 	if len(statement) > MaxStatementSize {
 		return nil, ErrStatementTooLarge
@@ -53,29 +54,52 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*Ad
 	id := newStatementID()
 	now := time.Now().Format("2006-01-02")
 
-	// Compute embedding synchronously
-	emb, err := kb.embedText(statement)
-	if err != nil {
-		slog.Warn("add-statement: embedding failed, storing without", "id", id, "error", err)
-	}
-
-	var embBlob []byte
-	if emb != nil {
-		embBlob = embeddingToBlob(emb)
-	}
-
-	_, err = kb.db.Exec(
+	_, err := kb.db.Exec(
 		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified)
-		 VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
-		id, statement, source, sourceType, embBlob, kb.embeddingModel, now, now,
+		 VALUES (?, ?, ?, ?, 'pending', NULL, '', ?, ?)`,
+		id, statement, source, sourceType, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert statement: %w", err)
 	}
 
-	slog.Info("statement added", "id", id, "content", truncateRunes(statement, 80))
+	slog.Info("statement added (pending)", "id", id, "content", truncateRunes(statement, 80))
+
+	// Notify worker (non-blocking)
+	select {
+	case kb.notifyCh <- struct{}{}:
+	default:
+	}
 
 	return &AddStatementResult{ID: id}, nil
+}
+
+// PromoteStatement sets a statement's status to "active".
+func (kb *KnowledgeBase) PromoteStatement(id string) error {
+	result, err := kb.db.Exec(`UPDATE statements SET status = 'active' WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("promote statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found: %s", id)
+	}
+	slog.Info("statement promoted", "id", id)
+	return nil
+}
+
+// DeleteStatement removes a statement from the database.
+func (kb *KnowledgeBase) DeleteStatement(id string) error {
+	result, err := kb.db.Exec(`DELETE FROM statements WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found: %s", id)
+	}
+	slog.Info("statement deleted", "id", id)
+	return nil
 }
 
 // GetStatement retrieves a statement by ID.

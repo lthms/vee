@@ -1,27 +1,23 @@
 package kb
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // stubModel implements Model for testing.
 type stubModel struct {
-	mu        sync.Mutex
-	responses []string
-	errors    []error
-	calls     []string
-	idx       int
-
+	mu      sync.Mutex
 	embedFn func(texts []string) ([][]float64, error)
 }
 
-func newStub(responses ...string) *stubModel {
+func newStub() *stubModel {
 	return &stubModel{
-		responses: responses,
 		embedFn: func(texts []string) ([][]float64, error) {
 			results := make([][]float64, len(texts))
 			for i := range texts {
@@ -32,21 +28,6 @@ func newStub(responses ...string) *stubModel {
 	}
 }
 
-func (s *stubModel) Generate(prompt string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls = append(s.calls, prompt)
-	if len(s.responses) == 0 {
-		return "", fmt.Errorf("stub: no responses configured")
-	}
-	i := s.idx % len(s.responses)
-	s.idx++
-	if s.errors != nil && i < len(s.errors) && s.errors[i] != nil {
-		return "", s.errors[i]
-	}
-	return s.responses[i], nil
-}
-
 func (s *stubModel) Embed(texts []string) ([][]float64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -54,12 +35,6 @@ func (s *stubModel) Embed(texts []string) ([][]float64, error) {
 		return s.embedFn(texts)
 	}
 	return nil, fmt.Errorf("embed not configured")
-}
-
-func (s *stubModel) callCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.calls)
 }
 
 // openTestKB creates a temporary KB for testing.
@@ -78,6 +53,27 @@ func openTestKB(t *testing.T, stub *stubModel) *KnowledgeBase {
 	return kbase
 }
 
+// addAndPromote is a test helper that adds a statement and manually promotes it
+// with an embedding, simulating what the worker would do.
+func addAndPromote(t *testing.T, kbase *KnowledgeBase, content, source, sourceType string, emb []float64) string {
+	t.Helper()
+	result, err := kbase.AddStatement(content, source, sourceType)
+	if err != nil {
+		t.Fatalf("AddStatement: %v", err)
+	}
+	if emb != nil {
+		blob := embeddingToBlob(emb)
+		_, err = kbase.db.Exec(
+			`UPDATE statements SET embedding = ?, model = ?, status = 'active' WHERE id = ?`,
+			blob, kbase.embeddingModel, result.ID,
+		)
+		if err != nil {
+			t.Fatalf("manual promote: %v", err)
+		}
+	}
+	return result.ID
+}
+
 // --- Schema & migration tests ---
 
 func TestOpen_CreatesDB(t *testing.T) {
@@ -86,7 +82,7 @@ func TestOpen_CreatesDB(t *testing.T) {
 
 	kbase, err := Open(Config{
 		DBPath: dbPath,
-		Model:  newStub("ok"),
+		Model:  newStub(),
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -97,7 +93,7 @@ func TestOpen_CreatesDB(t *testing.T) {
 func TestOpen_MigrateIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "kb.db")
-	cfg := Config{DBPath: dbPath, Model: newStub("ok")}
+	cfg := Config{DBPath: dbPath, Model: newStub()}
 
 	kb1, err := Open(cfg)
 	if err != nil {
@@ -126,7 +122,7 @@ func TestOpen_NilModel(t *testing.T) {
 // --- Statement CRUD tests ---
 
 func TestAddStatement_CreatesRow(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	result, err := kbase.AddStatement("Test Statement. Some content", "file.go", "manual")
@@ -145,13 +141,13 @@ func TestAddStatement_CreatesRow(t *testing.T) {
 	if content != "Test Statement. Some content" {
 		t.Errorf("expected content 'Test Statement. Some content', got %q", content)
 	}
-	if status != "active" {
-		t.Errorf("expected status 'active', got %q", status)
+	if status != "pending" {
+		t.Errorf("expected status 'pending', got %q", status)
 	}
 }
 
-func TestAddStatement_StoresEmbedding(t *testing.T) {
-	stub := newStub("ok")
+func TestAddStatement_NoEmbeddingAtInsert(t *testing.T) {
+	stub := newStub()
 	stub.embedFn = func(texts []string) ([][]float64, error) {
 		return [][]float64{{0.1, 0.2, 0.3}}, nil
 	}
@@ -167,17 +163,14 @@ func TestAddStatement_StoresEmbedding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query embedding: %v", err)
 	}
-	if embBlob == nil {
-		t.Error("expected embedding to be stored")
-	}
-	emb := blobToEmbedding(embBlob)
-	if len(emb) != 3 {
-		t.Errorf("expected 3-dimensional embedding, got %d", len(emb))
+	// No embedding at insert time — worker does it async
+	if embBlob != nil {
+		t.Error("expected NULL embedding at insert time")
 	}
 }
 
 func TestAddStatement_DefaultSourceType(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	result, err := kbase.AddStatement("Default ST content", "src", "")
@@ -193,7 +186,7 @@ func TestAddStatement_DefaultSourceType(t *testing.T) {
 }
 
 func TestGetStatement(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	result, _ := kbase.AddStatement("Get Test. Content here", "file.go", "manual")
@@ -208,13 +201,13 @@ func TestGetStatement(t *testing.T) {
 	if s.Source != "file.go" {
 		t.Errorf("expected source 'file.go', got %q", s.Source)
 	}
-	if s.Status != "active" {
-		t.Errorf("expected status 'active', got %q", s.Status)
+	if s.Status != "pending" {
+		t.Errorf("expected status 'pending', got %q", s.Status)
 	}
 }
 
 func TestGetStatement_NotFound(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	_, err := kbase.GetStatement("nonexistent-id")
@@ -224,7 +217,7 @@ func TestGetStatement_NotFound(t *testing.T) {
 }
 
 func TestFetchStatement(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	result, _ := kbase.AddStatement("Fetch Test. Detailed content", "src.go", "manual")
@@ -242,7 +235,7 @@ func TestFetchStatement(t *testing.T) {
 }
 
 func TestTouchStatement(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	result, _ := kbase.AddStatement("Touch Test body", "src", "manual")
@@ -260,7 +253,7 @@ func TestTouchStatement(t *testing.T) {
 }
 
 func TestTouchStatement_NotFound(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	err := kbase.TouchStatement("nonexistent-id")
@@ -269,10 +262,52 @@ func TestTouchStatement_NotFound(t *testing.T) {
 	}
 }
 
+// --- Promote & Delete tests ---
+
+func TestPromoteStatement(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Promote me", "src", "manual")
+
+	var status string
+	kbase.db.QueryRow(`SELECT status FROM statements WHERE id = ?`, result.ID).Scan(&status)
+	if status != "pending" {
+		t.Fatalf("expected 'pending' before promote, got %q", status)
+	}
+
+	err := kbase.PromoteStatement(result.ID)
+	if err != nil {
+		t.Fatalf("PromoteStatement: %v", err)
+	}
+
+	kbase.db.QueryRow(`SELECT status FROM statements WHERE id = ?`, result.ID).Scan(&status)
+	if status != "active" {
+		t.Errorf("expected 'active' after promote, got %q", status)
+	}
+}
+
+func TestDeleteStatement(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Delete me", "src", "manual")
+
+	err := kbase.DeleteStatement(result.ID)
+	if err != nil {
+		t.Fatalf("DeleteStatement: %v", err)
+	}
+
+	_, err = kbase.GetStatement(result.ID)
+	if err == nil {
+		t.Error("expected error after deletion")
+	}
+}
+
 // --- Query tests ---
 
 func TestQuery_EmptyDB(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	results, err := kbase.Query("anything")
@@ -285,7 +320,7 @@ func TestQuery_EmptyDB(t *testing.T) {
 }
 
 func TestQuery_FindsSimilarStatements(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	stub.embedFn = func(texts []string) ([][]float64, error) {
 		results := make([][]float64, len(texts))
 		for i, text := range texts {
@@ -299,8 +334,8 @@ func TestQuery_FindsSimilarStatements(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	kbase.AddStatement("Go Pointers. How Go pointers work", "docs", "manual")
-	kbase.AddStatement("Pasta Recipe. How to cook pasta", "cookbook", "manual")
+	addAndPromote(t, kbase, "Go Pointers. How Go pointers work", "docs", "manual", []float64{0.9, 0.1, 0})
+	addAndPromote(t, kbase, "Pasta Recipe. How to cook pasta", "cookbook", "manual", []float64{0, 0.1, 0.9})
 
 	results, err := kbase.Query("Go programming")
 	if err != nil {
@@ -329,23 +364,19 @@ func TestQuery_FindsSimilarStatements(t *testing.T) {
 }
 
 func TestQuery_RespectsThreshold(t *testing.T) {
-	stub := newStub("ok")
-	callIdx := 0
+	stub := newStub()
+	// Query embedding is orthogonal to the stored one
 	stub.embedFn = func(texts []string) ([][]float64, error) {
-		callIdx++
 		results := make([][]float64, len(texts))
 		for i := range texts {
-			if callIdx == 1 {
-				results[i] = []float64{0, 1, 0}
-			} else {
-				results[i] = []float64{1, 0, 0}
-			}
+			results[i] = []float64{1, 0, 0}
 		}
 		return results, nil
 	}
 	kbase := openTestKB(t, stub)
 
-	kbase.AddStatement("Orthogonal content", "src", "manual")
+	// Add with orthogonal embedding (dot product with query ≈ 0)
+	addAndPromote(t, kbase, "Orthogonal content", "src", "manual", []float64{0, 1, 0})
 
 	results, err := kbase.Query("search query")
 	if err != nil {
@@ -358,7 +389,7 @@ func TestQuery_RespectsThreshold(t *testing.T) {
 }
 
 func TestQuery_ResultsSortedByScore(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	stub.embedFn = func(texts []string) ([][]float64, error) {
 		results := make([][]float64, len(texts))
 		for i, text := range texts {
@@ -376,9 +407,9 @@ func TestQuery_ResultsSortedByScore(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	kbase.AddStatement("Low Relevance low", "src", "manual")
-	kbase.AddStatement("High Relevance high", "src", "manual")
-	kbase.AddStatement("Medium Relevance medium", "src", "manual")
+	addAndPromote(t, kbase, "Low Relevance low", "src", "manual", []float64{0.4, 0.4, 0.2})
+	addAndPromote(t, kbase, "High Relevance high", "src", "manual", []float64{0.95, 0.05, 0})
+	addAndPromote(t, kbase, "Medium Relevance medium", "src", "manual", []float64{0.7, 0.3, 0})
 
 	results, err := kbase.Query("search")
 	if err != nil {
@@ -398,11 +429,11 @@ func TestQuery_ResultsSortedByScore(t *testing.T) {
 }
 
 func TestQuery_ContentTruncated(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	longContent := strings.Repeat("x", 300)
-	kbase.AddStatement("Long Content. "+longContent, "src", "manual")
+	addAndPromote(t, kbase, "Long Content. "+longContent, "src", "manual", []float64{0.5, 0.5, 0})
 
 	results, err := kbase.Query("Long Content")
 	if err != nil {
@@ -443,7 +474,7 @@ func TestQueryResultsJSON_WithResults(t *testing.T) {
 // --- Size validation tests ---
 
 func TestAddStatement_RejectsTooLarge(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	large := strings.Repeat("x", MaxStatementSize+1)
@@ -457,7 +488,7 @@ func TestAddStatement_RejectsTooLarge(t *testing.T) {
 }
 
 func TestAddStatement_AcceptsExactLimit(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	kbase := openTestKB(t, stub)
 
 	exact := strings.Repeat("x", MaxStatementSize)
@@ -473,7 +504,7 @@ func TestAddStatement_AcceptsExactLimit(t *testing.T) {
 // --- Embedding failure degradation ---
 
 func TestAddStatement_EmbeddingFailure(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	stub.embedFn = func(texts []string) ([][]float64, error) {
 		return nil, fmt.Errorf("embedding service unavailable")
 	}
@@ -504,5 +535,237 @@ func TestAddStatement_EmbeddingFailure(t *testing.T) {
 	}
 	if results != nil {
 		t.Errorf("expected nil results (embed fails for query too), got %v", results)
+	}
+}
+
+// --- Worker tests ---
+
+func TestWorker_PromotesPendingStatement(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		results := make([][]float64, len(texts))
+		for i := range texts {
+			results[i] = []float64{0.1, 0.2, 0.3}
+		}
+		return results, nil
+	}
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Worker test content", "src", "manual")
+
+	// Run one processing cycle
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kbase.processPending(ctx)
+
+	// Check that the statement was promoted
+	s, err := kbase.GetStatement(result.ID)
+	if err != nil {
+		t.Fatalf("GetStatement: %v", err)
+	}
+	if s.Status != "active" {
+		t.Errorf("expected 'active' after worker, got %q", s.Status)
+	}
+
+	// Check embedding was stored
+	var embBlob []byte
+	kbase.db.QueryRow(`SELECT embedding FROM statements WHERE id = ?`, result.ID).Scan(&embBlob)
+	if embBlob == nil {
+		t.Error("expected embedding to be stored by worker")
+	}
+}
+
+func TestWorker_CreatesIssueForDuplicates(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		// All texts get the same embedding → guaranteed duplicate
+		results := make([][]float64, len(texts))
+		for i := range texts {
+			results[i] = []float64{1.0, 0.0, 0.0}
+		}
+		return results, nil
+	}
+	kbase := openTestKB(t, stub)
+
+	// Add two near-identical statements
+	r1, _ := kbase.AddStatement("Statement one", "src", "manual")
+	r2, _ := kbase.AddStatement("Statement two", "src", "manual")
+
+	// Process both
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kbase.processPending(ctx)
+
+	// One should be promoted (whichever FIFO picks first), the other stays pending
+	s1, _ := kbase.GetStatement(r1.ID)
+	s2, _ := kbase.GetStatement(r2.ID)
+
+	activeCount := 0
+	pendingCount := 0
+	if s1.Status == "active" {
+		activeCount++
+	}
+	if s1.Status == "pending" {
+		pendingCount++
+	}
+	if s2.Status == "active" {
+		activeCount++
+	}
+	if s2.Status == "pending" {
+		pendingCount++
+	}
+
+	if activeCount != 1 || pendingCount != 1 {
+		t.Errorf("expected 1 active + 1 pending, got active=%d pending=%d (s1=%s s2=%s)",
+			activeCount, pendingCount, s1.Status, s2.Status)
+	}
+
+	// Check issue was created
+	issues, err := kbase.ListOpenIssues()
+	if err != nil {
+		t.Fatalf("ListOpenIssues: %v", err)
+	}
+	if len(issues) == 0 {
+		t.Fatal("expected at least one issue")
+	}
+	if issues[0].Type != "duplicate" {
+		t.Errorf("expected type 'duplicate', got %q", issues[0].Type)
+	}
+}
+
+func TestWorker_SkipsOnEmbeddingFailure(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		return nil, fmt.Errorf("ollama down")
+	}
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Stuck without embedding", "src", "manual")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kbase.processPending(ctx)
+
+	// Statement should still be pending
+	s, _ := kbase.GetStatement(result.ID)
+	if s.Status != "pending" {
+		t.Errorf("expected 'pending' when embedding fails, got %q", s.Status)
+	}
+}
+
+// --- Issue tests ---
+
+func TestIssue_ResolveKeepA(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	// Manually create a controlled issue scenario
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "keep-a", "Keep this one", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "del-b", "Delete this one", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.95, ?)`, "iss-ka", "keep-a", "del-b", issueNow)
+
+	err := kbase.ResolveIssue("iss-ka", "keep_a")
+	if err != nil {
+		t.Fatalf("ResolveIssue: %v", err)
+	}
+
+	// Statement A (keep-a) should be active
+	s1, _ := kbase.GetStatement("keep-a")
+	if s1.Status != "active" {
+		t.Errorf("expected A 'active', got %q", s1.Status)
+	}
+
+	// Statement B (del-b) should be deleted
+	_, err = kbase.GetStatement("del-b")
+	if err == nil {
+		t.Error("expected B to be deleted")
+	}
+
+	// Issue should be resolved
+	count, _ := kbase.OpenIssueCount()
+	if count != 0 {
+		t.Errorf("expected 0 open issues, got %d", count)
+	}
+}
+
+func TestIssue_CascadeClose(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	// Manually create statements and issues for cascading test
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-a", "A content", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-b", "B content", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-c", "C content", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.9, ?)`, "iss-1", "stmt-a", "stmt-b", issueNow)
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.85, ?)`, "iss-2", "stmt-a", "stmt-c", issueNow)
+
+	// Resolve issue 1 by deleting A → issue 2 should cascade close
+	err := kbase.ResolveIssue("iss-1", "keep_b")
+	if err != nil {
+		t.Fatalf("ResolveIssue: %v", err)
+	}
+
+	count, _ := kbase.OpenIssueCount()
+	if count != 0 {
+		t.Errorf("expected 0 open issues after cascade, got %d", count)
+	}
+}
+
+func TestIssue_KeepBoth(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-x", "X content", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-y", "Y content", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.9, ?)`, "iss-kb", "stmt-x", "stmt-y", issueNow)
+
+	err := kbase.ResolveIssue("iss-kb", "keep_both")
+	if err != nil {
+		t.Fatalf("ResolveIssue: %v", err)
+	}
+
+	// Both should be active
+	sx, _ := kbase.GetStatement("stmt-x")
+	sy, _ := kbase.GetStatement("stmt-y")
+	if sx.Status != "active" {
+		t.Errorf("expected X 'active', got %q", sx.Status)
+	}
+	if sy.Status != "active" {
+		t.Errorf("expected Y 'active', got %q", sy.Status)
+	}
+}
+
+func TestIssue_DeleteBoth(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-d1", "D1 content", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-d2", "D2 content", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.9, ?)`, "iss-db", "stmt-d1", "stmt-d2", issueNow)
+
+	err := kbase.ResolveIssue("iss-db", "delete_both")
+	if err != nil {
+		t.Fatalf("ResolveIssue: %v", err)
+	}
+
+	_, err = kbase.GetStatement("stmt-d1")
+	if err == nil {
+		t.Error("expected D1 to be deleted")
+	}
+	_, err = kbase.GetStatement("stmt-d2")
+	if err == nil {
+		t.Error("expected D2 to be deleted")
 	}
 }

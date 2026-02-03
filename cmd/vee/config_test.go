@@ -14,9 +14,9 @@ func TestParseConfigBasic(t *testing.T) {
 	os.WriteFile(path, []byte(`[identity]
 	name = Vee
 	email = vee@example.com
-[judgment]
+[embedding]
 	url = http://localhost:9999
-	model = llama3
+	model = nomic-embed-text
 `), 0600)
 
 	m, err := parseConfig(path, nil)
@@ -30,8 +30,8 @@ func TestParseConfigBasic(t *testing.T) {
 	if got := lastValue(m, "identity.email"); got != "vee@example.com" {
 		t.Errorf("identity.email = %q, want %q", got, "vee@example.com")
 	}
-	if got := lastValue(m, "judgment.url"); got != "http://localhost:9999" {
-		t.Errorf("judgment.url = %q, want %q", got, "http://localhost:9999")
+	if got := lastValue(m, "embedding.url"); got != "http://localhost:9999" {
+		t.Errorf("embedding.url = %q, want %q", got, "http://localhost:9999")
 	}
 }
 
@@ -100,7 +100,7 @@ func TestParseConfigInclude(t *testing.T) {
 	mainPath := filepath.Join(dir, "config")
 	os.WriteFile(mainPath, []byte(`[include]
 	path = extra.conf
-[judgment]
+[embedding]
 	url = http://localhost:5000
 `), 0600)
 
@@ -113,8 +113,8 @@ func TestParseConfigInclude(t *testing.T) {
 	if got := lastValue(m, "identity.name"); got != "Included" {
 		t.Errorf("identity.name = %q, want %q", got, "Included")
 	}
-	if got := lastValue(m, "judgment.url"); got != "http://localhost:5000" {
-		t.Errorf("judgment.url = %q, want %q", got, "http://localhost:5000")
+	if got := lastValue(m, "embedding.url"); got != "http://localhost:5000" {
+		t.Errorf("embedding.url = %q, want %q", got, "http://localhost:5000")
 	}
 }
 
@@ -323,25 +323,25 @@ func TestHydrateProjectConfig(t *testing.T) {
 
 func TestHydrateUserConfig(t *testing.T) {
 	m := map[string][]string{
-		"judgment.model":           {"llama3"},
-		"knowledge.threshold":      {"0.5"},
-		"knowledge.maxresults":     {"20"},
-		"identity.name":            {"Vee"},
-		"identity.email":           {"vee@example.com"},
+		"embedding.model":      {"mxbai-embed-large"},
+		"embedding.threshold":  {"0.5"},
+		"embedding.maxresults": {"20"},
+		"identity.name":        {"Vee"},
+		"identity.email":       {"vee@example.com"},
 	}
 
 	cfg := hydrateUserConfig(m)
-	if cfg.Judgment.URL != "http://localhost:11434" {
-		t.Errorf("Judgment.URL = %q, want default", cfg.Judgment.URL)
+	if cfg.Embedding.URL != "http://localhost:11434" {
+		t.Errorf("Embedding.URL = %q, want default", cfg.Embedding.URL)
 	}
-	if cfg.Judgment.Model != "llama3" {
-		t.Errorf("Judgment.Model = %q, want %q", cfg.Judgment.Model, "llama3")
+	if cfg.Embedding.Model != "mxbai-embed-large" {
+		t.Errorf("Embedding.Model = %q, want %q", cfg.Embedding.Model, "mxbai-embed-large")
 	}
-	if cfg.Knowledge.Threshold != 0.5 {
-		t.Errorf("Knowledge.Threshold = %f, want 0.5", cfg.Knowledge.Threshold)
+	if cfg.Embedding.Threshold != 0.5 {
+		t.Errorf("Embedding.Threshold = %f, want 0.5", cfg.Embedding.Threshold)
 	}
-	if cfg.Knowledge.MaxResults != 20 {
-		t.Errorf("Knowledge.MaxResults = %d, want 20", cfg.Knowledge.MaxResults)
+	if cfg.Embedding.MaxResults != 20 {
+		t.Errorf("Embedding.MaxResults = %d, want 20", cfg.Embedding.MaxResults)
 	}
 	if cfg.Identity == nil || cfg.Identity.Name != "Vee" {
 		t.Errorf("Identity.Name = %v", cfg.Identity)
@@ -350,20 +350,20 @@ func TestHydrateUserConfig(t *testing.T) {
 
 func TestHydrateUserConfigDefaults(t *testing.T) {
 	cfg := hydrateUserConfig(nil)
-	if cfg.Judgment.URL != "http://localhost:11434" {
-		t.Errorf("default URL = %q", cfg.Judgment.URL)
+	if cfg.Embedding.URL != "http://localhost:11434" {
+		t.Errorf("default URL = %q", cfg.Embedding.URL)
 	}
-	if cfg.Judgment.Model != "claude:haiku" {
-		t.Errorf("default Model = %q", cfg.Judgment.Model)
+	if cfg.Embedding.Model != "nomic-embed-text" {
+		t.Errorf("default Model = %q", cfg.Embedding.Model)
 	}
-	if cfg.Knowledge.EmbeddingModel != "nomic-embed-text" {
-		t.Errorf("default EmbeddingModel = %q", cfg.Knowledge.EmbeddingModel)
+	if cfg.Embedding.Threshold != 0.3 {
+		t.Errorf("default Threshold = %f", cfg.Embedding.Threshold)
 	}
-	if cfg.Knowledge.Threshold != 0.3 {
-		t.Errorf("default Threshold = %f", cfg.Knowledge.Threshold)
+	if cfg.Embedding.MaxResults != 10 {
+		t.Errorf("default MaxResults = %d", cfg.Embedding.MaxResults)
 	}
-	if cfg.Knowledge.MaxResults != 10 {
-		t.Errorf("default MaxResults = %d", cfg.Knowledge.MaxResults)
+	if cfg.Embedding.DupThreshold != 0.85 {
+		t.Errorf("default DupThreshold = %f", cfg.Embedding.DupThreshold)
 	}
 }
 

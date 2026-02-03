@@ -8,29 +8,31 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Model abstracts the LLM backend used for judgment calls and embeddings.
+// Model abstracts the embedding backend used by the knowledge base.
 type Model interface {
-	Generate(prompt string) (string, error)
 	Embed(texts []string) ([][]float64, error)
 }
 
 // Config holds KB initialization parameters.
 type Config struct {
 	DBPath         string  // path to SQLite file
-	Model          Model   // LLM backend for embeddings/judgment
+	Model          Model   // embedding backend
 	EmbeddingModel string  // model name stored alongside embeddings for stale detection
 	Threshold      float64 // minimum cosine similarity to include (0 = default 0.3)
 	MaxResults     int     // max query results returned (0 = default 10)
+	DupThreshold   float64 // cosine similarity above which a pair is flagged as duplicate (0 = default 0.85)
 }
 
 // KnowledgeBase provides persistent statement storage backed by SQLite
-// with brute-force KNN search and synchronous contradiction detection.
+// with brute-force KNN search and async duplicate detection.
 type KnowledgeBase struct {
 	db             *sql.DB
 	model          Model
 	embeddingModel string
 	threshold      float64
 	maxResults     int
+	dupThreshold   float64
+	notifyCh       chan struct{} // signals the worker that a new statement was inserted
 }
 
 // QueryResult is a single search hit from KNN search.
@@ -67,6 +69,10 @@ func Open(cfg Config) (*KnowledgeBase, error) {
 	if maxResults == 0 {
 		maxResults = 10
 	}
+	dupThreshold := cfg.DupThreshold
+	if dupThreshold == 0 {
+		dupThreshold = 0.85
+	}
 
 	return &KnowledgeBase{
 		db:             db,
@@ -74,7 +80,14 @@ func Open(cfg Config) (*KnowledgeBase, error) {
 		embeddingModel: cfg.EmbeddingModel,
 		threshold:      threshold,
 		maxResults:     maxResults,
+		dupThreshold:   dupThreshold,
+		notifyCh:       make(chan struct{}, 1),
 	}, nil
+}
+
+// NotifyCh returns the channel that signals new pending statements.
+func (kb *KnowledgeBase) NotifyCh() <-chan struct{} {
+	return kb.notifyCh
 }
 
 // Close closes the database.

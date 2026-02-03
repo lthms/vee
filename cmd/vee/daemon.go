@@ -117,7 +117,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 	// Knowledge base tools — available to all modes
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
-		Description: "Save a statement to the persistent knowledge base. Near-duplicate detection and contradiction candidate queueing happen synchronously.",
+		Description: "Save a statement to the persistent knowledge base. The statement is queued for async duplicate detection and will be promoted to active once processed.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_remember called")
 
@@ -126,7 +126,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
 
-		msg := fmt.Sprintf("Statement saved (id: %s)", result.ID)
+		msg := fmt.Sprintf("Statement saved (id: %s, status: pending — will be promoted after duplicate check)", result.ID)
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -187,7 +187,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model Generator) *http.ServeMux {
+func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		sessionID := r.URL.Query().Get("session")
 		return newMCPServer(app, kbase, sessionID)
@@ -195,7 +195,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model Generator) *http.Serv
 
 	mux := http.NewServeMux()
 	mux.Handle("/sse", sseHandler)
-	mux.HandleFunc("/api/state", handleState(app))
+	mux.HandleFunc("/api/state", handleState(app, kbase))
 	mux.HandleFunc("/api/sessions", handleSessions(app))
 	mux.HandleFunc("/api/config", handleConfig(app))
 	mux.HandleFunc("/api/suspend", handleSuspend(app))
@@ -206,19 +206,25 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, model Generator) *http.Serv
 	mux.HandleFunc("/api/session-ended", handleSessionEnded(app))
 	mux.HandleFunc("/api/hook/preview", handleHookPreview(app))
 	mux.HandleFunc("/api/hook/window-state", handleHookWindowState(app))
-	mux.HandleFunc("/api/hook/kb-ingest", handleHookKBIngest(app, kbase, model))
 	mux.HandleFunc("/api/session", handleSession(app))
 	mux.HandleFunc("/api/kb/query", handleKBQuery(kbase))
 	mux.HandleFunc("/api/kb/fetch", handleKBFetch(kbase))
+	mux.HandleFunc("/api/kb/issues", handleKBIssues(kbase))
+	mux.HandleFunc("/api/kb/issues/resolve", handleKBIssueResolve(kbase))
 	return mux
 }
 
-func handleState(app *App) http.HandlerFunc {
+func handleState(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		activeSessions := app.Sessions.active()
 		suspendedSessions := app.Sessions.suspended()
 		completedSessions := app.Sessions.completed()
 		indexingTasks := app.Indexing.list()
+
+		issueCount := 0
+		if n, err := kbase.OpenIssueCount(); err == nil {
+			issueCount = n
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -226,6 +232,7 @@ func handleState(app *App) http.HandlerFunc {
 			"suspended_sessions": suspendedSessions,
 			"completed_sessions": completedSessions,
 			"indexing_tasks":     indexingTasks,
+			"issue_count":        issueCount,
 		})
 	}
 }
@@ -239,7 +246,6 @@ func handleSessions(app *App) http.HandlerFunc {
 		Preview      string `json:"preview"`
 		WindowTarget string `json:"window_target"`
 		Ephemeral    bool   `json:"ephemeral"`
-		KBIngest     bool   `json:"kb_ingest"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -254,8 +260,8 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.KBIngest)
-		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral, "kb_ingest", req.KBIngest)
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral)
+		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -628,105 +634,10 @@ func handleSession(app *App) http.HandlerFunc {
 	}
 }
 
-// handleHookKBIngest handles POST /api/hook/kb-ingest. Accepts task results
-// from the PostToolUse hook, returns immediately, and evaluates the results
-// for KB-worthy notes in the background.
-func handleHookKBIngest(app *App, kbase *kb.KnowledgeBase, model Generator) http.HandlerFunc {
-	type ingestReq struct {
-		SessionID    string `json:"session_id"`
-		TaskPrompt   string `json:"task_prompt"`
-		TaskResponse string `json:"task_response"`
-		SubagentType string `json:"subagent_type"`
-		Description  string `json:"description"`
-	}
-
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req ingestReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		slog.Debug("kb-ingest: received", "session", req.SessionID, "subagent_type", req.SubagentType)
-
-		taskID := newUUID()
-		app.Indexing.add(taskID, "Evaluating: "+req.Description)
-		go func() {
-			defer app.Indexing.remove(taskID)
-			evaluateAndIngest(kbase, model, app, req.SessionID, req.TaskPrompt, req.TaskResponse, req.SubagentType, req.Description)
-		}()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
-	}
-}
-
-// evaluateAndIngest calls the judgment model to evaluate whether a task result
-// contains KB-worthy information, and if so, extracts and ingests the statements.
-func evaluateAndIngest(kbase *kb.KnowledgeBase, model Generator, app *App, sessionID, taskPrompt, taskResponse, subagentType, description string) {
-	prompt := fmt.Sprintf(`You are evaluating whether a task result from an AI coding assistant contains information worth saving to a persistent knowledge base.
-
-The knowledge base stores reusable facts about codebases, conventions, architecture, and patterns — things that would help future sessions. It does NOT store task-specific details, debugging logs, or ephemeral information.
-
-Task prompt: %s
-Task description: %s
-Subagent type: %s
-
-Task result:
-%s
-
-Decide whether this result contains knowledge worth persisting. If yes, extract atomic statements (each covering one concept). Each statement is a self-contained string.
-
-Reply with ONLY valid JSON in one of these formats:
-{"ingest": false}
-{"ingest": true, "statements": ["Statement text..."]}`,
-		taskPrompt, description, subagentType, taskResponse)
-
-	response, err := model.Generate(prompt)
-	if err != nil {
-		slog.Warn("kb-ingest: judgment evaluation failed", "session", sessionID, "error", err)
-		return
-	}
-
-	response = strings.TrimSpace(response)
-	response = stripCodeFence(response)
-
-	var result struct {
-		Ingest     bool     `json:"ingest"`
-		Statements []string `json:"statements"`
-	}
-	if err := json.Unmarshal([]byte(response), &result); err != nil {
-		slog.Warn("kb-ingest: failed to parse judgment response", "session", sessionID, "raw", response, "error", err)
-		return
-	}
-
-	if !result.Ingest || len(result.Statements) == 0 {
-		slog.Debug("kb-ingest: no statements to ingest", "session", sessionID)
-		return
-	}
-
-	source := fmt.Sprintf("task:%s (session %s)", subagentType, sessionID)
-
-	for _, stmt := range result.Statements {
-		result, err := kbase.AddStatement(stmt, source, "auto-ingest")
-		if err != nil {
-			slog.Warn("kb-ingest: failed to add statement", "error", err)
-			continue
-		}
-
-		slog.Info("kb-ingest: statement ingested", "session", sessionID, "id", result.ID)
-	}
-}
-
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase, model Generator) (*http.Server, int, error) {
-	mux := setupHTTPMux(app, kbase, model)
+func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase) (*http.Server, int, error) {
+	mux := setupHTTPMux(app, kbase)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -750,20 +661,17 @@ func (cmd *DaemonCmd) Run() error {
 	userCfg, err := loadUserConfig()
 	if err != nil {
 		slog.Warn("failed to load user config, using defaults", "error", err)
-		userCfg = &UserConfig{
-			Judgment:  JudgmentConfig{URL: "http://localhost:11434", Model: "claude:haiku"},
-			Knowledge: KnowledgeConfig{EmbeddingModel: "nomic-embed-text"},
-		}
+		userCfg = hydrateUserConfig(nil)
 	}
 
-	kbase, judgmentModel, err := openKB(userCfg)
+	kbase, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("open knowledge base: %w", err)
 	}
 	defer kbase.Close()
 
 	app := newApp()
-	mux := setupHTTPMux(app, kbase, judgmentModel)
+	mux := setupHTTPMux(app, kbase)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -827,6 +735,63 @@ func handleKBFetch(kbase *kb.KnowledgeBase) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(s)
+	}
+}
+
+// handleKBIssues handles GET /api/kb/issues — returns all open issues.
+func handleKBIssues(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		issues, err := kbase.ListOpenIssues()
+		if err != nil {
+			http.Error(w, "list issues: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if issues == nil {
+			issues = []kb.Issue{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(issues)
+	}
+}
+
+// handleKBIssueResolve handles POST /api/kb/issues/resolve?id=<id>.
+func handleKBIssueResolve(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	type resolveReq struct {
+		Action string `json:"action"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		issueID := r.URL.Query().Get("id")
+		if issueID == "" {
+			http.Error(w, "missing id query parameter", http.StatusBadRequest)
+			return
+		}
+
+		var req resolveReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if err := kbase.ResolveIssue(issueID, req.Action); err != nil {
+			http.Error(w, "resolve: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "resolved"})
 	}
 }
 

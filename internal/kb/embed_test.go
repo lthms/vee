@@ -45,7 +45,7 @@ func TestEmbeddingBlobRoundtrip(t *testing.T) {
 }
 
 func TestEmbedText(t *testing.T) {
-	stub := newStub("ok")
+	stub := newStub()
 	stub.embedFn = func(texts []string) ([][]float64, error) {
 		return [][]float64{{0.1, 0.2, 0.3}}, nil
 	}

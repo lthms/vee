@@ -23,11 +23,13 @@ var promptFS embed.FS
 
 // Mode describes a Vee operating mode.
 type Mode struct {
-	Name        string
-	Indicator   string
-	Description string
-	Priority    int
-	Prompt      string // composed system prompt content
+	Name              string
+	Indicator         string
+	Description       string
+	Priority          int
+	Prompt            string // composed system prompt content
+	DefaultPrompt     string // template for the initial prompt (optional)
+	PromptPlaceholder string // hint text for the picker's prompt field (optional)
 }
 
 // logFilePath returns the log path for this Vee instance.

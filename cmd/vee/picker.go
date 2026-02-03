@@ -18,9 +18,11 @@ type SessionPickerCmd struct {
 }
 
 type pickerMode struct {
-	name      string
-	indicator string
-	desc      string
+	name              string
+	indicator         string
+	desc              string
+	defaultPrompt     string
+	promptPlaceholder string
 }
 
 func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
@@ -36,9 +38,11 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			continue
 		}
 		modes = append(modes, pickerMode{
-			name:      name,
-			indicator: mode.Indicator,
-			desc:      mode.Description,
+			name:              name,
+			indicator:         mode.Indicator,
+			desc:              mode.Description,
+			defaultPrompt:     mode.DefaultPrompt,
+			promptPlaceholder: mode.PromptPlaceholder,
 		})
 	}
 
@@ -95,9 +99,27 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			sb.WriteString("\r\n")
 		}
 
-		sb.WriteString("\r\n  \033[2mPrompt:\033[0m ")
-		sb.WriteString(prompt)
-		sb.WriteString("\033[s") // save cursor position
+		cur := modes[selected]
+		staticDefault := cur.defaultPrompt != "" && !strings.Contains(cur.defaultPrompt, "{}")
+		if staticDefault {
+			// No user input needed — show the fixed prompt dimmed
+			sb.WriteString("\r\n  \033[2mPrompt: ")
+			sb.WriteString(cur.defaultPrompt)
+			sb.WriteString("\033[0m")
+			sb.WriteString("\033[s")
+		} else {
+			sb.WriteString("\r\n  \033[2mPrompt:\033[0m ")
+			if prompt == "" && cur.promptPlaceholder != "" {
+				// Show placeholder dimmed, then move cursor back to after "Prompt: "
+				sb.WriteString("\033[2m")
+				sb.WriteString(cur.promptPlaceholder)
+				sb.WriteString("\033[0m")
+				sb.WriteString(fmt.Sprintf("\033[%dD", len(cur.promptPlaceholder)))
+			} else {
+				sb.WriteString(prompt)
+			}
+			sb.WriteString("\033[s")
+		}
 
 		sb.WriteString("\r\n\r\n  \033[2m")
 		if canEphemeral {
@@ -123,6 +145,9 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 
 		input := buf[:n]
 
+		cur := modes[selected]
+		isStatic := cur.defaultPrompt != "" && !strings.Contains(cur.defaultPrompt, "{}")
+
 		if len(input) == 1 {
 			switch input[0] {
 			case 27: // Esc
@@ -131,7 +156,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			case 10, 13: // Enter (LF or CR)
 				fmt.Print("\033[?25h")
 				term.Restore(int(os.Stdin.Fd()), oldState)
-				return cmd.createSession(modes[selected].name, prompt, ephemeral, args)
+				return cmd.createSession(modes[selected], prompt, ephemeral, args)
 			case 5: // C-e
 				if canEphemeral {
 					ephemeral = !ephemeral
@@ -145,22 +170,26 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 					selected--
 				}
 			case 127, 8: // Backspace
-				if len(prompt) > 0 {
+				if !isStatic && len(prompt) > 0 {
 					prompt = prompt[:len(prompt)-1]
 				}
 			case 23: // C-w — delete last word
-				i := len(prompt)
-				for i > 0 && prompt[i-1] == ' ' {
-					i--
+				if !isStatic {
+					i := len(prompt)
+					for i > 0 && prompt[i-1] == ' ' {
+						i--
+					}
+					for i > 0 && prompt[i-1] != ' ' {
+						i--
+					}
+					prompt = prompt[:i]
 				}
-				for i > 0 && prompt[i-1] != ' ' {
-					i--
-				}
-				prompt = prompt[:i]
 			case 21: // C-u — clear prompt
-				prompt = ""
+				if !isStatic {
+					prompt = ""
+				}
 			default:
-				if input[0] >= 32 && input[0] < 127 {
+				if !isStatic && input[0] >= 32 && input[0] < 127 {
 					prompt += string(input[0])
 				}
 			}
@@ -185,7 +214,16 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	}
 }
 
-func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral bool, args claudeArgs) error {
+func (cmd *SessionPickerCmd) createSession(mode pickerMode, prompt string, ephemeral bool, args claudeArgs) error {
+	// Template expansion: resolve the final prompt from default_prompt + user input.
+	if mode.defaultPrompt != "" {
+		if strings.Contains(mode.defaultPrompt, "{}") {
+			prompt = strings.Replace(mode.defaultPrompt, "{}", prompt, 1)
+		} else {
+			prompt = mode.defaultPrompt
+		}
+	}
+
 	veeBinary, err := os.Executable()
 	if err != nil {
 		return err
@@ -197,7 +235,7 @@ func (cmd *SessionPickerCmd) createSession(mode, prompt string, ephemeral bool, 
 	cmdParts = append(cmdParts, "--vee-path", cmd.VeePath)
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", cmd.Port))
 	cmdParts = append(cmdParts, "--tmux-socket", tmuxSocketName)
-	cmdParts = append(cmdParts, "--mode", mode)
+	cmdParts = append(cmdParts, "--mode", mode.name)
 	if prompt != "" {
 		cmdParts = append(cmdParts, "--prompt", prompt)
 	}

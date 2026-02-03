@@ -14,9 +14,11 @@ import (
 
 // ModeFrontmatter is the YAML frontmatter target for mode files.
 type ModeFrontmatter struct {
-	Indicator   string `yaml:"indicator"`
-	Description string `yaml:"description"`
-	Priority    *int   `yaml:"priority"`
+	Indicator        string `yaml:"indicator"`
+	Description      string `yaml:"description"`
+	Priority         *int   `yaml:"priority"`
+	DefaultPrompt    string `yaml:"default_prompt"`
+	PromptPlaceholder string `yaml:"prompt_placeholder"`
 }
 
 // parseModeFile splits a mode file into frontmatter and body, parses the
@@ -51,11 +53,13 @@ func parseModeFile(filename string, content []byte) (Mode, error) {
 	}
 
 	return Mode{
-		Name:        name,
-		Indicator:   fm.Indicator,
-		Description: fm.Description,
-		Priority:    priority,
-		Prompt:      string(body),
+		Name:              name,
+		Indicator:         fm.Indicator,
+		Description:       fm.Description,
+		Priority:          priority,
+		Prompt:            string(body),
+		DefaultPrompt:     fm.DefaultPrompt,
+		PromptPlaceholder: fm.PromptPlaceholder,
 	}, nil
 }
 

@@ -55,6 +55,10 @@ func (cmd *DashboardCmd) Run() error {
 		}()
 	}
 
+	// Hide cursor once at startup; defer guarantees it's restored on any exit path
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h")
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -70,7 +74,6 @@ func (cmd *DashboardCmd) Run() error {
 	for {
 		select {
 		case <-sigCh:
-			fmt.Print("\033[?25h") // show cursor
 			return nil
 		case <-winchCh:
 			cmd.render(cmd.fetchState())
@@ -102,8 +105,8 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 
 	var sb strings.Builder
 
-	// Clear screen and move cursor to top-left, hide cursor
-	sb.WriteString("\033[2J\033[H\033[?25l")
+	// Clear screen and move cursor to top-left
+	sb.WriteString("\033[2J\033[H")
 
 	// Header
 	sb.WriteString("\r\n")

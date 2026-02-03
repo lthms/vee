@@ -13,6 +13,7 @@ type AppConfig struct {
 	Port          int      `json:"port"`
 	Passthrough   []string `json:"passthrough"`
 	ProjectConfig string   `json:"project_config"`
+	IdentityRule  string   `json:"identity_rule"`
 }
 
 // IndexingTask represents a background processing operation.

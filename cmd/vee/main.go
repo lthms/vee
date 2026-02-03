@@ -230,6 +230,17 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 		}
 	}
 
+	// Resolve identity: merge user + project configs
+	var projectIdentity *IdentityConfig
+	if projTOML, err := readProjectTOML(); err == nil {
+		projectIdentity = projTOML.Identity
+	}
+	resolvedIdentity := resolveIdentity(userCfg.Identity, projectIdentity)
+	if err := validateIdentity(resolvedIdentity); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	idRule := identityRule(resolvedIdentity)
+
 	kbase, judgmentModel, err := openKB(userCfg)
 	if err != nil {
 		return fmt.Errorf("failed to open knowledge base: %w", err)
@@ -257,6 +268,7 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 		Port:          port,
 		Passthrough:   []string(args),
 		ProjectConfig: projectConfig,
+		IdentityRule:  idRule,
 	})
 
 	// Resolve project directory for status bar
@@ -299,10 +311,11 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	// Fetch project config from the running daemon
-	projectConfig, err := fetchProjectConfig(cmd.Port)
+	// Fetch config from the running daemon
+	appCfg, err := fetchAppConfig(cmd.Port)
 	if err != nil {
-		slog.Warn("failed to fetch project config from daemon, proceeding without", "error", err)
+		slog.Warn("failed to fetch config from daemon, proceeding without", "error", err)
+		appCfg = &AppConfig{}
 	}
 
 	// Generate session ID
@@ -317,9 +330,9 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		if cfg.Ephemeral == nil {
 			return fmt.Errorf("no [ephemeral] section in .vee/config.toml")
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, projectConfig, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args), cmd.KBIngest)
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args), cmd.KBIngest)
 	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, mode, projectConfig, cmd.Port, cmd.VeePath, []string(args), veeBinary, cmd.KBIngest)
+		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Port, cmd.VeePath, []string(args), veeBinary, cmd.KBIngest)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	}
 
@@ -347,26 +360,6 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	}
 
 	return nil
-}
-
-// fetchProjectConfig fetches the project config from the running daemon.
-func fetchProjectConfig(port int) (string, error) {
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/config", port))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-
-	var cfg AppConfig
-	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
-		return "", err
-	}
-
-	return cfg.ProjectConfig, nil
 }
 
 // registerSession registers a new session with the running daemon.
@@ -560,7 +553,7 @@ func (cmd *ResumeSessionCmd) Run() error {
 	}
 
 	// Build claude args with --resume
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary, kbIngest)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary, kbIngest)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -1032,9 +1025,14 @@ func readProjectConfig() (string, error) {
 	return string(content), nil
 }
 
-func composeSystemPrompt(base, projectConfig string, ephemeral bool) string {
+func composeSystemPrompt(base, identityRule, projectConfig string, ephemeral bool) string {
 	var sb strings.Builder
 	sb.WriteString(base)
+
+	if identityRule != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(identityRule)
+	}
 
 	if ephemeral {
 		sb.WriteString("\n\n<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.\n</environment>")
@@ -1253,14 +1251,14 @@ func stripSystemPrompt(args []string) []string {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig string, port int, veePath string, passthrough []string, veeBinary string, kbIngest bool) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule string, port int, veePath string, passthrough []string, veeBinary string, kbIngest bool) []string {
 	var args []string
 
 	if resume {
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig, false)
+		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, projectConfig, false)
 		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}

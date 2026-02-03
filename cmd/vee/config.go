@@ -29,6 +29,89 @@ type Generator interface {
 type UserConfig struct {
 	Judgment  JudgmentConfig  `toml:"judgment"`
 	Knowledge KnowledgeConfig `toml:"knowledge"`
+	Identity  *IdentityConfig `toml:"identity"`
+}
+
+// IdentityConfig configures the assistant's identity (name + git author).
+type IdentityConfig struct {
+	Name    string `toml:"name"`
+	Email   string `toml:"email"`
+	Disable bool   `toml:"disable"`
+}
+
+// ProjectTOML represents the top-level .vee/config.toml structure.
+type ProjectTOML struct {
+	Ephemeral *EphemeralConfig `toml:"ephemeral"`
+	Identity  *IdentityConfig  `toml:"identity"`
+}
+
+// readProjectTOML reads and parses .vee/config.toml from the current directory.
+func readProjectTOML() (*ProjectTOML, error) {
+	var cfg ProjectTOML
+	_, err := toml.DecodeFile(".vee/config.toml", &cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// resolveIdentity merges user-level and project-level identity configs.
+// Project disable=true suppresses identity entirely.
+// Field-level merge: user provides defaults, project overrides non-empty fields.
+func resolveIdentity(user, project *IdentityConfig) *IdentityConfig {
+	if user == nil && project == nil {
+		return nil
+	}
+	if project != nil && project.Disable {
+		return nil
+	}
+
+	result := &IdentityConfig{}
+
+	// Start with user values
+	if user != nil {
+		result.Name = user.Name
+		result.Email = user.Email
+	}
+
+	// Override with non-empty project values
+	if project != nil {
+		if project.Name != "" {
+			result.Name = project.Name
+		}
+		if project.Email != "" {
+			result.Email = project.Email
+		}
+	}
+
+	return result
+}
+
+// validateIdentity returns an error if identity is non-nil and not disabled
+// but name or email is empty.
+func validateIdentity(cfg *IdentityConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.Disable {
+		return nil
+	}
+	if cfg.Name == "" {
+		return fmt.Errorf("identity: name is required when identity is configured")
+	}
+	if cfg.Email == "" {
+		return fmt.Errorf("identity: email is required when identity is configured")
+	}
+	return nil
+}
+
+// identityRule returns the rendered <rule> block for the system prompt,
+// or "" if identity is nil.
+func identityRule(cfg *IdentityConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return fmt.Sprintf("<rule object=\"Identity\">\nYour name is %s.\nALWAYS use `git commit` with `--author \"%s <%s>\"`.\n</rule>", cfg.Name, cfg.Name, cfg.Email)
 }
 
 // JudgmentConfig configures the local LLM used for background KB operations.

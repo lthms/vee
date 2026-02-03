@@ -9,14 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/BurntSushi/toml"
 )
-
-// ProjectTOML represents the top-level .vee/config.toml structure.
-type ProjectTOML struct {
-	Ephemeral *EphemeralConfig `toml:"ephemeral"`
-}
 
 // EphemeralConfig holds the [ephemeral] section of .vee/config.toml.
 type EphemeralConfig struct {
@@ -31,16 +24,6 @@ type MountSpec struct {
 	Source string `toml:"source"`
 	Target string `toml:"target"`
 	Mount  string `toml:"mount"` // "overlay" (default), "ro", or "rw"
-}
-
-// readProjectTOML reads and parses .vee/config.toml from the current directory.
-func readProjectTOML() (*ProjectTOML, error) {
-	var cfg ProjectTOML
-	_, err := toml.DecodeFile(".vee/config.toml", &cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &cfg, nil
 }
 
 // ephemeralAvailable returns true if .vee/config.toml exists with an [ephemeral]
@@ -94,7 +77,7 @@ func dockerfilePath(cfg *EphemeralConfig) string {
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
 //
 //	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, prompt string, port int, veePath, veeBinary string, passthrough []string, kbIngest bool) string {
+func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, prompt string, port int, veePath, veeBinary string, passthrough []string, kbIngest bool) string {
 	tag := ephemeralImageTag()
 	df := dockerfilePath(cfg)
 
@@ -110,7 +93,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 
 	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
 	var claudeArgs []string
-	fullPrompt := composeSystemPrompt(mode.Prompt, projectConfig, true)
+	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, projectConfig, true)
 	claudeArgs = buildArgs(passthrough, fullPrompt)
 	claudeArgs = append(claudeArgs, "--session-id", sessionID)
 	if mcpConfigFile != "" {

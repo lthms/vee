@@ -3,12 +3,6 @@
   issues = https://github.com/lthms/vee/issues
 
 [ephemeral]
-  # Path to Dockerfile relative to .vee/ (defaults to "Dockerfile" → .vee/Dockerfile)
-  # dockerfile = Dockerfile
-  
-  # Extra arguments passed verbatim to `docker run`
-  # extraArgs = --gpus all
-  
-  # Bind mounts (source:target[:mode])
   mount = ~/.claude:/root/.claude
   mount = ~/.claude.json:/root/.claude.json:rw
+  mount = ~/.config/gh:/root/.config/gh

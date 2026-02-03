@@ -11,22 +11,22 @@ import (
 	"strings"
 )
 
-// EphemeralConfig holds the [ephemeral] section of .vee/config.toml.
+// EphemeralConfig holds the [ephemeral] section of .vee/config.
 type EphemeralConfig struct {
-	Dockerfile string      `toml:"dockerfile"`
-	Env        []string    `toml:"env"`
-	ExtraArgs  []string    `toml:"extra_args"`
-	Mounts     []MountSpec `toml:"mounts"`
+	Dockerfile string
+	Env        []string
+	ExtraArgs  []string
+	Mounts     []MountSpec
 }
 
 // MountSpec describes a bind mount for the Docker container.
 type MountSpec struct {
-	Source string `toml:"source"`
-	Target string `toml:"target"`
-	Mount  string `toml:"mount"` // "overlay" (default), "ro", or "rw"
+	Source string
+	Target string
+	Mount  string // "overlay" (default), "ro", or "rw"
 }
 
-// ephemeralAvailable returns true if .vee/config.toml exists with an [ephemeral]
+// ephemeralAvailable returns true if .vee/config exists with an [ephemeral]
 // section and the docker binary is on PATH.
 func ephemeralAvailable() bool {
 	cfg, err := readProjectTOML()

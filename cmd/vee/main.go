@@ -232,8 +232,8 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 
 	// Resolve identity: merge user + project configs
 	var projectIdentity *IdentityConfig
-	if projTOML, err := readProjectTOML(); err == nil {
-		projectIdentity = projTOML.Identity
+	if projCfg, err := readProjectTOML(); err == nil {
+		projectIdentity = projCfg.Identity
 	}
 	resolvedIdentity := resolveIdentity(userCfg.Identity, projectIdentity)
 	if err := validateIdentity(resolvedIdentity); err != nil {
@@ -325,10 +325,10 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	if cmd.Ephemeral {
 		cfg, err := readProjectTOML()
 		if err != nil {
-			return fmt.Errorf("failed to read .vee/config.toml: %w", err)
+			return fmt.Errorf("failed to read .vee/config: %w", err)
 		}
 		if cfg.Ephemeral == nil {
-			return fmt.Errorf("no [ephemeral] section in .vee/config.toml")
+			return fmt.Errorf("no [ephemeral] section in .vee/config")
 		}
 		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args), cmd.KBIngest)
 	} else {

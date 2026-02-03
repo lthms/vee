@@ -18,6 +18,7 @@ The Go binary (`cmd/vee`) is the mode orchestrator. It manages a tmux-based mult
 - **`cmd/vee/tmux.go`** — Tmux integration: window creation, keybindings, graceful session shutdown.
 - **`cmd/vee/dashboard.go`** — Terminal UI dashboard rendering active/suspended/completed sessions.
 - **`cmd/vee/picker.go`** — Interactive mode picker TUI with prompt input.
+- **`cmd/vee/config.go`** — Configuration parser: git-config-format files with `[include]`/`[includeIf]` support, loaded via `gcfg.ReadWithCallback`.
 - **`cmd/vee/kb.go`** — Knowledge base: SQLite FTS5 index + Obsidian-compatible markdown vault (`~/.local/state/vee/vault/`).
 
 ### Prompts

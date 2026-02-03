@@ -12,10 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
+	gcfg "github.com/go-git/gcfg/v2"
 	"github.com/lthms/vee/internal/kb"
 )
 
@@ -25,34 +26,361 @@ type Generator interface {
 	Generate(prompt string) (string, error)
 }
 
-// UserConfig holds user-level configuration loaded from ~/.config/vee/config.toml.
+// UserConfig holds user-level configuration loaded from ~/.config/vee/config.
 type UserConfig struct {
-	Judgment  JudgmentConfig  `toml:"judgment"`
-	Knowledge KnowledgeConfig `toml:"knowledge"`
-	Identity  *IdentityConfig `toml:"identity"`
+	Judgment  JudgmentConfig
+	Knowledge KnowledgeConfig
+	Identity  *IdentityConfig
 }
 
 // IdentityConfig configures the assistant's identity (name + git author).
 type IdentityConfig struct {
-	Name    string `toml:"name"`
-	Email   string `toml:"email"`
-	Disable bool   `toml:"disable"`
+	Name    string
+	Email   string
+	Disable bool
 }
 
-// ProjectTOML represents the top-level .vee/config.toml structure.
-type ProjectTOML struct {
-	Ephemeral *EphemeralConfig `toml:"ephemeral"`
-	Identity  *IdentityConfig  `toml:"identity"`
+// ProjectConfig represents the top-level .vee/config structure.
+type ProjectConfig struct {
+	Ephemeral *EphemeralConfig
+	Identity  *IdentityConfig
 }
 
-// readProjectTOML reads and parses .vee/config.toml from the current directory.
-func readProjectTOML() (*ProjectTOML, error) {
-	var cfg ProjectTOML
-	_, err := toml.DecodeFile(".vee/config.toml", &cfg)
+// readProjectTOML reads and parses .vee/config from the current directory.
+func readProjectTOML() (*ProjectConfig, error) {
+	m, err := parseConfig(".vee/config", nil)
 	if err != nil {
 		return nil, err
 	}
-	return &cfg, nil
+	return hydrateProjectConfig(m), nil
+}
+
+// parseConfig reads a git-config-format file and returns a flat map of
+// "section.key" → []string values. It handles [include] and [includeIf]
+// directives recursively. The seen map prevents infinite include cycles.
+func parseConfig(path string, seen map[string]bool) (map[string][]string, error) {
+	if seen == nil {
+		seen = make(map[string]bool)
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if seen[absPath] {
+		return make(map[string][]string), nil
+	}
+	seen[absPath] = true
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	result := make(map[string][]string)
+	dir := filepath.Dir(absPath)
+
+	var currentSection string
+	var currentSubsection string
+
+	err = gcfg.ReadWithCallback(f, func(section, subsection, key, value string, blank bool) error {
+		if key == "" {
+			// Section or subsection header
+			currentSection = strings.ToLower(section)
+			currentSubsection = subsection
+			return nil
+		}
+
+		sec := currentSection
+		sub := currentSubsection
+
+		// Handle [include] path = ...
+		if sec == "include" && strings.ToLower(key) == "path" && !blank {
+			incPath := resolveIncludePath(value, dir)
+			included, err := parseConfig(incPath, seen)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil // silently skip missing includes
+				}
+				return err
+			}
+			mergeConfig(result, included)
+			return nil
+		}
+
+		// Handle [includeIf "gitdir:PATTERN"] path = ...
+		if sec == "includeif" && strings.ToLower(key) == "path" && !blank && sub != "" {
+			if cond, ok := strings.CutPrefix(sub, "gitdir:"); ok {
+				if matchGitdir(cond) {
+					incPath := resolveIncludePath(value, dir)
+					included, err := parseConfig(incPath, seen)
+					if err != nil {
+						if errors.Is(err, os.ErrNotExist) {
+							return nil
+						}
+						return err
+					}
+					mergeConfig(result, included)
+				}
+			}
+			return nil
+		}
+
+		mapKey := sec + "." + strings.ToLower(key)
+		if blank {
+			return nil
+		}
+		result[mapKey] = append(result[mapKey], value)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// resolveIncludePath expands ~ and resolves relative paths against baseDir.
+func resolveIncludePath(path, baseDir string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, path)
+	}
+	return path
+}
+
+// matchGitdir checks whether the current repo's .git directory matches a
+// gitdir pattern, following git's includeIf gitdir rules:
+//   - Match target is the .git directory (via git rev-parse --absolute-git-dir)
+//   - ~/  → expand to $HOME
+//   - Pattern not starting with ~/, ./, or / → prepend **/
+//   - Trailing / → append **
+func matchGitdir(pattern string) bool {
+	out, err := exec.Command("git", "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimRight(string(out), "\n")
+
+	// Expand ~ in pattern
+	if strings.HasPrefix(pattern, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+
+	// Trailing "/" means recursive match into subdirs → append **
+	if strings.HasSuffix(pattern, "/") {
+		pattern = pattern + "**"
+	}
+
+	// Relative patterns (not starting with / or ./) match anywhere → prepend **/
+	if !strings.HasPrefix(pattern, "/") && !strings.HasPrefix(pattern, "./") {
+		pattern = "**/" + pattern
+	}
+
+	return matchPath(pattern, gitDir)
+}
+
+// matchPath performs **-aware glob matching by splitting pattern and path into
+// /-separated components. ** matches zero or more path components; single
+// segments are matched with filepath.Match.
+func matchPath(pattern, name string) bool {
+	patParts := strings.Split(pattern, "/")
+	nameParts := strings.Split(name, "/")
+	return matchParts(patParts, nameParts)
+}
+
+func matchParts(pat, name []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			pat = pat[1:]
+			if len(pat) == 0 {
+				return true // trailing ** matches everything
+			}
+			// Try matching the rest of the pattern against every suffix of name
+			for i := 0; i <= len(name); i++ {
+				if matchParts(pat, name[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+
+		if len(name) == 0 {
+			return false
+		}
+
+		matched, err := filepath.Match(pat[0], name[0])
+		if err != nil || !matched {
+			return false
+		}
+
+		pat = pat[1:]
+		name = name[1:]
+	}
+	return len(name) == 0
+}
+
+// mergeConfig merges src into dst, appending values.
+func mergeConfig(dst, src map[string][]string) {
+	for k, v := range src {
+		dst[k] = append(dst[k], v...)
+	}
+}
+
+
+// lastValue returns the last value for a key, or "" if absent.
+func lastValue(m map[string][]string, key string) string {
+	vals := m[key]
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[len(vals)-1]
+}
+
+// hydrateProjectConfig populates a ProjectConfig from the flat map.
+func hydrateProjectConfig(m map[string][]string) *ProjectConfig {
+	cfg := &ProjectConfig{}
+
+	// [ephemeral]
+	if df := lastValue(m, "ephemeral.dockerfile"); df != "" {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		cfg.Ephemeral.Dockerfile = df
+	}
+	if envs := m["ephemeral.env"]; len(envs) > 0 {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		cfg.Ephemeral.Env = envs
+	}
+	if args := m["ephemeral.extraargs"]; len(args) > 0 {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		cfg.Ephemeral.ExtraArgs = args
+	}
+	if mounts := m["ephemeral.mount"]; len(mounts) > 0 {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		for _, raw := range mounts {
+			ms, err := parseMountSpec(raw)
+			if err != nil {
+				slog.Warn("invalid mount spec, skipping", "spec", raw, "error", err)
+				continue
+			}
+			cfg.Ephemeral.Mounts = append(cfg.Ephemeral.Mounts, ms)
+		}
+	}
+
+	// [identity]
+	if name := lastValue(m, "identity.name"); name != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Name = name
+	}
+	if email := lastValue(m, "identity.email"); email != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Email = email
+	}
+	if disable := lastValue(m, "identity.disable"); disable != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Disable = disable == "true"
+	}
+
+	return cfg
+}
+
+// parseMountSpec parses a "source:target[:mode]" string into a MountSpec.
+func parseMountSpec(s string) (MountSpec, error) {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 2 {
+		return MountSpec{}, fmt.Errorf("mount spec requires at least source:target, got %q", s)
+	}
+	ms := MountSpec{
+		Source: parts[0],
+		Target: parts[1],
+	}
+	if len(parts) == 3 {
+		ms.Mount = parts[2]
+	}
+	return ms, nil
+}
+
+// hydrateUserConfig populates a UserConfig from the flat map, applying defaults.
+func hydrateUserConfig(m map[string][]string) *UserConfig {
+	cfg := &UserConfig{
+		Judgment: JudgmentConfig{
+			URL:   "http://localhost:11434",
+			Model: "claude:haiku",
+		},
+		Knowledge: KnowledgeConfig{
+			EmbeddingModel: "nomic-embed-text",
+			Threshold:      0.3,
+			MaxResults:     10,
+		},
+	}
+
+	// [judgment]
+	if url := lastValue(m, "judgment.url"); url != "" {
+		cfg.Judgment.URL = url
+	}
+	if model := lastValue(m, "judgment.model"); model != "" {
+		cfg.Judgment.Model = model
+	}
+
+	// [knowledge]
+	if em := lastValue(m, "knowledge.embeddingmodel"); em != "" {
+		cfg.Knowledge.EmbeddingModel = em
+	}
+	if th := lastValue(m, "knowledge.threshold"); th != "" {
+		if v, err := strconv.ParseFloat(th, 64); err == nil {
+			cfg.Knowledge.Threshold = v
+		}
+	}
+	if mr := lastValue(m, "knowledge.maxresults"); mr != "" {
+		if v, err := strconv.Atoi(mr); err == nil {
+			cfg.Knowledge.MaxResults = v
+		}
+	}
+
+	// [identity]
+	if name := lastValue(m, "identity.name"); name != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Name = name
+	}
+	if email := lastValue(m, "identity.email"); email != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Email = email
+	}
+	if disable := lastValue(m, "identity.disable"); disable != "" {
+		if cfg.Identity == nil {
+			cfg.Identity = &IdentityConfig{}
+		}
+		cfg.Identity.Disable = disable == "true"
+	}
+
+	return cfg
 }
 
 // resolveIdentity merges user-level and project-level identity configs.
@@ -116,18 +444,18 @@ func identityRule(cfg *IdentityConfig) string {
 
 // JudgmentConfig configures the local LLM used for background KB operations.
 type JudgmentConfig struct {
-	URL   string `toml:"url"`
-	Model string `toml:"model"`
+	URL   string
+	Model string
 }
 
 // KnowledgeConfig configures knowledge base settings.
 type KnowledgeConfig struct {
-	EmbeddingModel string  `toml:"embedding_model"`
-	Threshold      float64 `toml:"threshold"`
-	MaxResults     int     `toml:"max_results"`
+	EmbeddingModel string
+	Threshold      float64
+	MaxResults     int
 }
 
-// loadUserConfig reads ~/.config/vee/config.toml and returns the parsed config
+// loadUserConfig reads ~/.config/vee/config and returns the parsed config
 // with defaults applied. If the file does not exist, defaults are returned with
 // no error.
 func loadUserConfig() (*UserConfig, error) {
@@ -136,45 +464,17 @@ func loadUserConfig() (*UserConfig, error) {
 		return nil, fmt.Errorf("home dir: %w", err)
 	}
 
-	path := filepath.Join(home, ".config", "vee", "config.toml")
+	path := filepath.Join(home, ".config", "vee", "config")
 
-	cfg := &UserConfig{
-		Judgment: JudgmentConfig{
-			URL:   "http://localhost:11434",
-			Model: "claude:haiku",
-		},
-		Knowledge: KnowledgeConfig{
-			EmbeddingModel: "nomic-embed-text",
-			Threshold:      0.3,
-			MaxResults:     10,
-		},
-	}
-
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	m, err := parseConfig(path, nil)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return cfg, nil
+			return hydrateUserConfig(nil), nil
 		}
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
-	// Re-apply defaults for empty fields
-	if cfg.Judgment.URL == "" {
-		cfg.Judgment.URL = "http://localhost:11434"
-	}
-	if cfg.Judgment.Model == "" {
-		cfg.Judgment.Model = "claude:haiku"
-	}
-	if cfg.Knowledge.EmbeddingModel == "" {
-		cfg.Knowledge.EmbeddingModel = "nomic-embed-text"
-	}
-	if cfg.Knowledge.Threshold == 0 {
-		cfg.Knowledge.Threshold = 0.3
-	}
-	if cfg.Knowledge.MaxResults == 0 {
-		cfg.Knowledge.MaxResults = 10
-	}
-
-	return cfg, nil
+	return hydrateUserConfig(m), nil
 }
 
 // OllamaModel implements kb.Model via the Ollama HTTP API.

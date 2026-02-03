@@ -1,8 +1,371 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestParseConfigBasic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	os.WriteFile(path, []byte(`[identity]
+	name = Vee
+	email = vee@example.com
+[judgment]
+	url = http://localhost:9999
+	model = llama3
+`), 0600)
+
+	m, err := parseConfig(path, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "Vee" {
+		t.Errorf("identity.name = %q, want %q", got, "Vee")
+	}
+	if got := lastValue(m, "identity.email"); got != "vee@example.com" {
+		t.Errorf("identity.email = %q, want %q", got, "vee@example.com")
+	}
+	if got := lastValue(m, "judgment.url"); got != "http://localhost:9999" {
+		t.Errorf("judgment.url = %q, want %q", got, "http://localhost:9999")
+	}
+}
+
+func TestParseConfigLastWins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	os.WriteFile(path, []byte(`[identity]
+	name = First
+[identity]
+	name = Second
+`), 0600)
+
+	m, err := parseConfig(path, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "Second" {
+		t.Errorf("identity.name = %q, want %q", got, "Second")
+	}
+}
+
+func TestParseConfigMultiValued(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	os.WriteFile(path, []byte(`[ephemeral]
+	mount = ~/.claude:/root/.claude
+	mount = ~/.claude.json:/root/.claude.json:rw
+	env = FOO=bar
+	env = BAZ=qux
+`), 0600)
+
+	m, err := parseConfig(path, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	mounts := m["ephemeral.mount"]
+	if len(mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d", len(mounts))
+	}
+	if mounts[0] != "~/.claude:/root/.claude" {
+		t.Errorf("mount[0] = %q", mounts[0])
+	}
+	if mounts[1] != "~/.claude.json:/root/.claude.json:rw" {
+		t.Errorf("mount[1] = %q", mounts[1])
+	}
+
+	envs := m["ephemeral.env"]
+	if len(envs) != 2 {
+		t.Fatalf("expected 2 envs, got %d", len(envs))
+	}
+}
+
+func TestParseConfigInclude(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write the included file
+	incPath := filepath.Join(dir, "extra.conf")
+	os.WriteFile(incPath, []byte(`[identity]
+	name = Included
+	email = inc@example.com
+`), 0600)
+
+	// Write the main config with an include
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[include]
+	path = extra.conf
+[judgment]
+	url = http://localhost:5000
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	// Values from the included file should be present
+	if got := lastValue(m, "identity.name"); got != "Included" {
+		t.Errorf("identity.name = %q, want %q", got, "Included")
+	}
+	if got := lastValue(m, "judgment.url"); got != "http://localhost:5000" {
+		t.Errorf("judgment.url = %q, want %q", got, "http://localhost:5000")
+	}
+}
+
+func TestParseConfigIncludeOrdering(t *testing.T) {
+	dir := t.TempDir()
+
+	// Included file sets name = "FromInclude"
+	incPath := filepath.Join(dir, "inc.conf")
+	os.WriteFile(incPath, []byte(`[identity]
+	name = FromInclude
+`), 0600)
+
+	// Main file: set name before include, then override after
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[identity]
+	name = Before
+[include]
+	path = inc.conf
+[identity]
+	name = After
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	// "After" was set last, so it should win
+	if got := lastValue(m, "identity.name"); got != "After" {
+		t.Errorf("identity.name = %q, want %q", got, "After")
+	}
+}
+
+func TestParseConfigIncludeIfGitdirMatch(t *testing.T) {
+	dir := t.TempDir()
+
+	out, err := exec.Command("git", "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		t.Skipf("not inside a git repo: %v", err)
+	}
+	gitDir := filepath.Dir(strings.TrimRight(string(out), "\n"))
+
+	// Write included file
+	incPath := filepath.Join(dir, "work.conf")
+	os.WriteFile(incPath, []byte(`[identity]
+	name = WorkBot
+`), 0600)
+
+	// Use the git root with trailing "/" for prefix match
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[includeIf "gitdir:`+gitDir+`/"]
+	path = `+incPath+`
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "WorkBot" {
+		t.Errorf("identity.name = %q, want %q", got, "WorkBot")
+	}
+}
+
+func TestParseConfigIncludeIfGitdirNoTrailingSlash(t *testing.T) {
+	dir := t.TempDir()
+
+	out, err := exec.Command("git", "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		t.Skipf("not inside a git repo: %v", err)
+	}
+	gitDir := strings.TrimRight(string(out), "\n")
+
+	// Write included file
+	incPath := filepath.Join(dir, "work.conf")
+	os.WriteFile(incPath, []byte(`[identity]
+	name = ExactBot
+`), 0600)
+
+	// Exact match (no trailing /) against the .git directory itself
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[includeIf "gitdir:`+gitDir+`"]
+	path = `+incPath+`
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "ExactBot" {
+		t.Errorf("identity.name = %q, want %q", got, "ExactBot")
+	}
+}
+
+func TestParseConfigIncludeIfGitdirNoMatch(t *testing.T) {
+	dir := t.TempDir()
+
+	incPath := filepath.Join(dir, "work.conf")
+	os.WriteFile(incPath, []byte(`[identity]
+	name = WorkBot
+`), 0600)
+
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[includeIf "gitdir:/nonexistent/path/"]
+	path = `+incPath+`
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "" {
+		t.Errorf("identity.name = %q, want empty (should not include)", got)
+	}
+}
+
+func TestParseConfigMissingInclude(t *testing.T) {
+	dir := t.TempDir()
+
+	mainPath := filepath.Join(dir, "config")
+	os.WriteFile(mainPath, []byte(`[include]
+	path = /nonexistent/file.conf
+[identity]
+	name = StillHere
+`), 0600)
+
+	m, err := parseConfig(mainPath, nil)
+	if err != nil {
+		t.Fatalf("parseConfig should not error on missing include: %v", err)
+	}
+
+	if got := lastValue(m, "identity.name"); got != "StillHere" {
+		t.Errorf("identity.name = %q, want %q", got, "StillHere")
+	}
+}
+
+func TestParseMountSpec(t *testing.T) {
+	tests := []struct {
+		input      string
+		wantSource string
+		wantTarget string
+		wantMode   string
+		wantErr    bool
+	}{
+		{"~/.claude:/root/.claude", "~/.claude", "/root/.claude", "", false},
+		{"~/.claude.json:/root/.claude.json:rw", "~/.claude.json", "/root/.claude.json", "rw", false},
+		{"/src:/dst:ro", "/src", "/dst", "ro", false},
+		{"invalid", "", "", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			ms, err := parseMountSpec(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ms.Source != tt.wantSource {
+				t.Errorf("Source = %q, want %q", ms.Source, tt.wantSource)
+			}
+			if ms.Target != tt.wantTarget {
+				t.Errorf("Target = %q, want %q", ms.Target, tt.wantTarget)
+			}
+			if ms.Mount != tt.wantMode {
+				t.Errorf("Mount = %q, want %q", ms.Mount, tt.wantMode)
+			}
+		})
+	}
+}
+
+func TestHydrateProjectConfig(t *testing.T) {
+	m := map[string][]string{
+		"ephemeral.dockerfile": {"Dockerfile.dev"},
+		"ephemeral.mount":      {"~/.claude:/root/.claude", "~/.claude.json:/root/.claude.json:rw"},
+		"ephemeral.env":        {"FOO=bar"},
+		"identity.disable":     {"true"},
+	}
+
+	cfg := hydrateProjectConfig(m)
+	if cfg.Ephemeral == nil {
+		t.Fatal("expected non-nil Ephemeral")
+	}
+	if cfg.Ephemeral.Dockerfile != "Dockerfile.dev" {
+		t.Errorf("Dockerfile = %q", cfg.Ephemeral.Dockerfile)
+	}
+	if len(cfg.Ephemeral.Mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d", len(cfg.Ephemeral.Mounts))
+	}
+	if cfg.Ephemeral.Mounts[1].Mount != "rw" {
+		t.Errorf("mount[1].Mount = %q, want %q", cfg.Ephemeral.Mounts[1].Mount, "rw")
+	}
+	if cfg.Identity == nil {
+		t.Fatal("expected non-nil Identity")
+	}
+	if !cfg.Identity.Disable {
+		t.Error("expected Identity.Disable = true")
+	}
+}
+
+func TestHydrateUserConfig(t *testing.T) {
+	m := map[string][]string{
+		"judgment.model":           {"llama3"},
+		"knowledge.threshold":      {"0.5"},
+		"knowledge.maxresults":     {"20"},
+		"identity.name":            {"Vee"},
+		"identity.email":           {"vee@example.com"},
+	}
+
+	cfg := hydrateUserConfig(m)
+	if cfg.Judgment.URL != "http://localhost:11434" {
+		t.Errorf("Judgment.URL = %q, want default", cfg.Judgment.URL)
+	}
+	if cfg.Judgment.Model != "llama3" {
+		t.Errorf("Judgment.Model = %q, want %q", cfg.Judgment.Model, "llama3")
+	}
+	if cfg.Knowledge.Threshold != 0.5 {
+		t.Errorf("Knowledge.Threshold = %f, want 0.5", cfg.Knowledge.Threshold)
+	}
+	if cfg.Knowledge.MaxResults != 20 {
+		t.Errorf("Knowledge.MaxResults = %d, want 20", cfg.Knowledge.MaxResults)
+	}
+	if cfg.Identity == nil || cfg.Identity.Name != "Vee" {
+		t.Errorf("Identity.Name = %v", cfg.Identity)
+	}
+}
+
+func TestHydrateUserConfigDefaults(t *testing.T) {
+	cfg := hydrateUserConfig(nil)
+	if cfg.Judgment.URL != "http://localhost:11434" {
+		t.Errorf("default URL = %q", cfg.Judgment.URL)
+	}
+	if cfg.Judgment.Model != "claude:haiku" {
+		t.Errorf("default Model = %q", cfg.Judgment.Model)
+	}
+	if cfg.Knowledge.EmbeddingModel != "nomic-embed-text" {
+		t.Errorf("default EmbeddingModel = %q", cfg.Knowledge.EmbeddingModel)
+	}
+	if cfg.Knowledge.Threshold != 0.3 {
+		t.Errorf("default Threshold = %f", cfg.Knowledge.Threshold)
+	}
+	if cfg.Knowledge.MaxResults != 10 {
+		t.Errorf("default MaxResults = %d", cfg.Knowledge.MaxResults)
+	}
+}
 
 func TestResolveIdentity(t *testing.T) {
 	tests := []struct {
@@ -119,6 +482,51 @@ func TestValidateIdentity(t *testing.T) {
 			err := validateIdentity(tt.cfg)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateIdentity() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestMatchPath(t *testing.T) {
+	tests := []struct {
+		pattern string
+		name    string
+		want    bool
+	}{
+		// Exact match
+		{"/home/user/project/.git", "/home/user/project/.git", true},
+		{"/home/user/project/.git", "/home/user/other/.git", false},
+
+		// Single * matches one component segment
+		{"/home/*/project/.git", "/home/user/project/.git", true},
+		{"/home/*/project/.git", "/home/user/other/.git", false},
+
+		// ** matches zero or more components
+		{"/**/project/.git", "/home/user/project/.git", true},
+		{"/**/project/.git", "/project/.git", true},
+		{"/**/.git", "/home/user/project/.git", true},
+		{"/home/**/.git", "/home/user/project/.git", true},
+		{"/home/**/.git", "/home/.git", true},
+
+		// Trailing /** (from trailing / normalization)
+		{"/home/user/**", "/home/user/project/.git", true},
+		{"/home/user/**", "/home/user/.git", true},
+		{"/home/user/**", "/home/other/.git", false},
+
+		// Relative patterns (prepended with **/)
+		{"**/project/.git", "/home/user/project/.git", true},
+		{"**/work/**", "/home/user/work/project/.git", true},
+		{"**/work/**", "/home/user/personal/project/.git", false},
+
+		// No match
+		{"/a/b/c", "/x/y/z", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.pattern+"_vs_"+tt.name, func(t *testing.T) {
+			got := matchPath(tt.pattern, tt.name)
+			if got != tt.want {
+				t.Errorf("matchPath(%q, %q) = %v, want %v", tt.pattern, tt.name, got, tt.want)
 			}
 		})
 	}

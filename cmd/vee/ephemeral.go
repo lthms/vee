@@ -103,6 +103,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 		claudeArgs = append(claudeArgs, "--settings", settingsFile)
 	}
 	claudeArgs = append(claudeArgs, "--plugin-dir", "/opt/vee/plugins/vee")
+	claudeArgs = append(claudeArgs, "--dangerously-skip-permissions")
 
 	// Build command
 	buildCmd := fmt.Sprintf("docker build -t %s -f %s .", shelljoin(tag), shelljoin(df))

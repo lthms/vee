@@ -62,13 +62,14 @@ func parseModeFile(filename string, content []byte) (Mode, error) {
 // wrapModeBody wraps a mode body in XML tags for system prompt composition.
 // It prepends a rule explaining the script's role, so the rule is only
 // present when there is actually a script to follow.
-func wrapModeBody(body string) string {
+func wrapModeBody(indicator, body string) string {
 	const scriptRule = `<rule object="Script">
 Your system prompt contains a <script> block.
 It defines the purpose and constraints of this session.
 ALWAYS follow the directives in your <script> block. They take precedence over your default behavior.
 </rule>`
-	return fmt.Sprintf("%s\n\n<script>\n%s\n</script>", scriptRule, body)
+	indicatorRule := fmt.Sprintf("<rule object=\"Indicator\">\nALWAYS prefix your messages with %s.\n</rule>", indicator)
+	return fmt.Sprintf("%s\n\n%s\n\n<script>\n%s\n</script>", scriptRule, indicatorRule, body)
 }
 
 // loadModesFromDir reads all *.md files from a directory and parses them as modes.
@@ -138,7 +139,7 @@ func initModeRegistry(veePath string) error {
 	modes := make([]Mode, 0, len(byName))
 	for _, m := range byName {
 		if m.Prompt != "" {
-			m.Prompt = string(basePrompt) + "\n\n" + wrapModeBody(m.Prompt)
+			m.Prompt = string(basePrompt) + "\n\n" + wrapModeBody(m.Indicator, m.Prompt)
 		} else {
 			m.Prompt = string(basePrompt)
 		}

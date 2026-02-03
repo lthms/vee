@@ -129,12 +129,18 @@ Body text.`,
 }
 
 func TestWrapModeBody(t *testing.T) {
-	got := wrapModeBody("Read-only mode.")
+	got := wrapModeBody("🦊", "Read-only mode.")
 	if !strings.Contains(got, `<rule object="Script">`) {
 		t.Error("wrapModeBody should include the script rule")
 	}
 	if !strings.Contains(got, "<script>\nRead-only mode.\n</script>") {
 		t.Error("wrapModeBody should wrap body in script tags")
+	}
+	if !strings.Contains(got, `<rule object="Indicator">`) {
+		t.Error("wrapModeBody should include the indicator rule")
+	}
+	if !strings.Contains(got, "🦊") {
+		t.Error("wrapModeBody should include the indicator value")
 	}
 }
 

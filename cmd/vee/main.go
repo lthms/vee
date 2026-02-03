@@ -1266,7 +1266,7 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, i
 		args = append(args, "--session-id", sessionID)
 	}
 
-	// MCP config — always provided (needed for request_suspend and self_drop)
+	// MCP config — always provided (needed for request_suspend and KB tools)
 	mcpConfigFile, err := writeMCPConfig(port, sessionID)
 	if err != nil {
 		slog.Error("failed to write MCP config", "error", err)

@@ -14,7 +14,7 @@ The Go binary (`cmd/vee`) is the mode orchestrator. It manages a tmux-based mult
 
 - **`cmd/vee/main.go`** — CLI entry point (Kong framework), mode registry, subcommand dispatch, session launcher.
 - **`cmd/vee/app.go`** — Shared application state (`AppConfig`) and in-memory session store.
-- **`cmd/vee/daemon.go`** — MCP server (SSE-based) + HTTP API. Exposes tools (`request_suspend`, `self_drop`, `kb_remember`, `kb_query`) and manages session state via REST endpoints.
+- **`cmd/vee/daemon.go`** — MCP server (SSE-based) + HTTP API. Exposes tools (`request_suspend`, `kb_remember`, `kb_query`, `kb_touch`) and manages session state via REST endpoints.
 - **`cmd/vee/tmux.go`** — Tmux integration: window creation, keybindings, graceful session shutdown.
 - **`cmd/vee/dashboard.go`** — Terminal UI dashboard rendering active/suspended/completed sessions.
 - **`cmd/vee/picker.go`** — Interactive mode picker TUI with prompt input.
@@ -66,7 +66,7 @@ Sessions move through statuses: **active** → **suspended** → **completed**.
 
 ## Knowledge Base
 
-A shared knowledge base is available to all modes via MCP tools (`kb_remember`, `kb_query`, `kb_fetch`, `kb_touch`). Notes are stored as Obsidian-compatible markdown files with YAML frontmatter and indexed in a SQLite tree-based semantic index. Each note tracks a `last_verified` timestamp for freshness.
+A shared knowledge base is available to all modes via MCP tools (`kb_remember`, `kb_query`, `kb_touch`). Notes are stored as Obsidian-compatible markdown files with YAML frontmatter and indexed in a SQLite tree-based semantic index. Each note tracks a `last_verified` timestamp for freshness.
 
 # Instructions
 

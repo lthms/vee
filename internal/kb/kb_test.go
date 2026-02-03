@@ -216,24 +216,6 @@ func TestGetStatement_NotFound(t *testing.T) {
 	}
 }
 
-func TestFetchStatement(t *testing.T) {
-	stub := newStub()
-	kbase := openTestKB(t, stub)
-
-	result, _ := kbase.AddStatement("Fetch Test. Detailed content", "src.go", "manual")
-
-	content, err := kbase.FetchStatement(result.ID)
-	if err != nil {
-		t.Fatalf("FetchStatement: %v", err)
-	}
-	if !strings.Contains(content, "Fetch Test. Detailed content") {
-		t.Error("expected content body")
-	}
-	if !strings.Contains(content, "Source: src.go") {
-		t.Error("expected source info")
-	}
-}
-
 func TestTouchStatement(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)

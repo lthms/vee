@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 )
 
@@ -113,22 +112,6 @@ func (kb *KnowledgeBase) GetStatement(id string) (*Statement, error) {
 		return nil, fmt.Errorf("get statement %s: %w", id, err)
 	}
 	return &s, nil
-}
-
-// FetchStatement returns a formatted string representation of a statement.
-func (kb *KnowledgeBase) FetchStatement(id string) (string, error) {
-	s, err := kb.GetStatement(id)
-	if err != nil {
-		return "", err
-	}
-
-	var sb strings.Builder
-	sb.WriteString(s.Content)
-	sb.WriteString(fmt.Sprintf("\n\n---\nSource: %s\n", s.Source))
-	sb.WriteString(fmt.Sprintf("Status: %s\n", s.Status))
-	sb.WriteString(fmt.Sprintf("Created: %s\n", s.CreatedAt))
-	sb.WriteString(fmt.Sprintf("Last verified: %s\n", s.LastVerified))
-	return sb.String(), nil
 }
 
 // TouchStatement updates the last_verified timestamp to today.

@@ -24,7 +24,6 @@ type DaemonCmd struct{}
 // MCP tool args
 
 type requestSuspendArgs struct{}
-type selfDropArgs struct{}
 
 type kbRememberArgs struct {
 	Content    string `json:"content" jsonschema:"The statement to save. Must be a single atomic fact (max 2000 chars)."`
@@ -34,10 +33,6 @@ type kbRememberArgs struct {
 
 type kbQueryArgs struct {
 	Query string `json:"query" jsonschema:"Search query. Use specific, meaningful search terms (e.g. 'tmux keybindings'). Do NOT use wildcards or glob patterns."`
-}
-
-type kbFetchArgs struct {
-	ID string `json:"id" jsonschema:"Statement ID (as returned by kb_query)"`
 }
 
 type kbTouchArgs struct {
@@ -52,7 +47,7 @@ type feedbackRecordArgs struct {
 
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
-// sessionID scopes request_suspend and self_drop to a specific session.
+// sessionID scopes request_suspend to a specific session.
 func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, sessionID string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
@@ -75,7 +70,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		if sess.Ephemeral {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: "Ephemeral sessions cannot be suspended. Use self_drop to end the session instead."},
+					&mcp.TextContent{Text: "Ephemeral sessions cannot be suspended."},
 				},
 			}, nil, nil
 		}
@@ -91,35 +86,6 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: "Session suspended."},
-			},
-		}, nil, nil
-	})
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "self_drop",
-		Description: "Signal that the current task is done. Call this when your work is complete to end the session.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args selfDropArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("self_drop called", "session", sessionID)
-		sess := app.Sessions.get(sessionID)
-		if sess == nil || sess.Status != "active" {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: "No active session to drop."},
-				},
-			}, nil, nil
-		}
-		app.Sessions.setStatus(sess.ID, "completed")
-		slog.Debug("session completed", "session", sess.ID)
-		if sess.WindowTarget != "" {
-			go func() {
-				// Delay so the MCP response reaches Claude before we interrupt
-				time.Sleep(2 * time.Second)
-				tmuxGracefulClose(sess.WindowTarget)
-			}()
-		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: "Session ending."},
 			},
 		}, nil, nil
 	})
@@ -157,22 +123,6 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: kb.QueryResultsJSON(results)},
-			},
-		}, nil, nil
-	})
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "kb_fetch",
-		Description: "Fetch the full content of a statement by its ID. Use IDs returned by kb_query. Multiple statements can be fetched in parallel.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbFetchArgs) (*mcp.CallToolResult, any, error) {
-		slog.Debug("kb_fetch called", "id", args.ID)
-		content, err := kbase.FetchStatement(args.ID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("kb_fetch: %w", err)
-		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: content},
 			},
 		}, nil, nil
 	})

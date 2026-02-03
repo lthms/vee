@@ -249,6 +249,14 @@ func tmuxConfigure(veeBinary string, port int, veePath string, passthrough []str
 		return fmt.Errorf("tmux bind-key i: %w", err)
 	}
 
+	// Ctrl-b p: prompt viewer popup (shows system prompt for current session)
+	// display-popup doesn't expand #{window_id}, so we use run-shell to
+	// capture it first and then launch the popup.
+	promptCmd := fmt.Sprintf(`tmux -S %s display-popup -E -w 90%% -h 80%% '%s _prompt-viewer --port %d --window-id #{window_id}'`, tmuxSocketPath(), shelljoin(veeBinary), port)
+	if _, err := tmuxRun("bind-key", "-T", "prefix", "p", "run-shell", promptCmd); err != nil {
+		return fmt.Errorf("tmux bind-key p: %w", err)
+	}
+
 	return nil
 }
 

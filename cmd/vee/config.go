@@ -22,6 +22,12 @@ import (
 type UserConfig struct {
 	Embedding EmbeddingConfig
 	Identity  *IdentityConfig
+	Feedback  FeedbackConfig
+}
+
+// FeedbackConfig configures mode feedback sampling.
+type FeedbackConfig struct {
+	MaxExamples int
 }
 
 // IdentityConfig configures the assistant's identity (name + git author).
@@ -324,6 +330,9 @@ func hydrateUserConfig(m map[string][]string) *UserConfig {
 			MaxResults:   10,
 			DupThreshold: 0.85,
 		},
+		Feedback: FeedbackConfig{
+			MaxExamples: 5,
+		},
 	}
 
 	// [embedding]
@@ -367,6 +376,13 @@ func hydrateUserConfig(m map[string][]string) *UserConfig {
 			cfg.Identity = &IdentityConfig{}
 		}
 		cfg.Identity.Disable = disable == "true"
+	}
+
+	// [feedback]
+	if me := lastValue(m, "feedback.maxexamples"); me != "" {
+		if v, err := strconv.Atoi(me); err == nil {
+			cfg.Feedback.MaxExamples = v
+		}
 	}
 
 	return cfg

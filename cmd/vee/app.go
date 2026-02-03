@@ -14,6 +14,7 @@ type AppConfig struct {
 	Passthrough   []string `json:"passthrough"`
 	ProjectConfig string   `json:"project_config"`
 	IdentityRule  string   `json:"identity_rule"`
+	MaxExamples   int      `json:"max_examples"`
 }
 
 // IndexingTask represents a background processing operation.
@@ -110,6 +111,7 @@ type Session struct {
 	Working         bool      `json:"working"`
 	HasNotification bool      `json:"has_notification"`
 	PermissionMode  string    `json:"permission_mode"`
+	SystemPrompt    string    `json:"-"`
 }
 
 // sessionStore is an in-memory store of sessions keyed by ID.
@@ -124,7 +126,7 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool) *Session {
+func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool, systemPrompt string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &Session{
@@ -136,6 +138,7 @@ func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string,
 		Status:       "active",
 		WindowTarget: windowTarget,
 		Ephemeral:    ephemeral,
+		SystemPrompt: systemPrompt,
 	}
 	s.sessions[id] = sess
 	return sess

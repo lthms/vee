@@ -7,9 +7,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lthms/vee/internal/feedback"
 	"github.com/lthms/vee/internal/kb"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -40,10 +44,16 @@ type kbTouchArgs struct {
 	ID string `json:"id" jsonschema:"Statement ID (as returned by kb_query)"`
 }
 
+type feedbackRecordArgs struct {
+	Kind      string `json:"kind" jsonschema:"Whether this is a good or bad example (good or bad)"`
+	Statement string `json:"statement" jsonschema:"The example or counter-example statement"`
+	Scope     string `json:"scope" jsonschema:"Scope: user (all projects) or project (this project only)"`
+}
+
 // newMCPServer creates a fresh MCP server with all tools registered.
 // Called once per SSE connection so each session gets its own initialization lifecycle.
 // sessionID scopes request_suspend and self_drop to a specific session.
-func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Server {
+func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, sessionID string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "vee",
 		Version: "1.0.0",
@@ -183,14 +193,64 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, sessionID string) *mcp.Serv
 		}, nil, nil
 	})
 
+	// Feedback tool — record mode-specific examples
+	if fstore != nil {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "feedback_record",
+			Description: "Record a good or bad example of mode behavior. The mode is inferred automatically from the current session.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, args feedbackRecordArgs) (*mcp.CallToolResult, any, error) {
+			slog.Debug("feedback_record called", "session", sessionID)
+
+			if args.Kind != "good" && args.Kind != "bad" {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						&mcp.TextContent{Text: "kind must be 'good' or 'bad'"},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+			if args.Scope != "user" && args.Scope != "project" {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						&mcp.TextContent{Text: "scope must be 'user' or 'project'"},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+
+			sess := app.Sessions.get(sessionID)
+			if sess == nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						&mcp.TextContent{Text: "No active session found."},
+					},
+					IsError: true,
+				}, nil, nil
+			}
+
+			project, _ := os.Getwd()
+
+			id, err := fstore.Record(sess.Mode, args.Kind, args.Statement, args.Scope, project)
+			if err != nil {
+				return nil, nil, fmt.Errorf("feedback_record: %w", err)
+			}
+
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("Feedback recorded (id: %s, mode: %s, kind: %s, scope: %s)", id, sess.Mode, args.Kind, args.Scope)},
+				},
+			}, nil, nil
+		})
+	}
+
 	return server
 }
 
 // setupHTTPMux creates an http.ServeMux with all routes registered.
-func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
+func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store) *http.ServeMux {
 	sseHandler := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
 		sessionID := r.URL.Query().Get("session")
-		return newMCPServer(app, kbase, sessionID)
+		return newMCPServer(app, kbase, fstore, sessionID)
 	}, nil)
 
 	mux := http.NewServeMux()
@@ -211,6 +271,10 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase) *http.ServeMux {
 	mux.HandleFunc("/api/kb/fetch", handleKBFetch(kbase))
 	mux.HandleFunc("/api/kb/issues", handleKBIssues(kbase))
 	mux.HandleFunc("/api/kb/issues/resolve", handleKBIssueResolve(kbase))
+	if fstore != nil {
+		mux.HandleFunc("/api/feedback/sample", handleFeedbackSample(fstore, app))
+	}
+	mux.HandleFunc("/api/session/prompt", handleSessionPrompt(app))
 	return mux
 }
 
@@ -246,6 +310,7 @@ func handleSessions(app *App) http.HandlerFunc {
 		Preview      string `json:"preview"`
 		WindowTarget string `json:"window_target"`
 		Ephemeral    bool   `json:"ephemeral"`
+		SystemPrompt string `json:"system_prompt"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +325,7 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral)
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.SystemPrompt)
 		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -636,8 +701,8 @@ func handleSession(app *App) http.HandlerFunc {
 
 // startHTTPServerInBackground starts the HTTP server on an OS-assigned port in a
 // goroutine and returns the *http.Server and actual port for later use.
-func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase) (*http.Server, int, error) {
-	mux := setupHTTPMux(app, kbase)
+func startHTTPServerInBackground(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store) (*http.Server, int, error) {
+	mux := setupHTTPMux(app, kbase, fstore)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -670,8 +735,18 @@ func (cmd *DaemonCmd) Run() error {
 	}
 	defer kbase.Close()
 
+	stDir, err := stateDir()
+	if err != nil {
+		return fmt.Errorf("state dir: %w", err)
+	}
+	fstore, err := feedback.Open(filepath.Join(stDir, "feedback.db"))
+	if err != nil {
+		return fmt.Errorf("open feedback store: %w", err)
+	}
+	defer fstore.Close()
+
 	app := newApp()
-	mux := setupHTTPMux(app, kbase)
+	mux := setupHTTPMux(app, kbase, fstore)
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -792,6 +867,75 @@ func handleKBIssueResolve(kbase *kb.KnowledgeBase) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "resolved"})
+	}
+}
+
+// handleSessionPrompt handles GET /api/session/prompt?window=<window_id>.
+// Returns the system prompt for the session in the given window.
+func handleSessionPrompt(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		windowID := r.URL.Query().Get("window")
+		if windowID == "" {
+			http.Error(w, "missing window query parameter", http.StatusBadRequest)
+			return
+		}
+
+		sess := app.Sessions.findByWindowTarget(windowID)
+		if sess == nil {
+			http.Error(w, "no session for this window", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"mode":          sess.Mode,
+			"indicator":     sess.Indicator,
+			"system_prompt": sess.SystemPrompt,
+		})
+	}
+}
+
+// handleFeedbackSample handles GET /api/feedback/sample?mode=<mode>&project=<project>&n=<n>.
+// Returns a JSON array of sampled feedback entries.
+func handleFeedbackSample(fstore *feedback.Store, app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		mode := r.URL.Query().Get("mode")
+		if mode == "" {
+			http.Error(w, "missing mode query parameter", http.StatusBadRequest)
+			return
+		}
+
+		project := r.URL.Query().Get("project")
+
+		n := 5
+		if nStr := r.URL.Query().Get("n"); nStr != "" {
+			if v, err := strconv.Atoi(nStr); err == nil && v > 0 {
+				n = v
+			}
+		}
+
+		entries, err := fstore.Sample(mode, project, n)
+		if err != nil {
+			http.Error(w, "sample failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if entries == nil {
+			entries = []feedback.Entry{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(entries)
 	}
 }
 

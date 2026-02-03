@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/lthms/vee/internal/feedback"
 )
 
 //go:embed prompts/*.md
@@ -111,6 +112,7 @@ type CLI struct {
 	UpdatePreview UpdatePreviewCmd `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
 	UpdateWindow  UpdateWindowCmd  `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
 	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
+	PromptViewer  PromptViewerCmd  `cmd:"" name:"_prompt-viewer" hidden:"" help:"Internal: display session system prompt."`
 	KBExplorer    KBExplorerCmd    `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
 	IssueResolver IssueResolverCmd `cmd:"" name:"_issue-resolver" hidden:"" help:"Internal: KB issue resolver TUI."`
 	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
@@ -250,9 +252,19 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 	defer workerCancel()
 	go kbase.RunWorker(workerCtx)
 
+	stDir, err := stateDir()
+	if err != nil {
+		return fmt.Errorf("state dir: %w", err)
+	}
+	fstore, err := feedback.Open(filepath.Join(stDir, "feedback.db"))
+	if err != nil {
+		return fmt.Errorf("open feedback store: %w", err)
+	}
+	defer fstore.Close()
+
 	app := newApp()
 
-	srv, port, err := startHTTPServerInBackground(app, kbase)
+	srv, port, err := startHTTPServerInBackground(app, kbase, fstore)
 	if err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
@@ -272,6 +284,7 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 		Passthrough:   []string(args),
 		ProjectConfig: projectConfig,
 		IdentityRule:  idRule,
+		MaxExamples:   userCfg.Feedback.MaxExamples,
 	})
 
 	// Resolve project directory for status bar
@@ -323,8 +336,15 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	// Generate session ID
 	sessionID := newUUID()
 
+	// Sample feedback for this mode
+	feedbackBlock := fetchFeedbackBlock(cmd.Port, mode.Name, appCfg.MaxExamples)
+
+	// Compose system prompt (for storage — lets prompt viewer display it later)
+	isEphemeral := cmd.Ephemeral
+	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral)
+
 	var shellCmd string
-	if cmd.Ephemeral {
+	if isEphemeral {
 		cfg, err := readProjectTOML()
 		if err != nil {
 			return fmt.Errorf("failed to read .vee/config: %w", err)
@@ -334,7 +354,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		}
 		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
 	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, cmd.Port, cmd.VeePath, []string(args), veeBinary)
+		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	}
 
@@ -347,12 +367,12 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	}
 
 	// Set @vee-ephemeral on the window if this is an ephemeral session
-	if cmd.Ephemeral {
+	if isEphemeral {
 		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
 	}
 
-	// Register session with daemon, including the window target
-	if err := registerSession(cmd.Port, sessionID, mode, windowID, cmd.Ephemeral); err != nil {
+	// Register session with daemon, including the window target and system prompt
+	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, systemPrompt); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -360,14 +380,21 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool) error {
-	body := fmt.Sprintf(`{"id":%q,"mode":%q,"indicator":%q,"preview":"","window_target":%q,"ephemeral":%t}`,
-		sessionID, mode.Name, mode.Indicator, windowTarget, ephemeral)
+func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, systemPrompt string) error {
+	payload, _ := json.Marshal(map[string]any{
+		"id":            sessionID,
+		"mode":          mode.Name,
+		"indicator":     mode.Indicator,
+		"preview":       "",
+		"window_target": windowTarget,
+		"ephemeral":     ephemeral,
+		"system_prompt": systemPrompt,
+	})
 
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port),
 		"application/json",
-		strings.NewReader(body),
+		strings.NewReader(string(payload)),
 	)
 	if err != nil {
 		return err
@@ -540,8 +567,8 @@ func (cmd *ResumeSessionCmd) Run() error {
 		}
 	}
 
-	// Build claude args with --resume
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
+	// Build claude args with --resume (feedback block is empty — system prompt is stripped on resume)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
 	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
@@ -944,13 +971,18 @@ func readProjectConfig() (string, error) {
 	return string(content), nil
 }
 
-func composeSystemPrompt(base, identityRule, projectConfig string, ephemeral bool) string {
+func composeSystemPrompt(base, identityRule, feedbackBlock, projectConfig string, ephemeral bool) string {
 	var sb strings.Builder
 	sb.WriteString(base)
 
 	if identityRule != "" {
 		sb.WriteString("\n\n")
 		sb.WriteString(identityRule)
+	}
+
+	if feedbackBlock != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(feedbackBlock)
 	}
 
 	if ephemeral {
@@ -1153,15 +1185,73 @@ func stripSystemPrompt(args []string) []string {
 	return out
 }
 
+// fetchFeedbackBlock calls the daemon's /api/feedback/sample endpoint and
+// formats the result as a prompt block. Returns "" if no entries are sampled.
+func fetchFeedbackBlock(port int, mode string, maxExamples int) string {
+	if maxExamples <= 0 {
+		return ""
+	}
+
+	project, _ := filepath.Abs(".")
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/feedback/sample?mode=%s&project=%s&n=%d",
+		port, mode, project, maxExamples)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		slog.Debug("failed to fetch feedback samples", "error", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var entries []struct {
+		Kind      string `json:"kind"`
+		Statement string `json:"statement"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		slog.Debug("failed to decode feedback samples", "error", err)
+		return ""
+	}
+
+	return formatFeedbackBlock(entries)
+}
+
+// formatFeedbackBlock renders a list of feedback entries as a <rule> block
+// for injection into the system prompt. Returns "" if entries is empty.
+func formatFeedbackBlock(entries []struct {
+	Kind      string `json:"kind"`
+	Statement string `json:"statement"`
+}) string {
+	if len(entries) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<rule object=\"Feedback\">\n")
+	sb.WriteString("The following examples have been curated by the user to guide your behavior.\n")
+	sb.WriteString("Follow good examples. Avoid bad examples.\n")
+
+	for _, e := range entries {
+		sb.WriteString(fmt.Sprintf("\n<example status=%q>\n%s\n</example>\n", e.Kind, e.Statement))
+	}
+
+	sb.WriteString("</rule>")
+	return sb.String()
+}
+
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule string, port int, veePath string, passthrough []string, veeBinary string) []string {
+func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, projectConfig, false)
+		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, feedbackBlock, projectConfig, false)
 		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}

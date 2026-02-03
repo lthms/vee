@@ -123,6 +123,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 	runParts = append(runParts, "-v", shelljoin(veePath+":/opt/vee:ro"))
 
 	// Environment variables
+	runParts = append(runParts, "-e", "IS_SANDBOX=1")
 	for _, env := range cfg.Env {
 		runParts = append(runParts, "-e", shelljoin(env))
 	}

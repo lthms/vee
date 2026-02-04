@@ -204,7 +204,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store) *ht
 	}, nil)
 
 	mux := http.NewServeMux()
-	mux.Handle("/sse", sseHandler)
+	mux.Handle("/sse", sseWithKeepalive(sseHandler, defaultSSEKeepaliveInterval))
 	mux.HandleFunc("/api/state", handleState(app, kbase))
 	mux.HandleFunc("/api/sessions", handleSessions(app))
 	mux.HandleFunc("/api/config", handleConfig(app))

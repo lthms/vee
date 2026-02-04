@@ -1,0 +1,20 @@
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates git jq gh golang-go make \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Pre-clone the Vee repo so sessions start with source ready
+RUN git clone https://github.com/lthms/vee.git /workspace
+
+WORKDIR /workspace
+
+# Pre-warm Go module cache
+RUN go mod download
+
+# Configure git to use gh for auth (token provided at runtime via mounted ~/.config/gh)
+RUN git config --global credential.https://github.com.helper '!gh auth token'

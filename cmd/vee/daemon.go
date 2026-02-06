@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -226,6 +227,7 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store) *ht
 		mux.HandleFunc("/api/feedback/sample", handleFeedbackSample(fstore, app))
 	}
 	mux.HandleFunc("/api/session/prompt", handleSessionPrompt(app))
+	mux.HandleFunc("/api/gpg/sign", handleGPGSign())
 	return mux
 }
 
@@ -946,4 +948,51 @@ func stripCodeFence(s string) string {
 		return s
 	}
 	return strings.TrimSpace(inner[:end])
+}
+
+// handleGPGSign handles POST /api/gpg/sign — signs data using the host's GPG.
+// Request body contains the data to sign. Query params: key (signing key ID).
+// Returns the detached armored signature.
+func handleGPGSign() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "missing key query parameter", http.StatusBadRequest)
+			return
+		}
+
+		// Read the data to sign from the request body
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Call gpg to create a detached armored signature
+		// --batch: non-interactive
+		// --yes: overwrite
+		// -bsau <key>: detached sign with armor using specified key
+		// --status-fd 2: send status to stderr (for git compatibility)
+		cmd := exec.Command("gpg", "--batch", "--yes", "-bsau", key)
+		cmd.Stdin = strings.NewReader(string(data))
+
+		output, err := cmd.Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				slog.Error("gpg signing failed", "error", err, "stderr", string(exitErr.Stderr))
+				http.Error(w, "gpg signing failed: "+string(exitErr.Stderr), http.StatusInternalServerError)
+			} else {
+				http.Error(w, "gpg signing failed: "+err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/pgp-signature")
+		w.Write(output)
+	}
 }

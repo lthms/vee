@@ -15,3 +15,5 @@ install: build
 	cp -r plugins/vee $(DATADIR)/plugins/vee
 	install -d $(DATADIR)/modes
 	cp modes/*.md $(DATADIR)/modes/
+	install -d $(DATADIR)/scripts
+	install -m 755 scripts/* $(DATADIR)/scripts/

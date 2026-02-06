@@ -20,6 +20,20 @@ type EphemeralConfig struct {
 	Mounts     []MountSpec
 }
 
+// GitConfig holds the git user identity detected on the host.
+type GitConfig struct {
+	UserName  string // git config user.name
+	UserEmail string // git config user.email
+}
+
+// GPGSigningConfig holds the GPG signing configuration detected on the host.
+type GPGSigningConfig struct {
+	HomeDir    string // gpgconf --list-dirs homedir
+	SocketPath string // gpgconf --list-dirs agent-socket
+	SigningKey string // git config user.signingkey
+	GPGProgram string // git config gpg.program (optional)
+}
+
 // MountSpec describes a bind mount for the Docker container.
 type MountSpec struct {
 	Source string
@@ -50,6 +64,90 @@ func ephemeralAvailable() bool {
 		}
 	}
 	return true
+}
+
+// detectGitConfig reads the git user identity from host configuration.
+// Returns nil if no identity is configured.
+func detectGitConfig() *GitConfig {
+	cfg := &GitConfig{}
+
+	out, err := exec.Command("git", "config", "--get", "user.name").Output()
+	if err == nil {
+		cfg.UserName = strings.TrimSpace(string(out))
+	}
+	out, err = exec.Command("git", "config", "--get", "user.email").Output()
+	if err == nil {
+		cfg.UserEmail = strings.TrimSpace(string(out))
+	}
+
+	if cfg.UserName == "" && cfg.UserEmail == "" {
+		slog.Debug("no git user identity configured")
+		return nil
+	}
+
+	slog.Debug("detected git config", "user", cfg.UserName, "email", cfg.UserEmail)
+	return cfg
+}
+
+// detectGPGSigning checks whether the host has GPG signing configured and a
+// running agent. Returns nil if any requirement is missing (graceful degradation).
+func detectGPGSigning() *GPGSigningConfig {
+	// Check if commit.gpgsign is enabled
+	out, err := exec.Command("git", "config", "--get", "commit.gpgsign").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		slog.Debug("gpg signing not enabled in git config")
+		return nil
+	}
+
+	// Get GPG agent socket path
+	out, err = exec.Command("gpgconf", "--list-dirs", "agent-socket").Output()
+	if err != nil {
+		slog.Debug("gpgconf not available", "error", err)
+		return nil
+	}
+	socketPath := strings.TrimSpace(string(out))
+	if socketPath == "" {
+		slog.Debug("gpg agent socket path is empty")
+		return nil
+	}
+
+	// Check socket exists
+	if _, err := os.Stat(socketPath); err != nil {
+		slog.Debug("gpg agent socket not found", "path", socketPath, "error", err)
+		return nil
+	}
+
+	// Get GPG home directory
+	out, err = exec.Command("gpgconf", "--list-dirs", "homedir").Output()
+	if err != nil {
+		slog.Debug("failed to get gpg homedir", "error", err)
+		return nil
+	}
+	homeDir := strings.TrimSpace(string(out))
+	if homeDir == "" {
+		slog.Debug("gpg homedir is empty")
+		return nil
+	}
+
+	cfg := &GPGSigningConfig{
+		HomeDir:    homeDir,
+		SocketPath: socketPath,
+	}
+
+	if out, err = exec.Command("git", "config", "--get", "user.signingkey").Output(); err == nil {
+		cfg.SigningKey = strings.TrimSpace(string(out))
+	}
+	if out, err = exec.Command("git", "config", "--get", "gpg.program").Output(); err == nil {
+		cfg.GPGProgram = strings.TrimSpace(string(out))
+	}
+
+	slog.Debug("detected gpg signing config",
+		"homedir", cfg.HomeDir,
+		"socket", cfg.SocketPath,
+		"signingkey", cfg.SigningKey,
+		"gpg_program", cfg.GPGProgram)
+
+	return cfg
 }
 
 // ephemeralImageTag returns a deterministic image tag based on the project root path.
@@ -124,6 +222,17 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 		slog.Error("failed to write ephemeral settings", "error", err)
 	}
 
+	// Detect git identity and GPG signing configuration
+	gitCfg := detectGitConfig()
+	gpgCfg := detectGPGSigning()
+	var gitConfigFile string
+	if gitCfg != nil {
+		gitConfigFile, err = writeGitConfig(sessionID, gitCfg, gpgCfg)
+		if err != nil {
+			slog.Error("failed to write gitconfig", "error", err)
+		}
+	}
+
 	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
 	var claudeArgs []string
 	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, true, composeContents)
@@ -175,12 +284,17 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 		runParts = append(runParts, "-e", shelljoin(env))
 	}
 
+	// Git identity forwarding (when configured)
+	if gitConfigFile != "" {
+		runParts = append(runParts, "-v", shelljoin(gitConfigFile+":/etc/gitconfig:ro"))
+	}
+
 	// Extra args (passed verbatim)
 	for _, arg := range cfg.ExtraArgs {
 		runParts = append(runParts, shelljoin(arg))
 	}
 
-	// User mounts
+	// Overlay mounts (user mounts + GPG homedir)
 	type overlayMount struct {
 		target string
 		lower  string
@@ -188,8 +302,16 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 		work   string
 	}
 	var overlayMounts []overlayMount
+	overlayIndex := 0
 
-	for i, m := range cfg.Mounts {
+	// GPG signing uses the daemon's /api/gpg/sign endpoint via the wrapper script.
+	// Set the daemon port so the wrapper knows where to connect.
+	if gpgCfg != nil {
+		runParts = append(runParts, "-e", shelljoin(fmt.Sprintf("VEE_DAEMON_PORT=%d", port)))
+	}
+
+	// User mounts
+	for _, m := range cfg.Mounts {
 		src := expandHome(m.Source)
 		switch m.Mount {
 		case "ro":
@@ -197,7 +319,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 		case "rw":
 			runParts = append(runParts, "-v", shelljoin(src+":"+m.Target))
 		default: // "overlay" or empty
-			base := fmt.Sprintf("/overlay/%d", i)
+			base := fmt.Sprintf("/overlay/%d", overlayIndex)
 			lower := base + "/lower"
 			upper := base + "/upper"
 			work := base + "/work"
@@ -209,6 +331,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 			})
 			runParts = append(runParts, "-v", shelljoin(src+":"+lower+":ro"))
 			runParts = append(runParts, "--tmpfs", shelljoin(base))
+			overlayIndex++
 		}
 	}
 
@@ -368,5 +491,49 @@ func writeEphemeralSettings(sessionID string, port int) (string, error) {
 	}
 
 	slog.Debug("wrote ephemeral settings", "path", path, "session", sessionID, "hooks", "UserPromptSubmit,Stop,PostToolUseFailure,Notification")
+	return path, nil
+}
+
+// writeGitConfig writes a minimal .gitconfig file to the session temp dir.
+// It always includes user.name and user.email from gitCfg. When gpgCfg is
+// provided, it also adds signing configuration (signingkey, commit.gpgsign,
+// and optionally gpg.program).
+func writeGitConfig(sessionID string, gitCfg *GitConfig, gpgCfg *GPGSigningConfig) (string, error) {
+	dir := sessionTempDir(sessionID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("[user]\n")
+	if gitCfg.UserName != "" {
+		b.WriteString(fmt.Sprintf("\tname = %s\n", gitCfg.UserName))
+	}
+	if gitCfg.UserEmail != "" {
+		b.WriteString(fmt.Sprintf("\temail = %s\n", gitCfg.UserEmail))
+	}
+
+	// Add GPG signing configuration if available
+	// Uses the wrapper script that delegates to the Vee daemon's /api/gpg/sign endpoint
+	if gpgCfg != nil {
+		if gpgCfg.SigningKey != "" {
+			b.WriteString(fmt.Sprintf("\tsigningkey = %s\n", gpgCfg.SigningKey))
+		}
+		b.WriteString("[commit]\n")
+		b.WriteString("\tgpgsign = true\n")
+		b.WriteString("[gpg]\n")
+		b.WriteString("\tprogram = /opt/vee/scripts/gpg-sign-wrapper\n")
+	}
+
+	// Allow all directories to avoid "dubious ownership" errors in containers
+	b.WriteString("[safe]\n")
+	b.WriteString("\tdirectory = *\n")
+
+	path := filepath.Join(dir, "gitconfig")
+	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
+		return "", err
+	}
+
+	slog.Debug("wrote gitconfig", "path", path, "session", sessionID, "gpg", gpgCfg != nil)
 	return path, nil
 }

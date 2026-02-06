@@ -1,0 +1,71 @@
+#!/bin/sh
+# GPG wrapper for ephemeral sessions that delegates signing to the Vee daemon.
+# This script is used as gpg.program in the container's gitconfig.
+#
+# Git calls gpg with: gpg --status-fd=2 -bsau <key>
+# We intercept this and call the Vee daemon's /api/gpg/sign endpoint.
+
+set -e
+
+# Parse arguments to find the signing key
+# Git calls: gpg --status-fd=2 -bsau <KEY>
+# The -bsau combines -b -s -a -u, with KEY as the next argument
+KEY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u|--local-user)
+            KEY="$2"
+            shift 2
+            ;;
+        --local-user=*)
+            KEY="${1#--local-user=}"
+            shift
+            ;;
+        -u*)
+            KEY="${1#-u}"
+            shift
+            ;;
+        -*u)
+            # Combined flags ending in u (e.g., -bsau) — next arg is the key
+            KEY="$2"
+            shift 2
+            ;;
+        --status-fd=*|-b|-s|-a|--batch|--yes|--no-tty)
+            # Skip flags we don't need to pass through
+            shift
+            ;;
+        --status-fd)
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$KEY" ]; then
+    # No signing key means this is likely a verification request, not signing.
+    # Verification is not supported through the wrapper (would need the public keyring).
+    # Exit silently to avoid polluting git log output.
+    exit 1
+fi
+
+# Read data from stdin and send to the daemon
+DATA=$(cat)
+RESPONSE=$(printf '%s' "$DATA" | curl -sf -X POST \
+    "http://host.docker.internal:${VEE_DAEMON_PORT:-2700}/api/gpg/sign?key=${KEY}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @-)
+
+if [ $? -ne 0 ]; then
+    echo "gpg-sign-wrapper: signing request failed" >&2
+    exit 1
+fi
+
+# Git expects status messages on fd 2 before the signature
+# The format is: [GNUPG:] SIG_CREATED <type> <pk_algo> <hash_algo> <sig_class> <timestamp> <key_fpr>
+# Using placeholder values since git mainly just checks for the presence of SIG_CREATED
+echo "[GNUPG:] SIG_CREATED D 1 8 00 $(date +%s) 0000000000000000000000000000000000000000" >&2
+
+# Output the signature (git expects it on stdout)
+printf '%s\n' "$RESPONSE"

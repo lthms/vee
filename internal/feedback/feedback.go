@@ -10,7 +10,7 @@ import (
 // Entry represents a single feedback record.
 type Entry struct {
 	ID        string `json:"id"`
-	Mode      string `json:"mode"`
+	Profile   string `json:"profile"`
 	Kind      string `json:"kind"`
 	Statement string `json:"statement"`
 	Scope     string `json:"scope"`

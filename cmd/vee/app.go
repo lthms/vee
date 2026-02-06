@@ -102,7 +102,7 @@ func (a *App) Config() *AppConfig {
 // Session represents a Claude Code session (active or suspended).
 type Session struct {
 	ID              string    `json:"id"`
-	Mode            string    `json:"mode"`
+	Profile         string    `json:"profile"`
 	Indicator       string    `json:"indicator"`
 	StartedAt       time.Time `json:"started_at"`
 	Preview         string    `json:"preview"`
@@ -129,12 +129,12 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) *Session {
+func (s *sessionStore) create(id, profile, indicator, preview, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &Session{
 		ID:             id,
-		Mode:           mode,
+		Profile:        profile,
 		Indicator:      indicator,
 		StartedAt:      time.Now(),
 		Preview:        preview,

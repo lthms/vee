@@ -20,8 +20,8 @@ import (
 //go:embed prompts/*.md
 var promptFS embed.FS
 
-// Mode describes a Vee operating mode.
-type Mode struct {
+// Profile describes a Vee behavioral profile.
+type Profile struct {
 	Name              string
 	Indicator         string
 	Description       string
@@ -88,11 +88,11 @@ func waitForDaemon(timeout time.Duration) (int, error) {
 	return 0, fmt.Errorf("daemon did not start within %s", timeout)
 }
 
-// modeRegistry holds all known modes, keyed by name.
-var modeRegistry map[string]Mode
+// profileRegistry holds all known profiles, keyed by name.
+var profileRegistry map[string]Profile
 
-// modeOrder defines the display order, populated by initModeRegistry.
-var modeOrder []string
+// profileOrder defines the display order, populated by initProfileRegistry.
+var profileOrder []string
 
 // claudeArgs holds the arguments after "--" that are forwarded to claude.
 type claudeArgs []string
@@ -104,7 +104,7 @@ type CLI struct {
 	Daemon        DaemonCmd        `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
 	NewPane       NewPaneCmd       `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
 	Dashboard     DashboardCmd     `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
-	SessionPicker SessionPickerCmd `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive mode picker."`
+	SessionPicker SessionPickerCmd `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive profile picker."`
 	SuspendWindow  SuspendWindowCmd  `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
 	CompleteWindow CompleteWindowCmd `cmd:"" name:"_complete-window" hidden:"" help:"Internal: complete session by window."`
 	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
@@ -214,8 +214,8 @@ type ServeCmd struct {
 func (cmd *ServeCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
 
-	if err := initModeRegistry(cmd.VeePath); err != nil {
-		return fmt.Errorf("failed to init mode registry: %w", err)
+	if err := initProfileRegistry(cmd.VeePath); err != nil {
+		return fmt.Errorf("failed to init profile registry: %w", err)
 	}
 
 	projectConfig, err := readProjectConfig()
@@ -307,22 +307,22 @@ func (cmd *ServeCmd) Run(args claudeArgs) error {
 type NewPaneCmd struct {
 	VeePath    string `required:"" type:"path" name:"vee-path"`
 	Port       int    `short:"p" default:"2700" name:"port"`
-	Mode       string `required:"" name:"mode"`
+	Profile    string `required:"" name:"profile"`
 	Prompt     string `name:"prompt" help:"Initial prompt for the session."`
 	Ephemeral  bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
 	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
-// Run creates a new tmux window with a Claude session for the given mode.
+// Run creates a new tmux window with a Claude session for the given profile.
 func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
-	if err := initModeRegistry(cmd.VeePath); err != nil {
-		return fmt.Errorf("failed to init mode registry: %w", err)
+	if err := initProfileRegistry(cmd.VeePath); err != nil {
+		return fmt.Errorf("failed to init profile registry: %w", err)
 	}
 
-	mode, ok := modeRegistry[cmd.Mode]
+	profile, ok := profileRegistry[cmd.Profile]
 	if !ok {
-		return fmt.Errorf("unknown mode: %s", cmd.Mode)
+		return fmt.Errorf("unknown profile: %s", cmd.Profile)
 	}
 
 	veeBinary, err := os.Executable()
@@ -340,8 +340,8 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	// Generate session ID
 	sessionID := newUUID()
 
-	// Sample feedback for this mode
-	feedbackBlock := fetchFeedbackBlock(cmd.Port, mode.Name, appCfg.MaxExamples)
+	// Sample feedback for this profile
+	feedbackBlock := fetchFeedbackBlock(cmd.Port, profile.Name, appCfg.MaxExamples)
 
 	// Read compose file contents for prompt injection (if ephemeral + compose configured)
 	isEphemeral := cmd.Ephemeral
@@ -356,7 +356,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	}
 
 	// Compose system prompt (for storage — lets prompt viewer display it later)
-	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral, composeContents)
+	systemPrompt := composeSystemPrompt(profile.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral, composeContents)
 
 	var shellCmd string
 	if isEphemeral {
@@ -373,13 +373,13 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 				return fmt.Errorf("compose validation failed: %w", err)
 			}
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
 	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
+		sessionArgs := buildSessionArgs(sessionID, false, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
 	}
 
-	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
+	windowName := fmt.Sprintf("%s %s", profile.Indicator, profile.Name)
 
 	// Create the tmux window first so we have the window ID
 	windowID, err := tmuxNewWindow(windowName, shellCmd)
@@ -402,7 +402,7 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	}
 
 	// Register session with daemon, including the window target and system prompt
-	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, regComposePath, regComposeProject, systemPrompt); err != nil {
+	if err := registerSession(cmd.Port, sessionID, profile, windowID, isEphemeral, regComposePath, regComposeProject, systemPrompt); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -410,11 +410,11 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) error {
+func registerSession(port int, sessionID string, profile Profile, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) error {
 	payload, _ := json.Marshal(map[string]any{
 		"id":              sessionID,
-		"mode":            mode.Name,
-		"indicator":       mode.Indicator,
+		"profile":         profile.Name,
+		"indicator":       profile.Indicator,
 		"preview":         "",
 		"window_target":   windowTarget,
 		"ephemeral":       ephemeral,
@@ -538,7 +538,7 @@ func (cmd *ResumeMenuCmd) Run() error {
 	args := []string{"display-menu", "-T", "Resume Session"}
 
 	for _, sess := range state.Suspended {
-		label := fmt.Sprintf("⏣ ⊙ %s %s", sess.Indicator, sess.Mode)
+		label := fmt.Sprintf("⏣ ⊙ %s %s", sess.Indicator, sess.Profile)
 		if sess.Preview != "" {
 			preview := sess.Preview
 			if len(preview) > 40 {
@@ -547,8 +547,8 @@ func (cmd *ResumeMenuCmd) Run() error {
 			label += "  " + preview
 		}
 
-		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --mode %s --tmux-socket %s",
-			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Mode, tmuxSocketName)
+		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --profile %s --tmux-socket %s",
+			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Profile, tmuxSocketName)
 
 		args = append(args, label, "", "run-shell "+shelljoin(resumeCmd))
 	}
@@ -561,7 +561,7 @@ func (cmd *ResumeMenuCmd) Run() error {
 type ResumeSessionCmd struct {
 	Port       int    `short:"p" default:"2700" name:"port"`
 	SessionID  string `required:"" name:"session-id"`
-	Mode       string `required:"" name:"mode"`
+	Profile    string `required:"" name:"profile"`
 	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
@@ -574,36 +574,36 @@ func (cmd *ResumeSessionCmd) Run() error {
 		return fmt.Errorf("failed to resolve executable path: %w", err)
 	}
 
-	// Fetch config from daemon (needed for VeePath before loading modes).
+	// Fetch config from daemon (needed for VeePath before loading profiles).
 	cfg, err := fetchAppConfig(cmd.Port)
 	if err != nil {
 		return fmt.Errorf("failed to fetch config from daemon: %w", err)
 	}
 
-	if err := initModeRegistry(cfg.VeePath); err != nil {
-		return fmt.Errorf("failed to init mode registry: %w", err)
+	if err := initProfileRegistry(cfg.VeePath); err != nil {
+		return fmt.Errorf("failed to init profile registry: %w", err)
 	}
 
-	mode, ok := modeRegistry[cmd.Mode]
+	profile, ok := profileRegistry[cmd.Profile]
 	if !ok {
-		// Mode file may have been removed since the session was created.
+		// Profile file may have been removed since the session was created.
 		// Construct a minimal fallback — --resume strips the system prompt
 		// anyway, so the body isn't needed.
-		mode = Mode{
-			Name:      cmd.Mode,
+		profile = Profile{
+			Name:      cmd.Profile,
 			Indicator: "?",
 		}
 		// Try to recover the indicator from the stored session.
 		if sess, err := fetchSession(cmd.Port, cmd.SessionID); err == nil {
-			mode.Indicator = sess.Indicator
+			profile.Indicator = sess.Indicator
 		}
 	}
 
 	// Build claude args with --resume (feedback block is empty — system prompt is stripped on resume)
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, mode, cfg.ProjectConfig, cfg.IdentityRule, cfg.PlatformsRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
+	sessionArgs := buildSessionArgs(cmd.SessionID, true, profile, cfg.ProjectConfig, cfg.IdentityRule, cfg.PlatformsRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
 
 	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
-	windowName := fmt.Sprintf("%s %s", mode.Indicator, mode.Name)
+	windowName := fmt.Sprintf("%s %s", profile.Indicator, profile.Name)
 
 	windowID, err := tmuxNewWindow(windowName, shellCmd)
 	if err != nil {
@@ -729,7 +729,7 @@ func (cmd *ShutdownCmd) Run() error {
 				if sess.Ephemeral {
 					// Ephemeral sessions cannot be suspended — the daemon's
 					// /api/complete handler takes care of container + compose cleanup.
-					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "mode", sess.Mode)
+					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "profile", sess.Profile)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
 					r, err := http.Post(
 						fmt.Sprintf("http://127.0.0.1:%d/api/complete", cmd.Port),
@@ -740,7 +740,7 @@ func (cmd *ShutdownCmd) Run() error {
 						r.Body.Close()
 					}
 				} else {
-					slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
+					slog.Debug("shutdown: suspending session", "id", sess.ID, "profile", sess.Profile, "window", sess.WindowTarget)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
 					r, err := http.Post(
 						fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
@@ -940,7 +940,7 @@ func main() {
 	cli := CLI{}
 	parser, err := kong.New(&cli,
 		kong.Name("vee"),
-		kong.Description("A modal code assistant built on top of Claude Code."),
+		kong.Description("A session orchestrator for Claude Code."),
 		kong.UsageOnError(),
 		kong.Exit(func(code int) {
 			os.Exit(code)
@@ -1225,15 +1225,15 @@ func stripSystemPrompt(args []string) []string {
 
 // fetchFeedbackBlock calls the daemon's /api/feedback/sample endpoint and
 // formats the result as a prompt block. Returns "" if no entries are sampled.
-func fetchFeedbackBlock(port int, mode string, maxExamples int) string {
+func fetchFeedbackBlock(port int, profile string, maxExamples int) string {
 	if maxExamples <= 0 {
 		return ""
 	}
 
 	project, _ := filepath.Abs(".")
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/feedback/sample?mode=%s&project=%s&n=%d",
-		port, mode, project, maxExamples)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/feedback/sample?profile=%s&project=%s&n=%d",
+		port, profile, project, maxExamples)
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -1282,14 +1282,14 @@ func formatFeedbackBlock(entries []struct {
 }
 
 // buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, identityRule, platformsRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
+func buildSessionArgs(sessionID string, resume bool, profile Profile, projectConfig, identityRule, platformsRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
 	var args []string
 
 	if resume {
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false, "")
+		fullPrompt := composeSystemPrompt(profile.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false, "")
 		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}

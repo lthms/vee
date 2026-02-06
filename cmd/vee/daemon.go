@@ -92,7 +92,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		}, nil, nil
 	})
 
-	// Knowledge base tools — available to all modes
+	// Knowledge base tools — available to all profiles
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
 		Description: "Save a statement to the persistent knowledge base. The statement is queued for async duplicate detection and will be promoted to active once processed.",
@@ -145,11 +145,11 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		}, nil, nil
 	})
 
-	// Feedback tool — record mode-specific examples
+	// Feedback tool — record profile-specific examples
 	if fstore != nil {
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "feedback_record",
-			Description: "Record a good or bad example of mode behavior. The mode is inferred automatically from the current session.",
+			Description: "Record a good or bad example of profile behavior. The profile is inferred automatically from the current session.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, args feedbackRecordArgs) (*mcp.CallToolResult, any, error) {
 			slog.Debug("feedback_record called", "session", sessionID)
 
@@ -182,14 +182,14 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 
 			project, _ := os.Getwd()
 
-			id, err := fstore.Record(sess.Mode, args.Kind, args.Statement, args.Scope, project)
+			id, err := fstore.Record(sess.Profile, args.Kind, args.Statement, args.Scope, project)
 			if err != nil {
 				return nil, nil, fmt.Errorf("feedback_record: %w", err)
 			}
 
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: fmt.Sprintf("Feedback recorded (id: %s, mode: %s, kind: %s, scope: %s)", id, sess.Mode, args.Kind, args.Scope)},
+					&mcp.TextContent{Text: fmt.Sprintf("Feedback recorded (id: %s, profile: %s, kind: %s, scope: %s)", id, sess.Profile, args.Kind, args.Scope)},
 				},
 			}, nil, nil
 		})
@@ -285,7 +285,7 @@ func cleanupEphemeralSession(sess *Session) {
 func handleSessions(app *App) http.HandlerFunc {
 	type createReq struct {
 		ID             string `json:"id"`
-		Mode           string `json:"mode"`
+		Profile        string `json:"profile"`
 		Indicator      string `json:"indicator"`
 		Preview        string `json:"preview"`
 		WindowTarget   string `json:"window_target"`
@@ -307,8 +307,8 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.ComposePath, req.ComposeProject, req.SystemPrompt)
-		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
+		app.Sessions.create(req.ID, req.Profile, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.ComposePath, req.ComposeProject, req.SystemPrompt)
+		slog.Debug("session registered via API", "id", req.ID, "profile", req.Profile, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -883,14 +883,14 @@ func handleSessionPrompt(app *App) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"mode":          sess.Mode,
+			"profile":       sess.Profile,
 			"indicator":     sess.Indicator,
 			"system_prompt": sess.SystemPrompt,
 		})
 	}
 }
 
-// handleFeedbackSample handles GET /api/feedback/sample?mode=<mode>&project=<project>&n=<n>.
+// handleFeedbackSample handles GET /api/feedback/sample?profile=<profile>&project=<project>&n=<n>.
 // Returns a JSON array of sampled feedback entries.
 func handleFeedbackSample(fstore *feedback.Store, app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -899,9 +899,9 @@ func handleFeedbackSample(fstore *feedback.Store, app *App) http.HandlerFunc {
 			return
 		}
 
-		mode := r.URL.Query().Get("mode")
-		if mode == "" {
-			http.Error(w, "missing mode query parameter", http.StatusBadRequest)
+		profile := r.URL.Query().Get("profile")
+		if profile == "" {
+			http.Error(w, "missing profile query parameter", http.StatusBadRequest)
 			return
 		}
 
@@ -914,7 +914,7 @@ func handleFeedbackSample(fstore *feedback.Store, app *App) http.HandlerFunc {
 			}
 		}
 
-		entries, err := fstore.Sample(mode, project, n)
+		entries, err := fstore.Sample(profile, project, n)
 		if err != nil {
 			http.Error(w, "sample failed: "+err.Error(), http.StatusInternalServerError)
 			return

@@ -25,7 +25,7 @@ type UserConfig struct {
 	Feedback  FeedbackConfig
 }
 
-// FeedbackConfig configures mode feedback sampling.
+// FeedbackConfig configures profile feedback sampling.
 type FeedbackConfig struct {
 	MaxExamples int
 }

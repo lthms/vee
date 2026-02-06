@@ -38,9 +38,9 @@ func TestBuildEphemeralShellCmdWithCompose(t *testing.T) {
 		Compose:    "docker-compose.yml",
 	}
 	sessionID := "test-session-123"
-	mode := Mode{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
+	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
 
-	cmd := buildEphemeralShellCmd(cfg, sessionID, mode, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
+	cmd := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
 
 	// Should contain docker compose up prefix
 	if !strings.Contains(cmd, "docker compose -f .vee/docker-compose.yml -p vee-test-session-123 up -d --build") {
@@ -70,9 +70,9 @@ func TestBuildEphemeralShellCmdWithoutCompose(t *testing.T) {
 		Dockerfile: "Dockerfile",
 	}
 	sessionID := "test-session-456"
-	mode := Mode{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
+	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
 
-	cmd := buildEphemeralShellCmd(cfg, sessionID, mode, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
+	cmd := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
 
 	// Should NOT contain docker compose commands
 	if strings.Contains(cmd, "docker compose") {
@@ -285,9 +285,9 @@ func TestBuildEphemeralShellCmdWithoutGPGSigning(t *testing.T) {
 		Dockerfile: "Dockerfile",
 	}
 	sessionID := "no-gpg-test"
-	mode := Mode{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
+	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
 
-	cmd := buildEphemeralShellCmd(cfg, sessionID, mode, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
+	cmd := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
 
 	// On most test environments, GPG signing is not configured
 	// so we should not see GPG-related mounts or env vars.

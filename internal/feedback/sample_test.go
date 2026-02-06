@@ -18,12 +18,12 @@ func openTestStore(t *testing.T) *Store {
 	return s
 }
 
-func insertWithDate(t *testing.T, s *Store, mode, kind, statement, scope, project, date string) {
+func insertWithDate(t *testing.T, s *Store, profile, kind, statement, scope, project, date string) {
 	t.Helper()
 	id := newUUID()
 	_, err := s.db.Exec(
-		`INSERT INTO feedback (id, mode, kind, statement, scope, project, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, mode, kind, statement, scope, project, date,
+		`INSERT INTO feedback (id, profile, kind, statement, scope, project, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, profile, kind, statement, scope, project, date,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -10,14 +10,14 @@ import (
 )
 
 // SessionPickerCmd is the internal subcommand that shows an interactive
-// mode picker with a prompt input, rendered inside tmux display-popup.
+// profile picker with a prompt input, rendered inside tmux display-popup.
 type SessionPickerCmd struct {
 	VeePath    string `required:"" type:"path" name:"vee-path"`
 	Port       int    `short:"p" default:"2700" name:"port"`
 	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
-type pickerMode struct {
+type pickerProfile struct {
 	name              string
 	indicator         string
 	desc              string
@@ -27,22 +27,22 @@ type pickerMode struct {
 
 func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	tmuxSocketName = cmd.TmuxSocket
-	if err := initModeRegistry(cmd.VeePath); err != nil {
+	if err := initProfileRegistry(cmd.VeePath); err != nil {
 		return err
 	}
 
-	var modes []pickerMode
-	for _, name := range modeOrder {
-		mode, ok := modeRegistry[name]
+	var profiles []pickerProfile
+	for _, name := range profileOrder {
+		profile, ok := profileRegistry[name]
 		if !ok {
 			continue
 		}
-		modes = append(modes, pickerMode{
+		profiles = append(profiles, pickerProfile{
 			name:              name,
-			indicator:         mode.Indicator,
-			desc:              mode.Description,
-			defaultPrompt:     mode.DefaultPrompt,
-			promptPlaceholder: mode.PromptPlaceholder,
+			indicator:         profile.Indicator,
+			desc:              profile.Description,
+			defaultPrompt:     profile.DefaultPrompt,
+			promptPlaceholder: profile.PromptPlaceholder,
 		})
 	}
 
@@ -58,7 +58,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	canEphemeral := ephemeralAvailable()
 
 	maxNameLen := 0
-	for _, m := range modes {
+	for _, m := range profiles {
 		if len(m.name) > maxNameLen {
 			maxNameLen = len(m.name)
 		}
@@ -70,7 +70,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 
 		sb.WriteString("\r\n  \033[1m\033[38;2;137;180;250mNew Session\033[0m\r\n\r\n")
 
-		for i, m := range modes {
+		for i, m := range profiles {
 			if i == selected {
 				sb.WriteString("  \033[38;2;137;180;250m>\033[0m ")
 			} else {
@@ -99,7 +99,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			sb.WriteString("\r\n")
 		}
 
-		cur := modes[selected]
+		cur := profiles[selected]
 		staticDefault := cur.defaultPrompt != "" && !strings.Contains(cur.defaultPrompt, "{}")
 		if staticDefault {
 			// No user input needed — show the fixed prompt dimmed
@@ -145,7 +145,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 
 		input := buf[:n]
 
-		cur := modes[selected]
+		cur := profiles[selected]
 		isStatic := cur.defaultPrompt != "" && !strings.Contains(cur.defaultPrompt, "{}")
 
 		if len(input) == 1 {
@@ -156,13 +156,13 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 			case 10, 13: // Enter (LF or CR)
 				fmt.Print("\033[?25h")
 				term.Restore(int(os.Stdin.Fd()), oldState)
-				return cmd.createSession(modes[selected], prompt, ephemeral, args)
+				return cmd.createSession(profiles[selected], prompt, ephemeral, args)
 			case 5: // C-e
 				if canEphemeral {
 					ephemeral = !ephemeral
 				}
 			case 14: // C-n
-				if selected < len(modes)-1 {
+				if selected < len(profiles)-1 {
 					selected++
 				}
 			case 16: // C-p
@@ -200,7 +200,7 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 					selected--
 				}
 			case 66: // Down
-				if selected < len(modes)-1 {
+				if selected < len(profiles)-1 {
 					selected++
 				}
 			}
@@ -214,13 +214,13 @@ func (cmd *SessionPickerCmd) Run(args claudeArgs) error {
 	}
 }
 
-func (cmd *SessionPickerCmd) createSession(mode pickerMode, prompt string, ephemeral bool, args claudeArgs) error {
+func (cmd *SessionPickerCmd) createSession(profile pickerProfile, prompt string, ephemeral bool, args claudeArgs) error {
 	// Template expansion: resolve the final prompt from default_prompt + user input.
-	if mode.defaultPrompt != "" {
-		if strings.Contains(mode.defaultPrompt, "{}") {
-			prompt = strings.Replace(mode.defaultPrompt, "{}", prompt, 1)
+	if profile.defaultPrompt != "" {
+		if strings.Contains(profile.defaultPrompt, "{}") {
+			prompt = strings.Replace(profile.defaultPrompt, "{}", prompt, 1)
 		} else {
-			prompt = mode.defaultPrompt
+			prompt = profile.defaultPrompt
 		}
 	}
 
@@ -235,7 +235,7 @@ func (cmd *SessionPickerCmd) createSession(mode pickerMode, prompt string, ephem
 	cmdParts = append(cmdParts, "--vee-path", cmd.VeePath)
 	cmdParts = append(cmdParts, "--port", fmt.Sprintf("%d", cmd.Port))
 	cmdParts = append(cmdParts, "--tmux-socket", tmuxSocketName)
-	cmdParts = append(cmdParts, "--mode", mode.name)
+	cmdParts = append(cmdParts, "--profile", profile.name)
 	if prompt != "" {
 		cmdParts = append(cmdParts, "--prompt", prompt)
 	}

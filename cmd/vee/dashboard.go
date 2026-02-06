@@ -116,7 +116,7 @@ func (cmd *DashboardCmd) render(state *dashboardState) {
 	sb.WriteString("Vee")
 	sb.WriteString(ansiReset)
 	sb.WriteString(ansiDim)
-	sb.WriteString(" — Modal Code Assistant")
+	sb.WriteString(" — Session Orchestrator")
 	sb.WriteString(ansiReset)
 
 	if state != nil && state.IssueCount > 0 {
@@ -198,11 +198,11 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 	for _, sess := range sessions {
 		age := formatAge(time.Since(sess.StartedAt))
 
-		// Layout: indent(4) + ⏣(1) + space(1) + indicator(2) + space(1) + mode + gap + preview + gap + age
+		// Layout: indent(4) + ⏣(1) + space(1) + indicator(2) + space(1) + profile + gap + preview + gap + age
 		const indent = 4
 		const badgeWidth = 1    // ephemeral(1)
 		const indicatorWidth = 2 // emoji
-		leftFixed := indent + badgeWidth + 1 + indicatorWidth + 1 + len(sess.Mode)
+		leftFixed := indent + badgeWidth + 1 + indicatorWidth + 1 + len(sess.Profile)
 		rightFixed := len(age) + 2 // +2 for right margin
 
 		sb.WriteString("    ")
@@ -216,18 +216,18 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 		sb.WriteString("⏣")
 		sb.WriteString(ansiReset)
 
-		// Indicator + mode name
+		// Indicator + profile name
 		sb.WriteString(" ")
 		sb.WriteString(color)
 		sb.WriteString(sess.Indicator)
 		sb.WriteString(" ")
 		sb.WriteString(ansiBold)
-		sb.WriteString(sess.Mode)
+		sb.WriteString(sess.Profile)
 		sb.WriteString(ansiReset)
 
 		usedWidth := leftFixed
 
-		// Preview (between mode and age)
+		// Preview (between profile and age)
 		if sess.Preview != "" {
 			maxPreview := termWidth - leftFixed - rightFixed - 4
 			if maxPreview > 3 {

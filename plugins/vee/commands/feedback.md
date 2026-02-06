@@ -1,10 +1,10 @@
 ---
-description: Record mode feedback (positive or negative example)
+description: Record profile feedback (positive or negative example)
 user-invocable: true
 allowed-args: true
 ---
 
-The user wants to record feedback about the current mode's behavior.
+The user wants to record feedback about the current profile's behavior.
 Their input: `$ARGUMENTS`
 
 Your job is to collaborate with the user to craft a concise, actionable

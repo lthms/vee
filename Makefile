@@ -13,7 +13,7 @@ install: build
 	rm -rf $(DATADIR)/plugins/vee
 	install -d $(DATADIR)/plugins
 	cp -r plugins/vee $(DATADIR)/plugins/vee
-	install -d $(DATADIR)/modes
-	cp modes/*.md $(DATADIR)/modes/
+	install -d $(DATADIR)/profiles
+	cp profiles/*.md $(DATADIR)/profiles/
 	install -d $(DATADIR)/scripts
 	install -m 755 scripts/* $(DATADIR)/scripts/

@@ -23,7 +23,7 @@ type promptViewerState struct {
 	scroll     int
 	termWidth  int
 	termHeight int
-	mode       string
+	profile    string
 	indicator  string
 }
 
@@ -64,7 +64,7 @@ func (cmd *PromptViewerCmd) Run() error {
 	}
 
 	var result struct {
-		Mode         string `json:"mode"`
+		Profile      string `json:"profile"`
 		Indicator    string `json:"indicator"`
 		SystemPrompt string `json:"system_prompt"`
 	}
@@ -83,7 +83,7 @@ func (cmd *PromptViewerCmd) Run() error {
 		lines:      renderPromptLines(result.SystemPrompt, w-2),
 		termWidth:  w,
 		termHeight: h,
-		mode:       result.Mode,
+		profile:    result.Profile,
 		indicator:  result.Indicator,
 	}
 
@@ -181,7 +181,7 @@ func (ps *promptViewerState) render() {
 	}
 
 	// Header
-	title := fmt.Sprintf(" %s %s — System Prompt", ps.indicator, ps.mode)
+	title := fmt.Sprintf(" %s %s — System Prompt", ps.indicator, ps.profile)
 	sb.WriteString("\033[1m\033[38;2;137;180;250m") // bold, accent blue
 	sb.WriteString(truncateLine(title, w))
 	sb.WriteString("\033[0m\r\n")

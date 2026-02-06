@@ -6,15 +6,15 @@ import (
 	"time"
 )
 
-// Sample returns up to n feedback entries for the given mode, with recency bias.
-// Entries are selected where mode matches AND (scope='user' OR (scope='project' AND project matches)).
-func (s *Store) Sample(mode, project string, n int) ([]Entry, error) {
+// Sample returns up to n feedback entries for the given profile, with recency bias.
+// Entries are selected where profile matches AND (scope='user' OR (scope='project' AND project matches)).
+func (s *Store) Sample(profile, project string, n int) ([]Entry, error) {
 	rows, err := s.db.Query(
-		`SELECT id, mode, kind, statement, scope, project, created_at
+		`SELECT id, profile, kind, statement, scope, project, created_at
 		 FROM feedback
-		 WHERE mode = ?
+		 WHERE profile = ?
 		   AND (scope = 'user' OR (scope = 'project' AND project = ?))`,
-		mode, project,
+		profile, project,
 	)
 	if err != nil {
 		return nil, err
@@ -24,7 +24,7 @@ func (s *Store) Sample(mode, project string, n int) ([]Entry, error) {
 	var entries []Entry
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.ID, &e.Mode, &e.Kind, &e.Statement, &e.Scope, &e.Project, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Profile, &e.Kind, &e.Statement, &e.Scope, &e.Project, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)

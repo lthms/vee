@@ -7,14 +7,14 @@ import (
 )
 
 // Record inserts a new feedback entry and returns its ID.
-func (s *Store) Record(mode, kind, statement, scope, project string) (string, error) {
+func (s *Store) Record(profile, kind, statement, scope, project string) (string, error) {
 	id := newUUID()
 	createdAt := time.Now().Format("2006-01-02")
 
 	_, err := s.db.Exec(
-		`INSERT INTO feedback (id, mode, kind, statement, scope, project, created_at)
+		`INSERT INTO feedback (id, profile, kind, statement, scope, project, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, mode, kind, statement, scope, project, createdAt,
+		id, profile, kind, statement, scope, project, createdAt,
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert feedback: %w", err)

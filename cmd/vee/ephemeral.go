@@ -14,6 +14,7 @@ import (
 // EphemeralConfig holds the [ephemeral] section of .vee/config.
 type EphemeralConfig struct {
 	Dockerfile string
+	Compose    string
 	Env        []string
 	ExtraArgs  []string
 	Mounts     []MountSpec
@@ -27,7 +28,8 @@ type MountSpec struct {
 }
 
 // ephemeralAvailable returns true if .vee/config exists with an [ephemeral]
-// section and the docker binary is on PATH.
+// section and the docker binary is on PATH. When compose is configured, it
+// also verifies that `docker compose` is available.
 func ephemeralAvailable() bool {
 	cfg, err := readProjectTOML()
 	if err != nil {
@@ -37,7 +39,17 @@ func ephemeralAvailable() bool {
 		return false
 	}
 	_, err = exec.LookPath("docker")
-	return err == nil
+	if err != nil {
+		return false
+	}
+	if cfg.Ephemeral.Compose != "" {
+		out, err := exec.Command("docker", "compose", "version").CombinedOutput()
+		if err != nil {
+			slog.Debug("docker compose not available", "error", err, "output", string(out))
+			return false
+		}
+	}
+	return true
 }
 
 // ephemeralImageTag returns a deterministic image tag based on the project root path.
@@ -72,6 +84,27 @@ func dockerfilePath(cfg *EphemeralConfig) string {
 		df = "Dockerfile"
 	}
 	return filepath.Join(".vee", df)
+}
+
+// composePath returns the path to the Compose file, relative to .vee/.
+func composePath(cfg *EphemeralConfig) string {
+	return filepath.Join(".vee", cfg.Compose)
+}
+
+// validateComposeFile runs `docker compose config` as a preflight check.
+func validateComposeFile(path string) error {
+	cmd := exec.Command("docker", "compose", "-f", path, "config", "--quiet")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("invalid compose file %s: %s", path, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// composeProjectName derives a Compose-safe project name from a session ID.
+// Compose project names must match [a-z0-9][a-z0-9_-]*.
+func composeProjectName(sessionID string) string {
+	return "vee-" + sessionID
 }
 
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:

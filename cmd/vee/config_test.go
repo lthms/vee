@@ -321,6 +321,38 @@ func TestHydrateProjectConfig(t *testing.T) {
 	}
 }
 
+func TestHydrateProjectConfigCompose(t *testing.T) {
+	m := map[string][]string{
+		"ephemeral.dockerfile": {"Dockerfile"},
+		"ephemeral.compose":    {"docker-compose.yml"},
+	}
+
+	cfg := hydrateProjectConfig(m)
+	if cfg.Ephemeral == nil {
+		t.Fatal("expected non-nil Ephemeral")
+	}
+	if cfg.Ephemeral.Compose != "docker-compose.yml" {
+		t.Errorf("Compose = %q, want %q", cfg.Ephemeral.Compose, "docker-compose.yml")
+	}
+	if cfg.Ephemeral.Dockerfile != "Dockerfile" {
+		t.Errorf("Dockerfile = %q, want %q", cfg.Ephemeral.Dockerfile, "Dockerfile")
+	}
+}
+
+func TestHydrateProjectConfigComposeOnly(t *testing.T) {
+	m := map[string][]string{
+		"ephemeral.compose": {"compose.yml"},
+	}
+
+	cfg := hydrateProjectConfig(m)
+	if cfg.Ephemeral == nil {
+		t.Fatal("expected non-nil Ephemeral")
+	}
+	if cfg.Ephemeral.Compose != "compose.yml" {
+		t.Errorf("Compose = %q, want %q", cfg.Ephemeral.Compose, "compose.yml")
+	}
+}
+
 func TestHydrateUserConfig(t *testing.T) {
 	m := map[string][]string{
 		"embedding.model":      {"mxbai-embed-large"},

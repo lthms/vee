@@ -262,6 +262,12 @@ func hydrateProjectConfig(m map[string][]string) *ProjectConfig {
 		}
 		cfg.Ephemeral.Dockerfile = df
 	}
+	if compose := lastValue(m, "ephemeral.compose"); compose != "" {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		cfg.Ephemeral.Compose = compose
+	}
 	if envs := m["ephemeral.env"]; len(envs) > 0 {
 		if cfg.Ephemeral == nil {
 			cfg.Ephemeral = &EphemeralConfig{}

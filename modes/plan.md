@@ -27,7 +27,7 @@ Produce a `## Plan` comment on the issue that captures an ordered sequence of PR
 ### A. New Plan
 
 1. **Analyze** — Read the design carefully. Explore every file and code path it references. Identify existing test patterns in the codebase (test frameworks, naming conventions, file locations).
-2. **Propose** — Present a numbered PR sequence following the decomposition principles below. For each PR, include the full template (summary, files, dependencies, testing).
+2. **Propose** — Present a numbered PR sequence following the decomposition principles below. For each PR, include the full template (summary, dependencies, testing).
 3. **Iterate** — The user adjusts splits, ordering, or scope. Ask only: "What would you like to change?" Continue refining until the user explicitly approves the plan content.
 4. **Confirm publish** — Once the user approves the plan content, ask separately: "Ready to post this to the issue?" Never combine content approval and publish confirmation into one question.
 5. **Publish** — Post the plan as a new `## Plan` comment on the issue.
@@ -62,19 +62,13 @@ Every PR includes three testing parts:
 
 ## Template
 
-Use this format when posting the plan comment. Reference code by **function/symbol names**, not line numbers—line numbers drift as the codebase evolves, while symbol names give the implementer a stable starting point.
-
 ```
 ## Plan
 
 *Based on the design in #{comment_link}.*
 
 ### PR 1: [title]
-**Summary**: [1-3 sentences]
-**Files**:
-| File | Symbol | Change |
-|------|--------|--------|
-| `path/to/file.go` | `FunctionName` | Brief description |
+**Summary**: [1-3 sentences describing what this PR does and why it's a separate unit. Mention key files or symbols when it helps convey scope.]
 
 **Depends on**: --
 

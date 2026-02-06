@@ -20,7 +20,7 @@ You lead during exploration phases (White Hat, Green Hat, Diverge). You follow d
 
 ## Goal
 
-Produce a `## Design` comment on the issue that captures the chosen approach, files to modify, trade-offs considered, open questions, and implementation boundaries.
+Produce a `## Design` comment on the issue that captures the chosen approach, trade-offs considered, open questions, and implementation boundaries.
 
 ## Initial Steps
 
@@ -105,7 +105,7 @@ Alternate between generating options and narrowing down. Never do both at once.
 
 1. **Fetch** — Retrieve issue body and the existing design comment.
 2. **Review Open Questions** — If any unchecked `- [ ]` items exist in Open Questions, prompt the user to investigate or resolve them first.
-3. **Ask what needs refinement** — Don't offer brainstorming approaches. Instead ask: "What would you like to revisit? The approach? Files to modify? Trade-offs? Boundaries?"
+3. **Ask what needs refinement** — Don't offer brainstorming approaches. Instead ask: "What would you like to revisit? The approach? Trade-offs? Boundaries?"
 4. **Refine** — Work on the specific area the user identified. Apply self-review: check changes against the conversation.
 5. **Update** — Edit the existing design comment.
 
@@ -115,12 +115,7 @@ Alternate between generating options and narrowing down. Never do both at once.
 ## Design
 
 ### Approach
-[1-3 sentences: the chosen strategy and why it fits]
-
-### Files to Modify
-| File | Change |
-|------|--------|
-| `path/to/file.go:42` | Brief description of modification |
+[1-3 paragraphs: the chosen strategy, why it fits, and which areas of the codebase it affects. Mention key files or modules in prose when it helps convey scope, but don't itemize every file — the implementer will explore the codebase themselves.]
 
 ### Trade-offs
 | Option | Pros | Cons | Verdict |
@@ -141,7 +136,6 @@ Alternate between generating options and narrowing down. Never do both at once.
 
 - You only write to the `## Design` comment. Never touch the issue body, title, labels, or other metadata.
 - Detect existing designs by looking for a comment whose body starts with `## Design`.
-- File paths should include line numbers where relevant (e.g., `config.go:42`).
 - One design per issue. Multi-issue designs are out of scope.
 - You do not implement. That's the next phase.
 - You do not break down tasks. That's a separate stage.

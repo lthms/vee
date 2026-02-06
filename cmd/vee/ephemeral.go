@@ -110,7 +110,7 @@ func composeProjectName(sessionID string) string {
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
 //
 //	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, platformsRule, feedbackBlock, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
+func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, projectConfig, identityRule, platformsRule, feedbackBlock, composeContents, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
 	tag := ephemeralImageTag()
 	df := dockerfilePath(cfg)
 
@@ -126,7 +126,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 
 	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
 	var claudeArgs []string
-	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, true)
+	fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, true, composeContents)
 	claudeArgs = buildArgs(passthrough, fullPrompt)
 	claudeArgs = append(claudeArgs, "--session-id", sessionID)
 	if mcpConfigFile != "" {
@@ -141,12 +141,26 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 	// Build command
 	buildCmd := fmt.Sprintf("docker build -t %s -f %s .", shelljoin(tag), shelljoin(df))
 
+	// Compose lifecycle prefix
+	var composeUpCmd string
+	project := composeProjectName(sessionID)
+	if cfg.Compose != "" {
+		cp := composePath(cfg)
+		composeUpCmd = fmt.Sprintf("docker compose -f %s -p %s up -d --build",
+			shelljoin(cp), shelljoin(project))
+	}
+
 	// Docker run arguments
 	var runParts []string
 	runParts = append(runParts, "docker", "run", "--rm", "-it", "--init")
 	runParts = append(runParts, "--entrypoint", "''")
 	runParts = append(runParts, "--name", shelljoin("vee-"+sessionID))
 	runParts = append(runParts, "--add-host", "host.docker.internal:host-gateway")
+
+	// Connect to Compose network when compose is configured
+	if cfg.Compose != "" {
+		runParts = append(runParts, "--network", shelljoin(project+"_default"))
+	}
 
 	// Mount the session temp dir (MCP config + settings)
 	tmpDir := sessionTempDir(sessionID)
@@ -234,8 +248,19 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 	// Cleanup command — runs on host after Docker exits
 	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s --wait-for-user",
 		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
+	if cfg.Compose != "" {
+		cleanupCmd += fmt.Sprintf(" --compose-path %s --compose-project %s",
+			shelljoin(composePath(cfg)), shelljoin(project))
+	}
 
-	return "printf '\\033[?25h'; " + buildCmd + " && " + runCmd + "; " + cleanupCmd
+	// Assemble the full command chain
+	var chain string
+	if composeUpCmd != "" {
+		chain = "printf '\\033[?25h'; " + composeUpCmd + " && " + buildCmd + " && " + runCmd + "; " + cleanupCmd
+	} else {
+		chain = "printf '\\033[?25h'; " + buildCmd + " && " + runCmd + "; " + cleanupCmd
+	}
+	return chain
 }
 
 // writeMCPConfigDocker writes an MCP config file that uses host.docker.internal

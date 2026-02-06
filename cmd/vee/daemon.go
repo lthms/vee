@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -251,16 +252,45 @@ func handleState(app *App, kbase *kb.KnowledgeBase) http.HandlerFunc {
 	}
 }
 
+// cleanupEphemeralSession tears down all resources associated with an ephemeral session:
+// the Docker container, the Compose stack (if any), and the per-session temp directory.
+// Safe to call when resources are already gone (all steps are best-effort).
+func cleanupEphemeralSession(sess *Session) {
+	// 1. Kill the container (may already be dead from --rm)
+	dockerKill := exec.Command("docker", "kill", "vee-"+sess.ID)
+	dockerKill.Run()
+	slog.Debug("ephemeral cleanup: docker kill", "session", sess.ID)
+
+	// 2. Tear down Compose stack if one was started
+	if sess.ComposePath != "" && sess.ComposeProject != "" {
+		slog.Debug("ephemeral cleanup: compose down", "session", sess.ID, "path", sess.ComposePath, "project", sess.ComposeProject)
+		down := exec.Command("docker", "compose", "-f", sess.ComposePath, "-p", sess.ComposeProject, "down")
+		if err := down.Run(); err != nil {
+			slog.Warn("ephemeral cleanup: compose down failed", "session", sess.ID, "error", err)
+		}
+	}
+
+	// 3. Remove per-session temp directory
+	dir := sessionTempDir(sess.ID)
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("ephemeral cleanup: failed to remove temp dir", "session", sess.ID, "dir", dir, "error", err)
+	} else {
+		slog.Debug("ephemeral cleanup: removed temp dir", "session", sess.ID, "dir", dir)
+	}
+}
+
 // handleSessions handles POST /api/sessions to register a new session.
 func handleSessions(app *App) http.HandlerFunc {
 	type createReq struct {
-		ID           string `json:"id"`
-		Mode         string `json:"mode"`
-		Indicator    string `json:"indicator"`
-		Preview      string `json:"preview"`
-		WindowTarget string `json:"window_target"`
-		Ephemeral    bool   `json:"ephemeral"`
-		SystemPrompt string `json:"system_prompt"`
+		ID             string `json:"id"`
+		Mode           string `json:"mode"`
+		Indicator      string `json:"indicator"`
+		Preview        string `json:"preview"`
+		WindowTarget   string `json:"window_target"`
+		Ephemeral      bool   `json:"ephemeral"`
+		ComposePath    string `json:"compose_path"`
+		ComposeProject string `json:"compose_project"`
+		SystemPrompt   string `json:"system_prompt"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -275,7 +305,7 @@ func handleSessions(app *App) http.HandlerFunc {
 			return
 		}
 
-		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.SystemPrompt)
+		app.Sessions.create(req.ID, req.Mode, req.Indicator, req.Preview, req.WindowTarget, req.Ephemeral, req.ComposePath, req.ComposeProject, req.SystemPrompt)
 		slog.Debug("session registered via API", "id", req.ID, "mode", req.Mode, "window", req.WindowTarget, "ephemeral", req.Ephemeral)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -331,6 +361,7 @@ func handleSuspend(app *App) http.HandlerFunc {
 		if sess.Ephemeral {
 			app.Sessions.setStatus(sess.ID, "completed")
 			slog.Debug("ephemeral session completed via suspend API", "id", sess.ID, "window", req.WindowTarget)
+			go cleanupEphemeralSession(sess)
 			if req.WindowTarget != "" {
 				go tmuxGracefulClose(req.WindowTarget)
 			}
@@ -377,6 +408,10 @@ func handleComplete(app *App) http.HandlerFunc {
 
 		app.Sessions.setStatus(sess.ID, "completed")
 		slog.Debug("session completed via API", "id", sess.ID, "window", req.WindowTarget)
+
+		if sess.Ephemeral {
+			go cleanupEphemeralSession(sess)
+		}
 
 		if req.WindowTarget != "" {
 			go tmuxGracefulClose(req.WindowTarget)
@@ -476,6 +511,9 @@ func handleSessionEnded(app *App) http.HandlerFunc {
 		if sess.Status == "active" {
 			app.Sessions.setStatus(req.SessionID, "completed")
 			slog.Debug("session ended (process exited)", "id", req.SessionID)
+			if sess.Ephemeral {
+				go cleanupEphemeralSession(sess)
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")

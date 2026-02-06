@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -344,9 +343,20 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 	// Sample feedback for this mode
 	feedbackBlock := fetchFeedbackBlock(cmd.Port, mode.Name, appCfg.MaxExamples)
 
-	// Compose system prompt (for storage — lets prompt viewer display it later)
+	// Read compose file contents for prompt injection (if ephemeral + compose configured)
 	isEphemeral := cmd.Ephemeral
-	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral)
+	var composeContents string
+	if isEphemeral {
+		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
+			cp := composePath(cfg.Ephemeral)
+			if data, err := os.ReadFile(cp); err == nil {
+				composeContents = string(data)
+			}
+		}
+	}
+
+	// Compose system prompt (for storage — lets prompt viewer display it later)
+	systemPrompt := composeSystemPrompt(mode.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral, composeContents)
 
 	var shellCmd string
 	if isEphemeral {
@@ -357,7 +367,13 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		if cfg.Ephemeral == nil {
 			return fmt.Errorf("no [ephemeral] section in .vee/config")
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+		if cfg.Ephemeral.Compose != "" {
+			cp := composePath(cfg.Ephemeral)
+			if err := validateComposeFile(cp); err != nil {
+				return fmt.Errorf("compose validation failed: %w", err)
+			}
+		}
+		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
 	} else {
 		sessionArgs := buildSessionArgs(sessionID, false, mode, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
@@ -376,8 +392,17 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
 	}
 
+	// Derive compose info for daemon-side cleanup
+	var regComposePath, regComposeProject string
+	if isEphemeral {
+		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
+			regComposePath = composePath(cfg.Ephemeral)
+			regComposeProject = composeProjectName(sessionID)
+		}
+	}
+
 	// Register session with daemon, including the window target and system prompt
-	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, systemPrompt); err != nil {
+	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, regComposePath, regComposeProject, systemPrompt); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -385,15 +410,17 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, systemPrompt string) error {
+func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) error {
 	payload, _ := json.Marshal(map[string]any{
-		"id":            sessionID,
-		"mode":          mode.Name,
-		"indicator":     mode.Indicator,
-		"preview":       "",
-		"window_target": windowTarget,
-		"ephemeral":     ephemeral,
-		"system_prompt": systemPrompt,
+		"id":              sessionID,
+		"mode":            mode.Name,
+		"indicator":       mode.Indicator,
+		"preview":         "",
+		"window_target":   windowTarget,
+		"ephemeral":       ephemeral,
+		"compose_path":    composePath,
+		"compose_project": composeProject,
+		"system_prompt":   systemPrompt,
 	})
 
 	resp, err := http.Post(
@@ -638,10 +665,6 @@ func (cmd *SessionEndedCmd) Run() error {
 		fmt.Print("\n\033[1mPress Enter to close...\033[0m")
 		buf := make([]byte, 1)
 		os.Stdin.Read(buf)
-
-		// Defensive cleanup: remove container if --rm didn't catch it
-		dockerRm := exec.Command("docker", "rm", "-f", "vee-"+cmd.SessionID)
-		dockerRm.Run() // ignore errors — container is likely already gone
 	}
 
 	// Clean up per-session temp directory
@@ -704,7 +727,8 @@ func (cmd *ShutdownCmd) Run() error {
 			slog.Debug("shutdown: handling active sessions", "count", len(state.Active))
 			for _, sess := range state.Active {
 				if sess.Ephemeral {
-					// Ephemeral sessions cannot be suspended — complete and kill container
+					// Ephemeral sessions cannot be suspended — the daemon's
+					// /api/complete handler takes care of container + compose cleanup.
 					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "mode", sess.Mode)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
 					r, err := http.Post(
@@ -715,8 +739,6 @@ func (cmd *ShutdownCmd) Run() error {
 					if err == nil {
 						r.Body.Close()
 					}
-					dockerKill := exec.Command("docker", "kill", "vee-"+sess.ID)
-					dockerKill.Run() // ignore errors
 				} else {
 					slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
@@ -976,7 +998,7 @@ func readProjectConfig() (string, error) {
 	return string(content), nil
 }
 
-func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, projectConfig string, ephemeral bool) string {
+func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, projectConfig string, ephemeral bool, composeContents string) string {
 	var sb strings.Builder
 	sb.WriteString(base)
 
@@ -996,7 +1018,13 @@ func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, proje
 	}
 
 	if ephemeral {
-		sb.WriteString("\n\n<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.\n</environment>")
+		sb.WriteString("\n\n<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.")
+		if composeContents != "" {
+			sb.WriteString("\n\nThe following Docker Compose services are available on the container network. You can reach them by service name (e.g., `postgres:5432`).\n\n```yaml\n")
+			sb.WriteString(composeContents)
+			sb.WriteString("\n```")
+		}
+		sb.WriteString("\n</environment>")
 	} else {
 		sb.WriteString("\n\n<environment type=\"host\">\nThis session is run directly on the user's host.\n</environment>")
 	}
@@ -1261,7 +1289,7 @@ func buildSessionArgs(sessionID string, resume bool, mode Mode, projectConfig, i
 		args = append(args, stripSystemPrompt(passthrough)...)
 		args = append(args, "--resume", sessionID)
 	} else {
-		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false)
+		fullPrompt := composeSystemPrompt(mode.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false, "")
 		args = buildArgs(passthrough, fullPrompt)
 		args = append(args, "--session-id", sessionID)
 	}

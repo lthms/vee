@@ -109,6 +109,8 @@ type Session struct {
 	Status          string    `json:"status"`          // "active", "suspended", or "completed"
 	WindowTarget    string    `json:"window_target"`   // tmux window ID (e.g. "@3")
 	Ephemeral       bool      `json:"ephemeral"`
+	ComposePath     string    `json:"compose_path,omitempty"`
+	ComposeProject  string    `json:"compose_project,omitempty"`
 	Working         bool      `json:"working"`
 	HasNotification bool      `json:"has_notification"`
 	PermissionMode  string    `json:"permission_mode"`
@@ -127,19 +129,21 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool, systemPrompt string) *Session {
+func (s *sessionStore) create(id, mode, indicator, preview, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := &Session{
-		ID:           id,
-		Mode:         mode,
-		Indicator:    indicator,
-		StartedAt:    time.Now(),
-		Preview:      preview,
-		Status:       "active",
-		WindowTarget: windowTarget,
-		Ephemeral:    ephemeral,
-		SystemPrompt: systemPrompt,
+		ID:             id,
+		Mode:           mode,
+		Indicator:      indicator,
+		StartedAt:      time.Now(),
+		Preview:        preview,
+		Status:         "active",
+		WindowTarget:   windowTarget,
+		Ephemeral:      ephemeral,
+		ComposePath:    composePath,
+		ComposeProject: composeProject,
+		SystemPrompt:   systemPrompt,
 	}
 	s.sessions[id] = sess
 	return sess

@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -393,8 +392,17 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
 	}
 
+	// Derive compose info for daemon-side cleanup
+	var regComposePath, regComposeProject string
+	if isEphemeral {
+		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
+			regComposePath = composePath(cfg.Ephemeral)
+			regComposeProject = composeProjectName(sessionID)
+		}
+	}
+
 	// Register session with daemon, including the window target and system prompt
-	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, systemPrompt); err != nil {
+	if err := registerSession(cmd.Port, sessionID, mode, windowID, isEphemeral, regComposePath, regComposeProject, systemPrompt); err != nil {
 		slog.Warn("failed to register session with daemon", "error", err)
 	}
 
@@ -402,15 +410,17 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 }
 
 // registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, systemPrompt string) error {
+func registerSession(port int, sessionID string, mode Mode, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) error {
 	payload, _ := json.Marshal(map[string]any{
-		"id":            sessionID,
-		"mode":          mode.Name,
-		"indicator":     mode.Indicator,
-		"preview":       "",
-		"window_target": windowTarget,
-		"ephemeral":     ephemeral,
-		"system_prompt": systemPrompt,
+		"id":              sessionID,
+		"mode":            mode.Name,
+		"indicator":       mode.Indicator,
+		"preview":         "",
+		"window_target":   windowTarget,
+		"ephemeral":       ephemeral,
+		"compose_path":    composePath,
+		"compose_project": composeProject,
+		"system_prompt":   systemPrompt,
 	})
 
 	resp, err := http.Post(
@@ -640,12 +650,10 @@ func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArg
 
 // SessionEndedCmd is called when Claude exits to clean up stale sessions.
 type SessionEndedCmd struct {
-	Port           int    `short:"p" default:"2700" name:"port"`
-	SessionID      string `required:"" name:"session-id"`
-	WaitForUser    bool   `name:"wait-for-user" help:"Pause for user input before closing (used for ephemeral sessions)."`
-	TmuxSocket     string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-	ComposePath    string `name:"compose-path" help:"Path to the compose file (for teardown)."`
-	ComposeProject string `name:"compose-project" help:"Compose project name (for teardown)."`
+	Port        int    `short:"p" default:"2700" name:"port"`
+	SessionID   string `required:"" name:"session-id"`
+	WaitForUser bool   `name:"wait-for-user" help:"Pause for user input before closing (used for ephemeral sessions)."`
+	TmuxSocket  string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
 }
 
 // Run notifies the daemon that a Claude process has exited and cleans up temp files.
@@ -657,21 +665,6 @@ func (cmd *SessionEndedCmd) Run() error {
 		fmt.Print("\n\033[1mPress Enter to close...\033[0m")
 		buf := make([]byte, 1)
 		os.Stdin.Read(buf)
-
-		// Tear down Compose stack if one was started
-		if cmd.ComposePath != "" && cmd.ComposeProject != "" {
-			slog.Debug("session-ended: tearing down compose stack", "path", cmd.ComposePath, "project", cmd.ComposeProject)
-			down := exec.Command("docker", "compose", "-f", cmd.ComposePath, "-p", cmd.ComposeProject, "down")
-			down.Stdout = os.Stdout
-			down.Stderr = os.Stderr
-			if err := down.Run(); err != nil {
-				slog.Warn("session-ended: compose down failed", "error", err)
-			}
-		}
-
-		// Defensive cleanup: remove container if --rm didn't catch it
-		dockerRm := exec.Command("docker", "rm", "-f", "vee-"+cmd.SessionID)
-		dockerRm.Run() // ignore errors — container is likely already gone
 	}
 
 	// Clean up per-session temp directory
@@ -734,7 +727,8 @@ func (cmd *ShutdownCmd) Run() error {
 			slog.Debug("shutdown: handling active sessions", "count", len(state.Active))
 			for _, sess := range state.Active {
 				if sess.Ephemeral {
-					// Ephemeral sessions cannot be suspended — complete and kill container
+					// Ephemeral sessions cannot be suspended — the daemon's
+					// /api/complete handler takes care of container + compose cleanup.
 					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "mode", sess.Mode)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
 					r, err := http.Post(
@@ -745,8 +739,6 @@ func (cmd *ShutdownCmd) Run() error {
 					if err == nil {
 						r.Body.Close()
 					}
-					dockerKill := exec.Command("docker", "kill", "vee-"+sess.ID)
-					dockerKill.Run() // ignore errors
 				} else {
 					slog.Debug("shutdown: suspending session", "id", sess.ID, "mode", sess.Mode, "window", sess.WindowTarget)
 					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)

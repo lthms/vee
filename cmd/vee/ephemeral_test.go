@@ -54,12 +54,13 @@ func TestBuildEphemeralShellCmdWithCompose(t *testing.T) {
 		t.Errorf("expected compose network name in output, got:\n%s", cmd)
 	}
 
-	// Should contain --compose-path and --compose-project in cleanup
-	if !strings.Contains(cmd, "--compose-path") {
-		t.Errorf("expected --compose-path in cleanup tail, got:\n%s", cmd)
+	// Cleanup tail should NOT contain --compose-path or --compose-project
+	// (teardown is now handled by the daemon via cleanupEphemeralSession)
+	if strings.Contains(cmd, "--compose-path") {
+		t.Errorf("unexpected --compose-path in cleanup tail, got:\n%s", cmd)
 	}
-	if !strings.Contains(cmd, "--compose-project") {
-		t.Errorf("expected --compose-project in cleanup tail, got:\n%s", cmd)
+	if strings.Contains(cmd, "--compose-project") {
+		t.Errorf("unexpected --compose-project in cleanup tail, got:\n%s", cmd)
 	}
 }
 
@@ -82,10 +83,6 @@ func TestBuildEphemeralShellCmdWithoutCompose(t *testing.T) {
 		t.Errorf("unexpected --network flag in output, got:\n%s", cmd)
 	}
 
-	// Should NOT contain --compose-path or --compose-project
-	if strings.Contains(cmd, "--compose-path") {
-		t.Errorf("unexpected --compose-path in output, got:\n%s", cmd)
-	}
 }
 
 func TestComposeSystemPromptInjection(t *testing.T) {

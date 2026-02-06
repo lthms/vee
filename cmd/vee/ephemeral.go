@@ -245,13 +245,10 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, mode Mode, p
 
 	runCmd := strings.Join(runParts, " ")
 
-	// Cleanup command — runs on host after Docker exits
+	// Cleanup command — runs on host after Docker exits.
+	// Docker/compose teardown is handled by the daemon via cleanupEphemeralSession.
 	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s --wait-for-user",
 		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
-	if cfg.Compose != "" {
-		cleanupCmd += fmt.Sprintf(" --compose-path %s --compose-project %s",
-			shelljoin(composePath(cfg)), shelljoin(project))
-	}
 
 	// Assemble the full command chain
 	var chain string

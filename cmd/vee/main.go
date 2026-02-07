@@ -373,7 +373,10 @@ func (cmd *NewPaneCmd) Run(args claudeArgs) error {
 				return fmt.Errorf("compose validation failed: %w", err)
 			}
 		}
-		shellCmd = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+		shellCmd, err = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
+		if err != nil {
+			return fmt.Errorf("ephemeral session: %w", err)
+		}
 	} else {
 		sessionArgs := buildSessionArgs(sessionID, false, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
 		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)

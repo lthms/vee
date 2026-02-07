@@ -13,11 +13,12 @@ import (
 
 // EphemeralConfig holds the [ephemeral] section of .vee/config.
 type EphemeralConfig struct {
-	Dockerfile string
-	Compose    string
-	Env        []string
-	ExtraArgs  []string
-	Mounts     []MountSpec
+	Dockerfile    string
+	Compose       string
+	StartupScript string
+	Env           []string
+	ExtraArgs     []string
+	Mounts        []MountSpec
 }
 
 // GitConfig holds the git user identity detected on the host.
@@ -208,7 +209,7 @@ func composeProjectName(sessionID string) string {
 // buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
 //
 //	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Profile, projectConfig, identityRule, platformsRule, feedbackBlock, composeContents, prompt string, port int, veePath, veeBinary string, passthrough []string) string {
+func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Profile, projectConfig, identityRule, platformsRule, feedbackBlock, composeContents, prompt string, port int, veePath, veeBinary string, passthrough []string) (string, error) {
 	tag := ephemeralImageTag()
 	df := dockerfilePath(cfg)
 
@@ -278,6 +279,20 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 	// Mount the vee installation directory for plugins
 	runParts = append(runParts, "-v", shelljoin(veePath+":/opt/vee:ro"))
 
+	// Mount the startup script (if configured)
+	var startupScriptPath string
+	if cfg.StartupScript != "" {
+		startupScriptPath = filepath.Join(".vee", cfg.StartupScript)
+		abs, err := filepath.Abs(startupScriptPath)
+		if err == nil {
+			startupScriptPath = abs
+		}
+		if _, err := os.Stat(startupScriptPath); err != nil {
+			return "", fmt.Errorf("startup script %s: %w", startupScriptPath, err)
+		}
+		runParts = append(runParts, "-v", shelljoin(startupScriptPath+":/opt/startup.sh:ro"))
+	}
+
 	// Environment variables
 	runParts = append(runParts, "-e", "IS_SANDBOX=1")
 	for _, env := range cfg.Env {
@@ -342,18 +357,22 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 	// Image tag
 	runParts = append(runParts, shelljoin(tag))
 
-	// If overlay mounts are present, wrap the command in sh -c to set up
-	// overlayfs before exec'ing claude. The mount script runs inside the
-	// container; "$@" forwards all remaining args to claude.
-	if len(overlayMounts) > 0 {
-		var mountCmds []string
+	// If overlay mounts or a startup script are present, wrap the command
+	// in sh -c to run setup steps before exec'ing claude. The script runs
+	// inside the container; "$@" forwards all remaining args to claude.
+	needsWrapper := len(overlayMounts) > 0 || startupScriptPath != ""
+	if needsWrapper {
+		var wrapperCmds []string
 		for _, om := range overlayMounts {
-			mountCmds = append(mountCmds, fmt.Sprintf(
+			wrapperCmds = append(wrapperCmds, fmt.Sprintf(
 				"mkdir -p %s %s %s && mount -t overlay overlay -o lowerdir=%s,upperdir=%s,workdir=%s %s",
 				om.target, om.upper, om.work, om.lower, om.upper, om.work, om.target,
 			))
 		}
-		script := strings.Join(mountCmds, " && ") + ` && exec "$@"`
+		if startupScriptPath != "" {
+			wrapperCmds = append(wrapperCmds, "sh /opt/startup.sh")
+		}
+		script := strings.Join(wrapperCmds, " && ") + ` && exec "$@"`
 		runParts = append(runParts, "sh", "-c", shelljoin(script), "_")
 	}
 
@@ -380,7 +399,7 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 	} else {
 		chain = "printf '\\033[?25h'; " + buildCmd + " && " + runCmd + "; " + cleanupCmd
 	}
-	return chain
+	return chain, nil
 }
 
 // writeMCPConfigDocker writes an MCP config file that uses host.docker.internal

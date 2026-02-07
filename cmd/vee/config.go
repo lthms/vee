@@ -268,6 +268,12 @@ func hydrateProjectConfig(m map[string][]string) *ProjectConfig {
 		}
 		cfg.Ephemeral.Compose = compose
 	}
+	if ss := lastValue(m, "ephemeral.startupscript"); ss != "" {
+		if cfg.Ephemeral == nil {
+			cfg.Ephemeral = &EphemeralConfig{}
+		}
+		cfg.Ephemeral.StartupScript = ss
+	}
 	if envs := m["ephemeral.env"]; len(envs) > 0 {
 		if cfg.Ephemeral == nil {
 			cfg.Ephemeral = &EphemeralConfig{}

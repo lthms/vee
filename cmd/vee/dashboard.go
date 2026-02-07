@@ -304,65 +304,6 @@ func (cmd *DashboardCmd) renderIndexingSection(sb *strings.Builder, tasks []Inde
 	sb.WriteString("\r\n")
 }
 
-// LogViewerCmd tails the log file in a popup, exiting on Esc or q.
-type LogViewerCmd struct {
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-func (cmd *LogViewerCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	f, err := os.Open(logFilePath())
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		return err
-	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-	// Hide cursor
-	fmt.Print("\033[?25l")
-	defer fmt.Print("\033[?25h")
-
-	// Show last 16KB of existing content, then follow
-	if info, err := f.Stat(); err == nil && info.Size() > 16384 {
-		f.Seek(-16384, 2)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				n, _ := f.Read(buf)
-				if n > 0 {
-					// Raw mode: convert \n to \r\n
-					output := strings.ReplaceAll(string(buf[:n]), "\n", "\r\n")
-					fmt.Print(output)
-				} else {
-					time.Sleep(200 * time.Millisecond)
-				}
-			}
-		}
-	}()
-
-	// Wait for Esc or q
-	key := make([]byte, 1)
-	for {
-		os.Stdin.Read(key)
-		if key[0] == 27 || key[0] == 'q' {
-			close(done)
-			return nil
-		}
-	}
-}
-
 func formatAge(d time.Duration) string {
 	s := int(d.Seconds())
 	if s < 60 {

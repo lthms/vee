@@ -5,48 +5,66 @@ import (
 	"strings"
 )
 
+// promptLineKind identifies how a line should be styled.
+type promptLineKind int
+
+const (
+	lineKindPlain promptLineKind = iota
+	lineKindHeading
+	lineKindBullet
+	lineKindBulletCont // continuation of wrapped bullet
+	lineKindFenced
+	lineKindXMLTag
+)
+
+// promptLine holds a pre-processed line with its styling metadata.
+type promptLine struct {
+	text   string         // the raw text (may be wrapped segment)
+	kind   promptLineKind // how to style this line
+	indent string         // for bullets: the leading indent
+}
+
 // xmlTagRe matches block-level XML tags used in system prompts.
 var xmlTagRe = regexp.MustCompile(`^(\s*)<(/?)(rule|script|example|environment|project_setup)(\s[^>]*)?>(.*)$`)
 
-// renderPromptLines renders a raw markdown/XML system prompt into
-// ANSI-styled, word-wrapped lines ready for the scrolling viewport.
-func renderPromptLines(raw string, maxWidth int) []string {
+// preparePromptLines pre-processes raw prompt content into lines with metadata.
+// The returned lines are wrapped to maxWidth and tagged with their kind.
+func preparePromptLines(raw string, maxWidth int) []promptLine {
 	if maxWidth < 1 {
 		maxWidth = 1
 	}
 
 	rawLines := strings.Split(raw, "\n")
-	var result []string
+	var result []promptLine
 	inFencedBlock := false
 
 	for _, line := range rawLines {
 		// Fenced code blocks: toggle on ``` delimiters
 		if strings.HasPrefix(strings.TrimSpace(line), "```") {
 			inFencedBlock = !inFencedBlock
-			// Render the delimiter itself as dim
 			for _, w := range wrapOrSingle(line, maxWidth) {
-				result = append(result, ansiDim+w+ansiReset)
+				result = append(result, promptLine{text: w, kind: lineKindFenced})
 			}
 			continue
 		}
 
 		if inFencedBlock {
 			for _, w := range wrapOrSingle(line, maxWidth) {
-				result = append(result, ansiDim+w+ansiReset)
+				result = append(result, promptLine{text: w, kind: lineKindFenced})
 			}
 			continue
 		}
 
 		// XML tags
 		if m := xmlTagRe.FindStringSubmatch(line); m != nil {
-			result = append(result, renderXMLTag(m, maxWidth)...)
+			result = append(result, promptLine{text: line, kind: lineKindXMLTag})
 			continue
 		}
 
 		// Headings
 		if heading, level := parseHeading(line); level > 0 {
 			for _, w := range wrapOrSingle(heading, maxWidth) {
-				result = append(result, ansiAccent+ansiBold+w+ansiReset)
+				result = append(result, promptLine{text: w, kind: lineKindHeading})
 			}
 			continue
 		}
@@ -56,32 +74,64 @@ func renderPromptLines(raw string, maxWidth int) []string {
 			wrapped := wrapOrSingle(rest, maxWidth-len(indent)-2)
 			for i, w := range wrapped {
 				if i == 0 {
-					result = append(result, indent+"- "+renderInlineMarkdown(w))
+					result = append(result, promptLine{text: w, kind: lineKindBullet, indent: indent})
 				} else {
-					result = append(result, indent+"  "+renderInlineMarkdown(w))
+					result = append(result, promptLine{text: w, kind: lineKindBulletCont, indent: indent})
 				}
 			}
 			continue
 		}
 
-		// Default: inline markdown
+		// Default: plain text
 		if line == "" {
-			result = append(result, "")
+			result = append(result, promptLine{text: "", kind: lineKindPlain})
 			continue
 		}
 		for _, w := range wrapOrSingle(line, maxWidth) {
-			result = append(result, renderInlineMarkdown(w))
+			result = append(result, promptLine{text: w, kind: lineKindPlain})
 		}
 	}
 
 	return result
 }
 
-// xmlAttrRe splits an attribute string into name=, value pairs.
-var xmlAttrRe = regexp.MustCompile(`(\w+=)("(?:[^"\\]|\\.)*")`)
+// renderPromptLine applies styling to a single line, optionally highlighting filter matches.
+func renderPromptLine(pl promptLine, filter string) string {
+	var styled string
 
-// renderXMLTag styles an XML tag match. Groups: [full, indent, slash, name, attrs, tail].
-func renderXMLTag(m []string, maxWidth int) []string {
+	switch pl.kind {
+	case lineKindFenced:
+		styled = ansiDim + pl.text + ansiReset
+	case lineKindHeading:
+		styled = ansiAccent + ansiBold + pl.text + ansiReset
+	case lineKindBullet:
+		styled = pl.indent + "- " + renderInlineMarkdown(pl.text)
+	case lineKindBulletCont:
+		styled = pl.indent + "  " + renderInlineMarkdown(pl.text)
+	case lineKindXMLTag:
+		styled = renderXMLTagLine(pl.text)
+	default:
+		if pl.text == "" {
+			return ""
+		}
+		styled = renderInlineMarkdown(pl.text)
+	}
+
+	// Apply search highlighting if filter is set
+	if filter != "" {
+		styled = highlightFilter(styled, filter)
+	}
+
+	return styled
+}
+
+// renderXMLTagLine styles an XML tag line.
+func renderXMLTagLine(line string) string {
+	m := xmlTagRe.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+
 	indent := m[1]
 	slash := m[2]
 	name := m[3]
@@ -103,9 +153,23 @@ func renderXMLTag(m []string, maxWidth int) []string {
 		sb.WriteString(renderInlineMarkdown(tail))
 	}
 
-	// XML tag lines are typically short; wrap is unlikely but handled.
-	return []string{sb.String()}
+	return sb.String()
 }
+
+// renderPromptLines renders a raw markdown/XML system prompt into
+// ANSI-styled, word-wrapped lines ready for the scrolling viewport.
+// Kept for backward compatibility.
+func renderPromptLines(raw string, maxWidth int) []string {
+	lines := preparePromptLines(raw, maxWidth)
+	result := make([]string, len(lines))
+	for i, pl := range lines {
+		result[i] = renderPromptLine(pl, "")
+	}
+	return result
+}
+
+// xmlAttrRe splits an attribute string into name=, value pairs.
+var xmlAttrRe = regexp.MustCompile(`(\w+=)("(?:[^"\\]|\\.)*")`)
 
 // parseHeading checks if a line is a markdown heading (# through ####).
 // Returns the heading text (without #) and the level, or 0 if not a heading.

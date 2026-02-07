@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
-	"golang.org/x/term"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // PromptViewerCmd is the internal subcommand that displays the system prompt
@@ -18,49 +19,389 @@ type PromptViewerCmd struct {
 	WindowID string `required:"" name:"window-id"`
 }
 
-type promptViewerState struct {
-	lines      []string
-	scroll     int
-	termWidth  int
-	termHeight int
+// promptResult holds the fetched prompt data or an error message.
+type promptResult struct {
+	profile      string
+	indicator    string
+	systemPrompt string
+	errorMsg     string
+}
+
+// promptViewerModel is the Bubble Tea model for the prompt viewer.
+type promptViewerModel struct {
+	viewport   viewport.Model
 	profile    string
 	indicator  string
+	rawContent string
+	lines      []promptLine // pre-processed lines with metadata
+	ready      bool
+	errorMsg   string
+	width      int
+	height     int
+
+	// Search state
+	searching bool
+	filter    string
+	matches   []int // line indices that match
+	matchIdx  int   // current match index
+}
+
+// Styles
+var (
+	pvTitleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#89b4fa"))
+
+	pvHelpStyle = lipgloss.NewStyle().
+			Faint(true)
+
+	pvErrorStyle = lipgloss.NewStyle().
+			Faint(true)
+
+	pvSearchStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#bb9af7"))
+
+	pvMatchStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("#414868")).
+			Foreground(lipgloss.Color("#c0caf5"))
+)
+
+func initialPromptViewerModel(result promptResult) promptViewerModel {
+	return promptViewerModel{
+		profile:    result.profile,
+		indicator:  result.indicator,
+		rawContent: result.systemPrompt,
+		errorMsg:   result.errorMsg,
+		ready:      false,
+	}
+}
+
+func (m promptViewerModel) Init() tea.Cmd {
+	return nil
+}
+
+func (m promptViewerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+		if m.errorMsg != "" {
+			return m, nil
+		}
+
+		headerHeight := 2 // title + divider
+		footerHeight := 1 // help line
+		viewportHeight := m.height - headerHeight - footerHeight
+		if viewportHeight < 1 {
+			viewportHeight = 1
+		}
+
+		if !m.ready {
+			m.viewport = viewport.New(m.width, viewportHeight)
+			m.viewport.YPosition = headerHeight
+			m.ready = true
+		} else {
+			m.viewport.Width = m.width
+			m.viewport.Height = viewportHeight
+		}
+
+		// Pre-process lines on first ready
+		if m.ready && len(m.lines) == 0 && m.rawContent != "" {
+			m.lines = preparePromptLines(m.rawContent, m.width-2)
+			m.refreshContent()
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		if m.searching {
+			return m.handleSearchInput(msg)
+		}
+		return m.handleNormalInput(msg)
+	}
+
+	return m, nil
+}
+
+func (m promptViewerModel) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.searching = false
+		m.filter = ""
+		m.matches = nil
+		m.matchIdx = 0
+		m.refreshContent()
+	case tea.KeyEnter:
+		m.searching = false
+		if m.filter != "" {
+			m.updateMatches()
+			m.refreshContent()
+			if len(m.matches) > 0 {
+				m.jumpToMatch(0)
+			}
+		}
+	case tea.KeyBackspace:
+		if len(m.filter) > 0 {
+			m.filter = m.filter[:len(m.filter)-1]
+		}
+	case tea.KeyCtrlU:
+		m.filter = ""
+	case tea.KeyCtrlW:
+		// Delete last word
+		i := len(m.filter)
+		for i > 0 && m.filter[i-1] == ' ' {
+			i--
+		}
+		for i > 0 && m.filter[i-1] != ' ' {
+			i--
+		}
+		m.filter = m.filter[:i]
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.filter += string(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
+func (m promptViewerModel) handleNormalInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		if m.filter != "" {
+			m.filter = ""
+			m.matches = nil
+			m.matchIdx = 0
+			m.refreshContent()
+			return m, nil
+		}
+		return m, tea.Quit
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyCtrlD, tea.KeyCtrlU:
+		// Swallow vi half-page bindings
+		return m, nil
+	case tea.KeyRunes:
+		if len(msg.Runes) == 1 {
+			switch msg.Runes[0] {
+			case 'q':
+				return m, tea.Quit
+			case 'g':
+				if m.ready && m.errorMsg == "" {
+					m.viewport.GotoTop()
+					return m, nil
+				}
+			case 'G':
+				if m.ready && m.errorMsg == "" {
+					m.viewport.GotoBottom()
+					return m, nil
+				}
+			case 'j', 'k', 'd', 'u':
+				// Swallow vi scroll bindings
+				return m, nil
+			case '/':
+				m.searching = true
+				m.filter = ""
+				return m, nil
+			case 'n':
+				if len(m.matches) > 0 {
+					m.matchIdx = (m.matchIdx + 1) % len(m.matches)
+					m.jumpToMatch(m.matchIdx)
+				}
+				return m, nil
+			case 'N':
+				if len(m.matches) > 0 {
+					m.matchIdx--
+					if m.matchIdx < 0 {
+						m.matchIdx = len(m.matches) - 1
+					}
+					m.jumpToMatch(m.matchIdx)
+				}
+				return m, nil
+			}
+		}
+	}
+
+	// Pass remaining keys to viewport (arrows, pgup/pgdown)
+	if m.ready && m.errorMsg == "" {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+
+	return m, nil
+}
+
+func (m *promptViewerModel) updateMatches() {
+	m.matches = nil
+	if m.filter == "" {
+		return
+	}
+	lower := strings.ToLower(m.filter)
+	for i, pl := range m.lines {
+		if strings.Contains(strings.ToLower(pl.text), lower) {
+			m.matches = append(m.matches, i)
+		}
+	}
+}
+
+func (m *promptViewerModel) jumpToMatch(idx int) {
+	if idx < 0 || idx >= len(m.matches) {
+		return
+	}
+	lineIdx := m.matches[idx]
+	// Calculate target position (center the match in viewport)
+	targetLine := lineIdx - m.viewport.Height/2
+	if targetLine < 0 {
+		targetLine = 0
+	}
+	m.viewport.SetYOffset(targetLine)
+	m.refreshContent()
+}
+
+func (m *promptViewerModel) refreshContent() {
+	if len(m.lines) == 0 {
+		return
+	}
+
+	var content strings.Builder
+	for i, pl := range m.lines {
+		if i > 0 {
+			content.WriteString("\n")
+		}
+
+		// Check if this is the current match
+		isCurrentMatch := false
+		if m.filter != "" && len(m.matches) > 0 && m.matchIdx < len(m.matches) {
+			if m.matches[m.matchIdx] == i {
+				isCurrentMatch = true
+			}
+		}
+
+		if isCurrentMatch {
+			// Highlight entire line for current match
+			styled := renderPromptLine(pl, m.filter)
+			content.WriteString(pvMatchStyle.Render(stripAnsiForMatch(styled)))
+		} else {
+			// Normal rendering with optional filter highlighting
+			content.WriteString(renderPromptLine(pl, m.filter))
+		}
+	}
+	m.viewport.SetContent(content.String())
+}
+
+// stripAnsiForMatch removes ANSI codes for clean match highlighting.
+func stripAnsiForMatch(s string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\033' {
+			i++
+			for i < len(s) {
+				c := s[i]
+				i++
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+					break
+				}
+			}
+			continue
+		}
+		result.WriteByte(s[i])
+		i++
+	}
+	return result.String()
+}
+
+func (m promptViewerModel) View() string {
+	if m.errorMsg != "" {
+		return m.viewError()
+	}
+
+	if !m.ready {
+		return ""
+	}
+
+	var b strings.Builder
+
+	// Header
+	title := fmt.Sprintf(" %s %s — System Prompt", m.indicator, m.profile)
+	if m.filter != "" && len(m.matches) > 0 {
+		title += pvSearchStyle.Render(fmt.Sprintf(" [%s] ", m.filter)) +
+			pvHelpStyle.Render(fmt.Sprintf("%d/%d", m.matchIdx+1, len(m.matches)))
+	} else if m.filter != "" {
+		title += pvSearchStyle.Render(fmt.Sprintf(" [%s] ", m.filter)) +
+			pvHelpStyle.Render("no matches")
+	}
+	b.WriteString(pvTitleStyle.Render(title))
+	b.WriteString("\n")
+	b.WriteString(pvHelpStyle.Render(strings.Repeat("─", m.width)))
+	b.WriteString("\n")
+
+	// Content
+	b.WriteString(m.viewport.View())
+	b.WriteString("\n")
+
+	// Footer
+	b.WriteString(m.renderFooter())
+
+	return b.String()
+}
+
+func (m promptViewerModel) renderFooter() string {
+	if m.searching {
+		return " " + pvSearchStyle.Render("/") + m.filter + pvHelpStyle.Render("▏")
+	}
+
+	pct := m.viewport.ScrollPercent() * 100
+	position := ""
+	if m.viewport.TotalLineCount() > m.viewport.Height {
+		position = fmt.Sprintf(" %.0f%%", pct)
+	}
+
+	help := "↑/↓ scroll  g/G top/bottom  / search  q quit"
+	if m.filter != "" {
+		help = "n/N match  Esc clear  " + help
+	}
+	return " " + pvHelpStyle.Render(help) + pvHelpStyle.Render(position)
+}
+
+func (m promptViewerModel) viewError() string {
+	row := m.height / 2
+	col := (m.width - len(m.errorMsg)) / 2
+	if col < 0 {
+		col = 0
+	}
+
+	var b strings.Builder
+	for i := 0; i < row; i++ {
+		b.WriteString("\n")
+	}
+	b.WriteString(strings.Repeat(" ", col))
+	b.WriteString(pvErrorStyle.Render(m.errorMsg))
+
+	return b.String()
 }
 
 func (cmd *PromptViewerCmd) Run() error {
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		return err
-	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	result := cmd.fetchPrompt()
+	m := initialPromptViewerModel(result)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
 
-	fmt.Print("\033[?25l") // hide cursor
-	defer fmt.Print("\033[?25h")
-
-	w, h, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || w < 40 {
-		w = 90
-	}
-	if err != nil || h < 10 {
-		h = 30
-	}
-
-	// Fetch the system prompt from the daemon
+func (cmd *PromptViewerCmd) fetchPrompt() promptResult {
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session/prompt?window=%s",
 		cmd.Port, url.QueryEscape(cmd.WindowID)))
 	if err != nil {
-		printRawMessage(w, h, "Could not reach the daemon.")
-		return waitForDismiss()
+		return promptResult{errorMsg: "Could not reach the daemon."}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		printRawMessage(w, h, "No session in this window.")
-		return waitForDismiss()
+		return promptResult{errorMsg: "No session in this window."}
 	}
 	if resp.StatusCode != http.StatusOK {
-		printRawMessage(w, h, fmt.Sprintf("Daemon returned %d.", resp.StatusCode))
-		return waitForDismiss()
+		return promptResult{errorMsg: fmt.Sprintf("Daemon returned %d.", resp.StatusCode)}
 	}
 
 	var result struct {
@@ -69,240 +410,16 @@ func (cmd *PromptViewerCmd) Run() error {
 		SystemPrompt string `json:"system_prompt"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		printRawMessage(w, h, "Failed to decode response.")
-		return waitForDismiss()
+		return promptResult{errorMsg: "Failed to decode response."}
 	}
 
 	if result.SystemPrompt == "" {
-		printRawMessage(w, h, "No system prompt stored for this session.")
-		return waitForDismiss()
+		return promptResult{errorMsg: "No system prompt stored for this session."}
 	}
 
-	// Wrap lines to terminal width
-	ps := &promptViewerState{
-		lines:      renderPromptLines(result.SystemPrompt, w-2),
-		termWidth:  w,
-		termHeight: h,
-		profile:    result.Profile,
-		indicator:  result.Indicator,
-	}
-
-	ps.render()
-
-	// Input loop
-	buf := make([]byte, 64)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			return nil
-		}
-		key := buf[:n]
-
-		maxScroll := ps.maxScroll()
-
-		switch {
-		case key[0] == 27 || key[0] == 'q':
-			return nil
-		case key[0] == 'j' || (len(key) == 3 && key[0] == 27 && key[1] == '[' && key[2] == 'B'):
-			// Down
-			if ps.scroll < maxScroll {
-				ps.scroll++
-				ps.render()
-			}
-		case key[0] == 'k' || (len(key) == 3 && key[0] == 27 && key[1] == '[' && key[2] == 'A'):
-			// Up
-			if ps.scroll > 0 {
-				ps.scroll--
-				ps.render()
-			}
-		case key[0] == 'd' && len(key) == 1:
-			// Half-page down
-			ps.scroll += ps.termHeight / 2
-			if ps.scroll > maxScroll {
-				ps.scroll = maxScroll
-			}
-			ps.render()
-		case key[0] == 'u' && len(key) == 1:
-			// Half-page up
-			ps.scroll -= ps.termHeight / 2
-			if ps.scroll < 0 {
-				ps.scroll = 0
-			}
-			ps.render()
-		case key[0] == 'g':
-			// Top
-			ps.scroll = 0
-			ps.render()
-		case key[0] == 'G':
-			// Bottom
-			ps.scroll = maxScroll
-			ps.render()
-		case len(key) == 4 && key[0] == 27 && key[1] == '[' && key[2] == '5' && key[3] == '~':
-			// Page up
-			ps.scroll -= ps.termHeight - 2
-			if ps.scroll < 0 {
-				ps.scroll = 0
-			}
-			ps.render()
-		case len(key) == 4 && key[0] == 27 && key[1] == '[' && key[2] == '6' && key[3] == '~':
-			// Page down
-			ps.scroll += ps.termHeight - 2
-			if ps.scroll > maxScroll {
-				ps.scroll = maxScroll
-			}
-			ps.render()
-		}
-	}
-}
-
-func (ps *promptViewerState) maxScroll() int {
-	// Reserve 2 lines for header, 1 for footer
-	viewable := ps.termHeight - 3
-	if viewable < 1 {
-		viewable = 1
-	}
-	max := len(ps.lines) - viewable
-	if max < 0 {
-		return 0
-	}
-	return max
-}
-
-func (ps *promptViewerState) render() {
-	var sb strings.Builder
-
-	// Clear screen
-	sb.WriteString("\033[2J\033[H")
-
-	w := ps.termWidth
-	viewable := ps.termHeight - 3 // header (2 lines) + footer (1 line)
-	if viewable < 1 {
-		viewable = 1
-	}
-
-	// Header
-	title := fmt.Sprintf(" %s %s — System Prompt", ps.indicator, ps.profile)
-	sb.WriteString("\033[1m\033[38;2;137;180;250m") // bold, accent blue
-	sb.WriteString(truncateLine(title, w))
-	sb.WriteString("\033[0m\r\n")
-	sb.WriteString("\033[2m")
-	sb.WriteString(strings.Repeat("─", w))
-	sb.WriteString("\033[0m\r\n")
-
-	// Content
-	end := ps.scroll + viewable
-	if end > len(ps.lines) {
-		end = len(ps.lines)
-	}
-	visible := ps.lines[ps.scroll:end]
-	for _, line := range visible {
-		sb.WriteString(truncateLine(line, w))
-		sb.WriteString("\r\n")
-	}
-
-	// Pad remaining space
-	for range viewable - len(visible) {
-		sb.WriteString("\r\n")
-	}
-
-	// Footer
-	position := ""
-	if len(ps.lines) > viewable {
-		pct := 0
-		if ps.maxScroll() > 0 {
-			pct = ps.scroll * 100 / ps.maxScroll()
-		}
-		position = fmt.Sprintf(" %d%% ", pct)
-	}
-	footer := fmt.Sprintf(" j/k scroll  d/u half-page  g/G top/bottom  q quit%s", position)
-	sb.WriteString("\033[2m")
-	sb.WriteString(truncateLine(footer, w))
-	sb.WriteString("\033[0m")
-
-	fmt.Print(sb.String())
-}
-
-// wrapText splits text into lines, wrapping at maxWidth.
-func wrapText(text string, maxWidth int) []string {
-	if maxWidth < 1 {
-		maxWidth = 1
-	}
-
-	rawLines := strings.Split(text, "\n")
-	var result []string
-
-	for _, line := range rawLines {
-		if line == "" {
-			result = append(result, "")
-			continue
-		}
-		for len(line) > maxWidth {
-			// Try to break at a space
-			breakAt := maxWidth
-			for i := maxWidth; i > maxWidth/2; i-- {
-				if line[i] == ' ' {
-					breakAt = i
-					break
-				}
-			}
-			result = append(result, line[:breakAt])
-			line = line[breakAt:]
-			if len(line) > 0 && line[0] == ' ' {
-				line = line[1:]
-			}
-		}
-		result = append(result, line)
-	}
-
-	return result
-}
-
-// truncateLine truncates a line to fit within maxWidth visible characters,
-// skipping ANSI escape sequences when counting width.
-func truncateLine(line string, maxWidth int) string {
-	visible := 0
-	i := 0
-	runes := []rune(line)
-	for i < len(runes) {
-		if runes[i] == '\033' {
-			// Skip entire escape sequence: ESC [ ... letter
-			i++
-			for i < len(runes) {
-				c := runes[i]
-				i++
-				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-					break
-				}
-			}
-			continue
-		}
-		if visible >= maxWidth {
-			return string(runes[:i]) + ansiReset
-		}
-		visible++
-		i++
-	}
-	return line
-}
-
-// printRawMessage prints a centered message in raw terminal mode.
-func printRawMessage(w, h int, msg string) {
-	fmt.Print("\033[2J\033[H") // clear screen
-	row := h / 2
-	col := (w - len(msg)) / 2
-	if col < 0 {
-		col = 0
-	}
-	fmt.Printf("\033[%d;%dH\033[2m%s\033[0m", row, col+1, msg)
-}
-
-// waitForDismiss waits for Esc or q in raw terminal mode.
-func waitForDismiss() error {
-	buf := make([]byte, 1)
-	for {
-		os.Stdin.Read(buf)
-		if buf[0] == 27 || buf[0] == 'q' {
-			return nil
-		}
+	return promptResult{
+		profile:      result.Profile,
+		indicator:    result.Indicator,
+		systemPrompt: result.SystemPrompt,
 	}
 }

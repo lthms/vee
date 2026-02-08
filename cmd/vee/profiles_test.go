@@ -380,3 +380,92 @@ Custom profile body.`), 0644)
 		}
 	}
 }
+
+func TestInitProfileRegistryMergesProjectProfiles(t *testing.T) {
+	veePath := writeTestProfiles(t)
+
+	// Create a fake project directory with .vee/profiles.
+	projectDir := t.TempDir()
+	projectProfilesDir := filepath.Join(projectDir, ".vee", "profiles")
+	os.MkdirAll(projectProfilesDir, 0755)
+
+	// Override vibe profile with project-specific version.
+	os.WriteFile(filepath.Join(projectProfilesDir, "vibe.md"), []byte(`---
+indicator: "🚀"
+description: "Project-specific vibe"
+priority: 1
+---
+Project vibe body.`), 0644)
+
+	// Add a project-only profile.
+	os.WriteFile(filepath.Join(projectProfilesDir, "project.md"), []byte(`---
+indicator: "📦"
+description: "Project-only profile"
+priority: 25
+---
+Project-only body.`), 0644)
+
+	// Change to project directory so initProfileRegistry picks it up.
+	origWd, _ := os.Getwd()
+	os.Chdir(projectDir)
+	defer os.Chdir(origWd)
+
+	origRegistry := profileRegistry
+	origOrder := profileOrder
+	defer func() {
+		profileRegistry = origRegistry
+		profileOrder = origOrder
+	}()
+
+	if err := initProfileRegistry(veePath); err != nil {
+		t.Fatalf("initProfileRegistry: %v", err)
+	}
+
+	// Should have 5 profiles: claude, normal, vibe (overridden), contradictor, project (new).
+	if len(profileRegistry) != 5 {
+		t.Fatalf("expected 5 profiles, got %d", len(profileRegistry))
+	}
+
+	// Vibe should be overridden by project profile.
+	vibe := profileRegistry["vibe"]
+	if vibe.Indicator != "🚀" {
+		t.Errorf("vibe indicator = %q, want %q (project override)", vibe.Indicator, "🚀")
+	}
+	if vibe.Priority != 1 {
+		t.Errorf("vibe priority = %d, want 1 (project override)", vibe.Priority)
+	}
+	if !strings.Contains(vibe.Prompt, "Project vibe body") {
+		t.Error("vibe prompt should contain project override body")
+	}
+
+	// Project profile should exist.
+	project, ok := profileRegistry["project"]
+	if !ok {
+		t.Fatal("missing project-added profile: project")
+	}
+	if project.Indicator != "📦" {
+		t.Errorf("project indicator = %q, want %q", project.Indicator, "📦")
+	}
+
+	// Installed profiles that weren't overridden should still be present.
+	if _, ok := profileRegistry["claude"]; !ok {
+		t.Error("missing installed profile: claude")
+	}
+	if _, ok := profileRegistry["normal"]; !ok {
+		t.Error("missing installed profile: normal")
+	}
+	if _, ok := profileRegistry["contradictor"]; !ok {
+		t.Error("missing installed profile: contradictor")
+	}
+
+	// Verify priority ordering: claude(0), vibe(1), normal(10), project(25), contradictor(30).
+	expectedOrder := []string{"claude", "vibe", "normal", "project", "contradictor"}
+	if len(profileOrder) != len(expectedOrder) {
+		t.Fatalf("profileOrder length = %d, want %d", len(profileOrder), len(expectedOrder))
+	}
+	for i, want := range expectedOrder {
+		if profileOrder[i] != want {
+			t.Errorf("profileOrder[%d] = %q, want %q", i, profileOrder[i], want)
+		}
+	}
+}

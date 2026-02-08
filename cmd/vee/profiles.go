@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -90,11 +91,13 @@ func loadProfilesFromDir(dir string) ([]Profile, error) {
 		}
 		content, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", e.Name(), err)
+			slog.Warn("skipping unreadable profile", "file", e.Name(), "error", err)
+			continue
 		}
 		profile, err := parseProfileFile(e.Name(), content)
 		if err != nil {
-			return nil, err
+			slog.Warn("skipping malformed profile", "file", e.Name(), "error", err)
+			continue
 		}
 		profiles = append(profiles, profile)
 	}

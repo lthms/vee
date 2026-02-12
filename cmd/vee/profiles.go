@@ -14,10 +14,10 @@ import (
 
 // ProfileFrontmatter is the YAML frontmatter target for profile files.
 type ProfileFrontmatter struct {
-	Indicator        string `yaml:"indicator"`
-	Description      string `yaml:"description"`
-	Priority         *int   `yaml:"priority"`
-	DefaultPrompt    string `yaml:"default_prompt"`
+	Indicator         string `yaml:"indicator"`
+	Description       string `yaml:"description"`
+	Priority          *int   `yaml:"priority"`
+	DefaultPrompt     string `yaml:"default_prompt"`
 	PromptPlaceholder string `yaml:"prompt_placeholder"`
 }
 

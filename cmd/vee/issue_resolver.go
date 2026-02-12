@@ -334,7 +334,6 @@ func (rs *resolverState) render() {
 	fmt.Print(sb.String())
 }
 
-
 func (rs *resolverState) renderList(sb *strings.Builder) {
 	w := rs.termWidth
 

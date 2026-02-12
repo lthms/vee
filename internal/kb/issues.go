@@ -8,14 +8,14 @@ import (
 
 // Issue represents a detected issue between two statements.
 type Issue struct {
-	ID         string `json:"id"`
-	Type       string `json:"type"`
-	Status     string `json:"status"`
-	StatementA string `json:"statement_a"`
-	StatementB string `json:"statement_b"`
+	ID         string  `json:"id"`
+	Type       string  `json:"type"`
+	Status     string  `json:"status"`
+	StatementA string  `json:"statement_a"`
+	StatementB string  `json:"statement_b"`
 	Score      float64 `json:"score"`
-	CreatedAt  string `json:"created_at"`
-	ResolvedAt string `json:"resolved_at"`
+	CreatedAt  string  `json:"created_at"`
+	ResolvedAt string  `json:"resolved_at"`
 
 	// Inlined statement content for display
 	ContentA string `json:"content_a,omitempty"`

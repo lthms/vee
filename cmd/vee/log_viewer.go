@@ -20,18 +20,18 @@ type LogViewerCmd struct {
 
 // Styles for slog syntax highlighting (Tokyo Night palette)
 var (
-	logTimeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
-	logDebugStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7"))
-	logInfoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
-	logWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	logErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e"))
-	logMsgStyle     = lipgloss.NewStyle().Bold(true)
-	logKeyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
-	logMatchStyle   = lipgloss.NewStyle().Background(lipgloss.Color("#414868")).Foreground(lipgloss.Color("#c0caf5"))
-	logStatusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7"))
-	logPausedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
-	logHelpStyle    = lipgloss.NewStyle().Faint(true)
-	logSearchStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#bb9af7"))
+	logTimeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
+	logDebugStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7"))
+	logInfoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
+	logWarnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
+	logErrorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f7768e"))
+	logMsgStyle    = lipgloss.NewStyle().Bold(true)
+	logKeyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
+	logMatchStyle  = lipgloss.NewStyle().Background(lipgloss.Color("#414868")).Foreground(lipgloss.Color("#c0caf5"))
+	logStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7aa2f7"))
+	logPausedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
+	logHelpStyle   = lipgloss.NewStyle().Faint(true)
+	logSearchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#bb9af7"))
 )
 
 // Regex patterns for slog text format parsing
@@ -471,10 +471,10 @@ func (m logModel) renderHeader() string {
 	// Search info
 	var searchInfo string
 	if m.filter != "" && len(m.matches) > 0 {
-		searchInfo = logSearchStyle.Render(" [" + m.filter + "] ") +
+		searchInfo = logSearchStyle.Render(" ["+m.filter+"] ") +
 			logHelpStyle.Render(formatMatchInfo(m.matchIdx+1, len(m.matches)))
 	} else if m.filter != "" {
-		searchInfo = logSearchStyle.Render(" [" + m.filter + "] ") +
+		searchInfo = logSearchStyle.Render(" ["+m.filter+"] ") +
 			logHelpStyle.Render("no matches")
 	}
 

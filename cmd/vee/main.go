@@ -99,25 +99,25 @@ type claudeArgs []string
 
 // CLI is the top-level command structure for vee.
 type CLI struct {
-	Debug         bool             `env:"VEE_DEBUG" help:"Enable debug logging."`
-	Start         StartCmd         `cmd:"" help:"Start an interactive Vee session."`
-	Daemon        DaemonCmd        `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
-	NewPane       NewPaneCmd       `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
-	Dashboard     DashboardCmd     `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
-	SessionPicker SessionPickerCmd `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive profile picker."`
+	Debug          bool              `env:"VEE_DEBUG" help:"Enable debug logging."`
+	Start          StartCmd          `cmd:"" help:"Start an interactive Vee session."`
+	Daemon         DaemonCmd         `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
+	NewPane        NewPaneCmd        `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
+	Dashboard      DashboardCmd      `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
+	SessionPicker  SessionPickerCmd  `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive profile picker."`
 	SuspendWindow  SuspendWindowCmd  `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
 	CompleteWindow CompleteWindowCmd `cmd:"" name:"_complete-window" hidden:"" help:"Internal: complete session by window."`
-	ResumeMenu    ResumeMenuCmd    `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
-	ResumeSession ResumeSessionCmd `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
-	SessionEnded  SessionEndedCmd  `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
-	UpdatePreview UpdatePreviewCmd `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
-	UpdateWindow  UpdateWindowCmd  `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
-	LogViewer     LogViewerCmd     `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
-	PromptViewer  PromptViewerCmd  `cmd:"" name:"_prompt-viewer" hidden:"" help:"Internal: display session system prompt."`
-	KBExplorer    KBExplorerCmd    `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
-	IssueResolver IssueResolverCmd `cmd:"" name:"_issue-resolver" hidden:"" help:"Internal: KB issue resolver TUI."`
-	Shutdown      ShutdownCmd      `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
-	Serve         ServeCmd         `cmd:"" name:"_serve" hidden:"" help:"Internal: daemon + dashboard inside tmux."`
+	ResumeMenu     ResumeMenuCmd     `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
+	ResumeSession  ResumeSessionCmd  `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
+	SessionEnded   SessionEndedCmd   `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
+	UpdatePreview  UpdatePreviewCmd  `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
+	UpdateWindow   UpdateWindowCmd   `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
+	LogViewer      LogViewerCmd      `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
+	PromptViewer   PromptViewerCmd   `cmd:"" name:"_prompt-viewer" hidden:"" help:"Internal: display session system prompt."`
+	KBExplorer     KBExplorerCmd     `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
+	IssueResolver  IssueResolverCmd  `cmd:"" name:"_issue-resolver" hidden:"" help:"Internal: KB issue resolver TUI."`
+	Shutdown       ShutdownCmd       `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
+	Serve          ServeCmd          `cmd:"" name:"_serve" hidden:"" help:"Internal: daemon + dashboard inside tmux."`
 }
 
 // StartCmd runs the in-process server and manages the tmux session.

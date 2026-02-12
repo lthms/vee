@@ -332,53 +332,53 @@ func TestPromptViewerModelKeyHandling(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		key      tea.KeyMsg
+		name       string
+		key        tea.KeyMsg
 		shouldQuit bool
 	}{
 		{
-			name:     "q quits",
-			key:      tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}},
+			name:       "q quits",
+			key:        tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}},
 			shouldQuit: true,
 		},
 		{
-			name:     "Esc quits",
-			key:      tea.KeyMsg{Type: tea.KeyEsc},
+			name:       "Esc quits",
+			key:        tea.KeyMsg{Type: tea.KeyEsc},
 			shouldQuit: true,
 		},
 		{
-			name:     "Ctrl+C quits",
-			key:      tea.KeyMsg{Type: tea.KeyCtrlC},
+			name:       "Ctrl+C quits",
+			key:        tea.KeyMsg{Type: tea.KeyCtrlC},
 			shouldQuit: true,
 		},
 		{
-			name:     "j is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}},
+			name:       "j is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}},
 			shouldQuit: false,
 		},
 		{
-			name:     "k is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}},
+			name:       "k is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}},
 			shouldQuit: false,
 		},
 		{
-			name:     "d is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}},
+			name:       "d is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}},
 			shouldQuit: false,
 		},
 		{
-			name:     "u is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}},
+			name:       "u is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}},
 			shouldQuit: false,
 		},
 		{
-			name:     "Ctrl+D is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyCtrlD},
+			name:       "Ctrl+D is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyCtrlD},
 			shouldQuit: false,
 		},
 		{
-			name:     "Ctrl+U is swallowed",
-			key:      tea.KeyMsg{Type: tea.KeyCtrlU},
+			name:       "Ctrl+U is swallowed",
+			key:        tea.KeyMsg{Type: tea.KeyCtrlU},
 			shouldQuit: false,
 		},
 	}

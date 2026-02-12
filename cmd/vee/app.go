@@ -72,7 +72,7 @@ func (s *indexingStore) list() []IndexingTask {
 // App holds the shared application state passed to all subsystems.
 type App struct {
 	Sessions *sessionStore
-	Indexing  *indexingStore
+	Indexing *indexingStore
 
 	mu     sync.RWMutex
 	config *AppConfig
@@ -81,7 +81,7 @@ type App struct {
 func newApp() *App {
 	return &App{
 		Sessions: newSessionStore(),
-		Indexing:  newIndexingStore(),
+		Indexing: newIndexingStore(),
 	}
 }
 
@@ -106,8 +106,8 @@ type Session struct {
 	Indicator       string    `json:"indicator"`
 	StartedAt       time.Time `json:"started_at"`
 	Preview         string    `json:"preview"`
-	Status          string    `json:"status"`          // "active", "suspended", or "completed"
-	WindowTarget    string    `json:"window_target"`   // tmux window ID (e.g. "@3")
+	Status          string    `json:"status"`        // "active", "suspended", or "completed"
+	WindowTarget    string    `json:"window_target"` // tmux window ID (e.g. "@3")
 	Ephemeral       bool      `json:"ephemeral"`
 	ComposePath     string    `json:"compose_path,omitempty"`
 	ComposeProject  string    `json:"compose_project,omitempty"`

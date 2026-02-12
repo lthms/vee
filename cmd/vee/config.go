@@ -241,7 +241,6 @@ func mergeConfig(dst, src map[string][]string) {
 	}
 }
 
-
 // lastValue returns the last value for a key, or "" if absent.
 func lastValue(m map[string][]string, key string) string {
 	vals := m[key]

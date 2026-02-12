@@ -200,7 +200,7 @@ func (cmd *DashboardCmd) renderSection(sb *strings.Builder, title string, sessio
 
 		// Layout: indent(4) + ⏣(1) + space(1) + indicator(2) + space(1) + profile + gap + preview + gap + age
 		const indent = 4
-		const badgeWidth = 1    // ephemeral(1)
+		const badgeWidth = 1     // ephemeral(1)
 		const indicatorWidth = 2 // emoji
 		leftFixed := indent + badgeWidth + 1 + indicatorWidth + 1 + len(sess.Profile)
 		rightFixed := len(age) + 2 // +2 for right margin

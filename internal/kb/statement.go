@@ -131,6 +131,41 @@ func (kb *KnowledgeBase) TouchStatement(id string) error {
 	return nil
 }
 
+// FlagStatement marks a statement for deletion review.
+func (kb *KnowledgeBase) FlagStatement(id string) error {
+	now := time.Now().Format("2006-01-02T15:04:05Z")
+	result, err := kb.db.Exec(
+		`UPDATE statements SET flagged_at = ? WHERE id = ? AND flagged_at = ''`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("flag statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found or already flagged: %s", id)
+	}
+	slog.Info("statement flagged for deletion", "id", id)
+	return nil
+}
+
+// RestoreStatement clears the flagged_at timestamp.
+func (kb *KnowledgeBase) RestoreStatement(id string) error {
+	result, err := kb.db.Exec(
+		`UPDATE statements SET flagged_at = '' WHERE id = ? AND flagged_at != ''`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("restore statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found or not flagged: %s", id)
+	}
+	slog.Info("statement restored", "id", id)
+	return nil
+}
+
 // newStatementID generates a UUID v4 for statement IDs.
 func newStatementID() string {
 	var b [16]byte

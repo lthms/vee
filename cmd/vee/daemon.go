@@ -41,6 +41,10 @@ type kbTouchArgs struct {
 	ID string `json:"id" jsonschema:"Statement ID (as returned by kb_query)"`
 }
 
+type kbForgetArgs struct {
+	ID string `json:"id" jsonschema:"Statement ID to flag for deletion (as returned by kb_query)"`
+}
+
 type feedbackRecordArgs struct {
 	Kind      string `json:"kind" jsonschema:"Whether this is a good or bad example (good or bad)"`
 	Statement string `json:"statement" jsonschema:"The example or counter-example statement"`
@@ -141,6 +145,22 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: fmt.Sprintf("Touched: %s (last_verified updated to today)", args.ID)},
+			},
+		}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "kb_forget",
+		Description: "Flag a statement for deletion. Hidden from queries, pending user review.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbForgetArgs) (*mcp.CallToolResult, any, error) {
+		slog.Debug("kb_forget called", "id", args.ID)
+		if err := kbase.FlagStatement(args.ID); err != nil {
+			return nil, nil, fmt.Errorf("kb_forget: %w", err)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("Flagged for deletion: %s (pending user review)", args.ID)},
 			},
 		}, nil, nil
 	})

@@ -20,7 +20,7 @@ func (kb *KnowledgeBase) Query(query string) ([]QueryResult, error) {
 	rows, err := kb.db.Query(
 		`SELECT id, content, source, last_verified, embedding
 		 FROM statements
-		 WHERE status = 'active' AND embedding IS NOT NULL AND model = ?`,
+		 WHERE status = 'active' AND embedding IS NOT NULL AND model = ? AND flagged_at = ''`,
 		kb.embeddingModel,
 	)
 	if err != nil {

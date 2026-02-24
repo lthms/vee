@@ -57,7 +57,7 @@ func openTestKB(t *testing.T, stub *stubModel) *KnowledgeBase {
 // with an embedding, simulating what the worker would do.
 func addAndPromote(t *testing.T, kbase *KnowledgeBase, content, source, sourceType string, emb []float64) string {
 	t.Helper()
-	result, err := kbase.AddStatement(content, source, sourceType)
+	result, err := kbase.AddStatement(content, source, sourceType, "user", "")
 	if err != nil {
 		t.Fatalf("AddStatement: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestAddStatement_CreatesRow(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, err := kbase.AddStatement("Test Statement. Some content", "file.go", "manual")
+	result, err := kbase.AddStatement("Test Statement. Some content", "file.go", "manual", "", "")
 	if err != nil {
 		t.Fatalf("AddStatement: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestAddStatement_NoEmbeddingAtInsert(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	result, err := kbase.AddStatement("Embedded content", "src", "")
+	result, err := kbase.AddStatement("Embedded content", "src", "", "", "")
 	if err != nil {
 		t.Fatalf("AddStatement: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestAddStatement_DefaultSourceType(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, err := kbase.AddStatement("Default ST content", "src", "")
+	result, err := kbase.AddStatement("Default ST content", "src", "", "", "")
 	if err != nil {
 		t.Fatalf("AddStatement: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestGetStatement(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Get Test. Content here", "file.go", "manual")
+	result, _ := kbase.AddStatement("Get Test. Content here", "file.go", "manual", "", "")
 
 	s, err := kbase.GetStatement(result.ID)
 	if err != nil {
@@ -220,7 +220,7 @@ func TestTouchStatement(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Touch Test body", "src", "manual")
+	result, _ := kbase.AddStatement("Touch Test body", "src", "manual", "", "")
 
 	err := kbase.TouchStatement(result.ID)
 	if err != nil {
@@ -250,7 +250,7 @@ func TestPromoteStatement(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Promote me", "src", "manual")
+	result, _ := kbase.AddStatement("Promote me", "src", "manual", "", "")
 
 	var status string
 	kbase.db.QueryRow(`SELECT status FROM statements WHERE id = ?`, result.ID).Scan(&status)
@@ -273,7 +273,7 @@ func TestDeleteStatement(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Delete me", "src", "manual")
+	result, _ := kbase.AddStatement("Delete me", "src", "manual", "", "")
 
 	err := kbase.DeleteStatement(result.ID)
 	if err != nil {
@@ -292,7 +292,7 @@ func TestQuery_EmptyDB(t *testing.T) {
 	stub := newStub()
 	kbase := openTestKB(t, stub)
 
-	results, err := kbase.Query("anything")
+	results, err := kbase.Query("anything", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestQuery_FindsSimilarStatements(t *testing.T) {
 	addAndPromote(t, kbase, "Go Pointers. How Go pointers work", "docs", "manual", []float64{0.9, 0.1, 0})
 	addAndPromote(t, kbase, "Pasta Recipe. How to cook pasta", "cookbook", "manual", []float64{0, 0.1, 0.9})
 
-	results, err := kbase.Query("Go programming")
+	results, err := kbase.Query("Go programming", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestQuery_RespectsThreshold(t *testing.T) {
 	// Add with orthogonal embedding (dot product with query ≈ 0)
 	addAndPromote(t, kbase, "Orthogonal content", "src", "manual", []float64{0, 1, 0})
 
-	results, err := kbase.Query("search query")
+	results, err := kbase.Query("search query", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestQuery_ResultsSortedByScore(t *testing.T) {
 	addAndPromote(t, kbase, "High Relevance high", "src", "manual", []float64{0.95, 0.05, 0})
 	addAndPromote(t, kbase, "Medium Relevance medium", "src", "manual", []float64{0.7, 0.3, 0})
 
-	results, err := kbase.Query("search")
+	results, err := kbase.Query("search", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestQuery_ContentTruncated(t *testing.T) {
 	longContent := strings.Repeat("x", 300)
 	addAndPromote(t, kbase, "Long Content. "+longContent, "src", "manual", []float64{0.5, 0.5, 0})
 
-	results, err := kbase.Query("Long Content")
+	results, err := kbase.Query("Long Content", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestAddStatement_RejectsTooLarge(t *testing.T) {
 	kbase := openTestKB(t, stub)
 
 	large := strings.Repeat("x", MaxStatementSize+1)
-	_, err := kbase.AddStatement(large, "src", "manual")
+	_, err := kbase.AddStatement(large, "src", "manual", "", "")
 	if err == nil {
 		t.Fatal("expected error for oversized statement")
 	}
@@ -474,7 +474,7 @@ func TestAddStatement_AcceptsExactLimit(t *testing.T) {
 	kbase := openTestKB(t, stub)
 
 	exact := strings.Repeat("x", MaxStatementSize)
-	result, err := kbase.AddStatement(exact, "src", "manual")
+	result, err := kbase.AddStatement(exact, "src", "manual", "", "")
 	if err != nil {
 		t.Fatalf("expected no error at exact limit, got %v", err)
 	}
@@ -492,7 +492,7 @@ func TestAddStatement_EmbeddingFailure(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	result, err := kbase.AddStatement("Survives embedding failure", "src", "manual")
+	result, err := kbase.AddStatement("Survives embedding failure", "src", "manual", "", "")
 	if err != nil {
 		t.Fatalf("AddStatement should succeed even when embedding fails: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestAddStatement_EmbeddingFailure(t *testing.T) {
 	}
 
 	// Query should not crash on an empty/NULL-embedding DB
-	results, err := kbase.Query("anything")
+	results, err := kbase.Query("anything", "")
 	if err != nil {
 		t.Fatalf("Query should not error: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestWorker_PromotesPendingStatement(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Worker test content", "src", "manual")
+	result, _ := kbase.AddStatement("Worker test content", "src", "manual", "", "")
 
 	// Run one processing cycle
 	ctx, cancel := context.WithCancel(context.Background())
@@ -570,8 +570,8 @@ func TestWorker_CreatesIssueForDuplicates(t *testing.T) {
 	kbase := openTestKB(t, stub)
 
 	// Add two near-identical statements
-	r1, _ := kbase.AddStatement("Statement one", "src", "manual")
-	r2, _ := kbase.AddStatement("Statement two", "src", "manual")
+	r1, _ := kbase.AddStatement("Statement one", "src", "manual", "", "")
+	r2, _ := kbase.AddStatement("Statement two", "src", "manual", "", "")
 
 	// Process both
 	ctx, cancel := context.WithCancel(context.Background())
@@ -622,7 +622,7 @@ func TestWorker_SkipsOnEmbeddingFailure(t *testing.T) {
 	}
 	kbase := openTestKB(t, stub)
 
-	result, _ := kbase.AddStatement("Stuck without embedding", "src", "manual")
+	result, _ := kbase.AddStatement("Stuck without embedding", "src", "manual", "", "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

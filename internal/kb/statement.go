@@ -41,7 +41,8 @@ type AddStatementResult struct {
 
 // AddStatement creates a new statement with status "pending" and no embedding.
 // The background worker will compute the embedding and promote the statement.
-func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*AddStatementResult, error) {
+// Scope must be "user" or "project". Project is only used when scope is "project".
+func (kb *KnowledgeBase) AddStatement(statement, source, sourceType, scope, project string) (*AddStatementResult, error) {
 	if len(statement) > MaxStatementSize {
 		return nil, ErrStatementTooLarge
 	}
@@ -50,19 +51,23 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*Ad
 		sourceType = "manual"
 	}
 
+	if scope == "" {
+		scope = "user"
+	}
+
 	id := newStatementID()
 	now := time.Now().Format("2006-01-02")
 
 	_, err := kb.db.Exec(
-		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified)
-		 VALUES (?, ?, ?, ?, 'pending', NULL, '', ?, ?)`,
-		id, statement, source, sourceType, now, now,
+		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified, scope, project)
+		 VALUES (?, ?, ?, ?, 'pending', NULL, '', ?, ?, ?, ?)`,
+		id, statement, source, sourceType, now, now, scope, project,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert statement: %w", err)
 	}
 
-	slog.Info("statement added (pending)", "id", id, "content", truncateRunes(statement, 80))
+	slog.Info("statement added (pending)", "id", id, "scope", scope, "content", truncateRunes(statement, 80))
 
 	// Notify worker (non-blocking)
 	select {

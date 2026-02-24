@@ -31,6 +31,7 @@ type kbRememberArgs struct {
 	Content    string `json:"content" jsonschema:"The statement to save. Must be a single atomic fact (max 2000 chars)."`
 	Source     string `json:"source" jsonschema:"Origin of the information (file path, URL, issue reference, etc.)"`
 	SourceType string `json:"source_type,omitempty" jsonschema:"Type of source (default: manual)"`
+	Scope      string `json:"scope,omitempty" jsonschema:"Scope: user (all projects) or project (this project only). Default: user"`
 }
 
 type kbQueryArgs struct {
@@ -99,16 +100,34 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 	// Knowledge base tools — available to all profiles
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_remember",
-		Description: "Save a statement to the persistent knowledge base. The statement is queued for async duplicate detection and will be promoted to active once processed.",
+		Description: "Save a fact to your long-term memory. Use this whenever you learn something useful: build commands, project conventions, user preferences, architectural decisions. One atomic fact per call. Will be deduplicated automatically.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbRememberArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_remember called")
 
-		result, err := kbase.AddStatement(args.Content, args.Source, args.SourceType)
+		scope := args.Scope
+		if scope == "" {
+			scope = "user"
+		}
+		if scope != "user" && scope != "project" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "scope must be 'user' or 'project'"},
+				},
+				IsError: true,
+			}, nil, nil
+		}
+
+		project := ""
+		if scope == "project" {
+			project, _ = os.Getwd()
+		}
+
+		result, err := kbase.AddStatement(args.Content, args.Source, args.SourceType, scope, project)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_remember: %w", err)
 		}
 
-		msg := fmt.Sprintf("Statement saved (id: %s, status: pending — will be promoted after duplicate check)", result.ID)
+		msg := fmt.Sprintf("Statement saved (id: %s, scope: %s, status: pending — will be promoted after duplicate check)", result.ID, scope)
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -119,10 +138,11 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_query",
-		Description: "Search the knowledge base using semantic similarity. Returns matching statements with scores. Use specific search terms, not wildcards.",
+		Description: "Search your long-term memory. Query BEFORE starting unfamiliar tasks — past sessions may have already solved this. Use specific terms like 'vee build commands' not vague phrases. Empty results = opportunity to learn and remember.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbQueryArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_query called", "query", args.Query)
-		results, err := kbase.Query(args.Query)
+		project, _ := os.Getwd()
+		results, err := kbase.Query(args.Query, project)
 		if err != nil {
 			return nil, nil, fmt.Errorf("kb_query: %w", err)
 		}
@@ -135,7 +155,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_touch",
-		Description: "Bump the last_verified timestamp of a statement to today, confirming the information is still accurate. Use IDs returned by kb_query.",
+		Description: "Confirm a statement is still accurate. Call this when you use information from kb_query and verify it's correct. Keeps the knowledge base healthy by tracking freshness.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbTouchArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_touch called", "id", args.ID)
 		if err := kbase.TouchStatement(args.ID); err != nil {
@@ -151,7 +171,7 @@ func newMCPServer(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store, ses
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "kb_forget",
-		Description: "Flag a statement for deletion. Hidden from queries, pending user review.",
+		Description: "Flag outdated or incorrect information for removal. Use when you discover a kb_query result is wrong or obsolete. Hidden immediately, queued for user to confirm deletion.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args kbForgetArgs) (*mcp.CallToolResult, any, error) {
 		slog.Debug("kb_forget called", "id", args.ID)
 		if err := kbase.FlagStatement(args.ID); err != nil {
@@ -771,7 +791,7 @@ func (cmd *DaemonCmd) Run() error {
 }
 
 // handleKBQuery handles GET /api/kb/query?q=<query>.
-// Returns a JSON array of QueryResult objects.
+// Returns a JSON array of QueryResult objects. Uses daemon's working directory for project scope.
 func handleKBQuery(kbase *kb.KnowledgeBase) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -785,7 +805,10 @@ func handleKBQuery(kbase *kb.KnowledgeBase) http.HandlerFunc {
 			return
 		}
 
-		results, err := kbase.Query(query)
+		// Default to current working directory for project scope filtering
+		project, _ := os.Getwd()
+
+		results, err := kbase.Query(query, project)
 		if err != nil {
 			http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
 			return

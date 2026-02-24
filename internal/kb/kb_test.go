@@ -751,3 +751,413 @@ func TestIssue_DeleteBoth(t *testing.T) {
 		t.Error("expected D2 to be deleted")
 	}
 }
+
+// --- Flag/Restore tests ---
+
+func TestFlagStatement(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Flag me", "src", "manual", "", "")
+
+	err := kbase.FlagStatement(result.ID)
+	if err != nil {
+		t.Fatalf("FlagStatement: %v", err)
+	}
+
+	var flaggedAt string
+	kbase.db.QueryRow(`SELECT flagged_at FROM statements WHERE id = ?`, result.ID).Scan(&flaggedAt)
+	if flaggedAt == "" {
+		t.Error("expected flagged_at to be set")
+	}
+}
+
+func TestFlagStatement_NotFound(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	err := kbase.FlagStatement("nonexistent-id")
+	if err == nil {
+		t.Fatal("expected error for nonexistent statement")
+	}
+}
+
+func TestFlagStatement_AlreadyFlagged(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Double flag me", "src", "manual", "", "")
+	kbase.FlagStatement(result.ID)
+
+	err := kbase.FlagStatement(result.ID)
+	if err == nil {
+		t.Fatal("expected error for already flagged statement")
+	}
+}
+
+func TestRestoreStatement(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Restore me", "src", "manual", "", "")
+	kbase.FlagStatement(result.ID)
+
+	err := kbase.RestoreStatement(result.ID)
+	if err != nil {
+		t.Fatalf("RestoreStatement: %v", err)
+	}
+
+	var flaggedAt string
+	kbase.db.QueryRow(`SELECT flagged_at FROM statements WHERE id = ?`, result.ID).Scan(&flaggedAt)
+	if flaggedAt != "" {
+		t.Errorf("expected flagged_at to be cleared, got %q", flaggedAt)
+	}
+}
+
+func TestRestoreStatement_NotFlagged(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("Not flagged", "src", "manual", "", "")
+
+	err := kbase.RestoreStatement(result.ID)
+	if err == nil {
+		t.Fatal("expected error for non-flagged statement")
+	}
+}
+
+func TestRestoreStatement_NotFound(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	err := kbase.RestoreStatement("nonexistent-id")
+	if err == nil {
+		t.Fatal("expected error for nonexistent statement")
+	}
+}
+
+// --- ListFlaggedStatements tests ---
+
+func TestListFlaggedStatements_Empty(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	flagged, err := kbase.ListFlaggedStatements()
+	if err != nil {
+		t.Fatalf("ListFlaggedStatements: %v", err)
+	}
+	if len(flagged) != 0 {
+		t.Errorf("expected no flagged statements, got %d", len(flagged))
+	}
+}
+
+func TestListFlaggedStatements_ReturnsFlagged(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	r1, _ := kbase.AddStatement("Flagged one", "src1", "manual", "", "")
+	kbase.AddStatement("Not flagged", "src2", "manual", "", "")
+	r3, _ := kbase.AddStatement("Flagged two", "src3", "manual", "", "")
+
+	kbase.FlagStatement(r1.ID)
+	kbase.FlagStatement(r3.ID)
+
+	flagged, err := kbase.ListFlaggedStatements()
+	if err != nil {
+		t.Fatalf("ListFlaggedStatements: %v", err)
+	}
+	if len(flagged) != 2 {
+		t.Errorf("expected 2 flagged statements, got %d", len(flagged))
+	}
+
+	for _, f := range flagged {
+		if f.ID == "" {
+			t.Error("expected non-empty ID")
+		}
+		if f.Content == "" {
+			t.Error("expected non-empty Content")
+		}
+		if f.FlaggedAt == "" {
+			t.Error("expected non-empty FlaggedAt")
+		}
+	}
+}
+
+// --- Scope tests ---
+
+func TestAddStatement_WithScope(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	r1, err := kbase.AddStatement("User statement", "src", "manual", "user", "")
+	if err != nil {
+		t.Fatalf("AddStatement(user): %v", err)
+	}
+
+	r2, err := kbase.AddStatement("Project statement", "src", "manual", "project", "my-project")
+	if err != nil {
+		t.Fatalf("AddStatement(project): %v", err)
+	}
+
+	var scope1, project1 string
+	kbase.db.QueryRow(`SELECT scope, project FROM statements WHERE id = ?`, r1.ID).Scan(&scope1, &project1)
+	if scope1 != "user" {
+		t.Errorf("expected scope 'user', got %q", scope1)
+	}
+	if project1 != "" {
+		t.Errorf("expected empty project, got %q", project1)
+	}
+
+	var scope2, project2 string
+	kbase.db.QueryRow(`SELECT scope, project FROM statements WHERE id = ?`, r2.ID).Scan(&scope2, &project2)
+	if scope2 != "project" {
+		t.Errorf("expected scope 'project', got %q", scope2)
+	}
+	if project2 != "my-project" {
+		t.Errorf("expected project 'my-project', got %q", project2)
+	}
+}
+
+func TestAddStatement_DefaultScope(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, err := kbase.AddStatement("Default scope", "src", "manual", "", "")
+	if err != nil {
+		t.Fatalf("AddStatement: %v", err)
+	}
+
+	var scope string
+	kbase.db.QueryRow(`SELECT scope FROM statements WHERE id = ?`, result.ID).Scan(&scope)
+	if scope != "user" {
+		t.Errorf("expected default scope 'user', got %q", scope)
+	}
+}
+
+// --- Query with scope tests ---
+
+func TestQuery_FiltersProjectScope(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		results := make([][]float64, len(texts))
+		for i := range texts {
+			results[i] = []float64{0.9, 0.1, 0}
+		}
+		return results, nil
+	}
+	kbase := openTestKB(t, stub)
+
+	addAndPromoteWithScope(t, kbase, "User visible", "src", "manual", []float64{0.9, 0.1, 0}, "user", "")
+	addAndPromoteWithScope(t, kbase, "Project A only", "src", "manual", []float64{0.9, 0.1, 0}, "project", "project-a")
+	addAndPromoteWithScope(t, kbase, "Project B only", "src", "manual", []float64{0.9, 0.1, 0}, "project", "project-b")
+
+	results, err := kbase.Query("search", "")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("expected 1 result (user-scoped only), got %d", len(results))
+	}
+
+	results, err = kbase.Query("search", "project-a")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results (user + project-a), got %d", len(results))
+	}
+}
+
+func addAndPromoteWithScope(t *testing.T, kbase *KnowledgeBase, content, source, sourceType string, emb []float64, scope, project string) string {
+	t.Helper()
+	result, err := kbase.AddStatement(content, source, sourceType, scope, project)
+	if err != nil {
+		t.Fatalf("AddStatement: %v", err)
+	}
+	if emb != nil {
+		blob := embeddingToBlob(emb)
+		_, err = kbase.db.Exec(
+			`UPDATE statements SET embedding = ?, model = ?, status = 'active' WHERE id = ?`,
+			blob, kbase.embeddingModel, result.ID,
+		)
+		if err != nil {
+			t.Fatalf("manual promote: %v", err)
+		}
+	}
+	return result.ID
+}
+
+// --- Soft-delete workflow tests (flag → hidden → restore → visible) ---
+
+func TestFlaggedStatementIsHiddenFromQueries(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		results := make([][]float64, len(texts))
+		for i := range texts {
+			results[i] = []float64{0.9, 0.1, 0}
+		}
+		return results, nil
+	}
+	kbase := openTestKB(t, stub)
+
+	id := addAndPromote(t, kbase, "Visible statement", "src", "manual", []float64{0.9, 0.1, 0})
+
+	results, _ := kbase.Query("Visible", "")
+	if len(results) != 1 {
+		t.Fatalf("precondition: expected statement to be queryable")
+	}
+
+	kbase.FlagStatement(id)
+	results, _ = kbase.Query("Visible", "")
+	if len(results) != 0 {
+		t.Errorf("flagged statement should be hidden from queries, got %d results", len(results))
+	}
+}
+
+func TestRestoredStatementBecomesQueryableAgain(t *testing.T) {
+	stub := newStub()
+	stub.embedFn = func(texts []string) ([][]float64, error) {
+		results := make([][]float64, len(texts))
+		for i := range texts {
+			results[i] = []float64{0.9, 0.1, 0}
+		}
+		return results, nil
+	}
+	kbase := openTestKB(t, stub)
+
+	id := addAndPromote(t, kbase, "Will restore", "src", "manual", []float64{0.9, 0.1, 0})
+	kbase.FlagStatement(id)
+
+	results, _ := kbase.Query("restore", "")
+	if len(results) != 0 {
+		t.Fatalf("precondition: flagged statement should be hidden")
+	}
+
+	kbase.RestoreStatement(id)
+	results, _ = kbase.Query("restore", "")
+	if len(results) != 1 {
+		t.Errorf("restored statement should be queryable, got %d results", len(results))
+	}
+}
+
+func TestConfirmDeleteRemovesStatementPermanently(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	result, _ := kbase.AddStatement("To be deleted", "src", "manual", "", "")
+	kbase.FlagStatement(result.ID)
+
+	flagged, _ := kbase.ListFlaggedStatements()
+	if len(flagged) != 1 {
+		t.Fatalf("precondition: expected 1 flagged statement")
+	}
+
+	err := kbase.DeleteStatement(result.ID)
+	if err != nil {
+		t.Fatalf("DeleteStatement: %v", err)
+	}
+
+	flagged, _ = kbase.ListFlaggedStatements()
+	if len(flagged) != 0 {
+		t.Errorf("deleted statement should not appear in flagged list")
+	}
+
+	_, err = kbase.GetStatement(result.ID)
+	if err == nil {
+		t.Error("statement should be permanently deleted")
+	}
+}
+
+// --- truncateRunes tests ---
+
+func TestTruncateRunes(t *testing.T) {
+	tests := []struct {
+		input    string
+		limit    int
+		expected string
+	}{
+		{"hello", 10, "hello"},
+		{"hello", 5, "hello"},
+		{"hello", 3, "hel..."},
+		{"", 5, ""},
+		{"日本語テスト", 3, "日本語..."},
+		{"日本語テスト", 10, "日本語テスト"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := truncateRunes(tt.input, tt.limit)
+			if got != tt.expected {
+				t.Errorf("truncateRunes(%q, %d) = %q, want %q", tt.input, tt.limit, got, tt.expected)
+			}
+		})
+	}
+}
+
+// --- ResolveIssue error cases ---
+
+func TestResolveIssue_NotFound(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	err := kbase.ResolveIssue("nonexistent-id", "keep_a")
+	if err == nil {
+		t.Fatal("expected error for nonexistent issue")
+	}
+}
+
+func TestResolveIssue_AlreadyResolved(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'active', ?)`, "stmt-ar-a", "A", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'active', ?)`, "stmt-ar-b", "B", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at, resolved_at) VALUES (?, 'duplicate', 'resolved', ?, ?, 0.9, ?, ?)`, "iss-ar", "stmt-ar-a", "stmt-ar-b", issueNow, issueNow)
+
+	err := kbase.ResolveIssue("iss-ar", "keep_a")
+	if err == nil {
+		t.Fatal("expected error for already resolved issue")
+	}
+}
+
+func TestResolveIssue_UnknownAction(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	now := time.Now().Format("2006-01-02")
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-ua-a", "A", now)
+	kbase.db.Exec(`INSERT INTO statements (id, content, source, source_type, status, created_at) VALUES (?, ?, '', 'manual', 'pending', ?)`, "stmt-ua-b", "B", now)
+
+	issueNow := time.Now().Format("2006-01-02T15:04:05Z")
+	kbase.db.Exec(`INSERT INTO issues (id, type, status, statement_a, statement_b, score, created_at) VALUES (?, 'duplicate', 'open', ?, ?, 0.9, ?)`, "iss-ua", "stmt-ua-a", "stmt-ua-b", issueNow)
+
+	err := kbase.ResolveIssue("iss-ua", "invalid_action")
+	if err == nil {
+		t.Fatal("expected error for unknown action")
+	}
+}
+
+// --- PromoteStatement and DeleteStatement error cases ---
+
+func TestPromoteStatement_NotFound(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	err := kbase.PromoteStatement("nonexistent-id")
+	if err == nil {
+		t.Fatal("expected error for nonexistent statement")
+	}
+}
+
+func TestDeleteStatement_NotFound(t *testing.T) {
+	stub := newStub()
+	kbase := openTestKB(t, stub)
+
+	err := kbase.DeleteStatement("nonexistent-id")
+	if err == nil {
+		t.Fatal("expected error for nonexistent statement")
+	}
+}

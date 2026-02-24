@@ -243,6 +243,9 @@ func setupHTTPMux(app *App, kbase *kb.KnowledgeBase, fstore *feedback.Store) *ht
 	mux.HandleFunc("/api/kb/fetch", handleKBFetch(kbase))
 	mux.HandleFunc("/api/kb/issues", handleKBIssues(kbase))
 	mux.HandleFunc("/api/kb/issues/resolve", handleKBIssueResolve(kbase))
+	mux.HandleFunc("/api/kb/flagged", handleKBFlagged(kbase))
+	mux.HandleFunc("/api/kb/flagged/confirm", handleKBFlaggedConfirm(kbase))
+	mux.HandleFunc("/api/kb/flagged/restore", handleKBFlaggedRestore(kbase))
 	if fstore != nil {
 		mux.HandleFunc("/api/feedback/sample", handleFeedbackSample(fstore, app))
 	}
@@ -877,6 +880,77 @@ func handleKBIssueResolve(kbase *kb.KnowledgeBase) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "resolved"})
+	}
+}
+
+// handleKBFlagged handles GET /api/kb/flagged — returns all flagged statements.
+func handleKBFlagged(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		flagged, err := kbase.ListFlaggedStatements()
+		if err != nil {
+			http.Error(w, "list flagged: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if flagged == nil {
+			flagged = []kb.FlaggedStatement{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(flagged)
+	}
+}
+
+// handleKBFlaggedConfirm handles POST /api/kb/flagged/confirm?id=<id> — deletes flagged statement.
+func handleKBFlaggedConfirm(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing id query parameter", http.StatusBadRequest)
+			return
+		}
+
+		if err := kbase.DeleteStatement(id); err != nil {
+			http.Error(w, "delete: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+	}
+}
+
+// handleKBFlaggedRestore handles POST /api/kb/flagged/restore?id=<id> — restores flagged statement.
+func handleKBFlaggedRestore(kbase *kb.KnowledgeBase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing id query parameter", http.StatusBadRequest)
+			return
+		}
+
+		if err := kbase.RestoreStatement(id); err != nil {
+			http.Error(w, "restore: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "restored"})
 	}
 }
 

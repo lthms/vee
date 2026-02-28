@@ -41,7 +41,8 @@ type AddStatementResult struct {
 
 // AddStatement creates a new statement with status "pending" and no embedding.
 // The background worker will compute the embedding and promote the statement.
-func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*AddStatementResult, error) {
+// Scope must be "user" or "project". Project is only used when scope is "project".
+func (kb *KnowledgeBase) AddStatement(statement, source, sourceType, scope, project string) (*AddStatementResult, error) {
 	if len(statement) > MaxStatementSize {
 		return nil, ErrStatementTooLarge
 	}
@@ -50,19 +51,23 @@ func (kb *KnowledgeBase) AddStatement(statement, source, sourceType string) (*Ad
 		sourceType = "manual"
 	}
 
+	if scope == "" {
+		scope = "user"
+	}
+
 	id := newStatementID()
 	now := time.Now().Format("2006-01-02")
 
 	_, err := kb.db.Exec(
-		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified)
-		 VALUES (?, ?, ?, ?, 'pending', NULL, '', ?, ?)`,
-		id, statement, source, sourceType, now, now,
+		`INSERT INTO statements (id, content, source, source_type, status, embedding, model, created_at, last_verified, scope, project)
+		 VALUES (?, ?, ?, ?, 'pending', NULL, '', ?, ?, ?, ?)`,
+		id, statement, source, sourceType, now, now, scope, project,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert statement: %w", err)
 	}
 
-	slog.Info("statement added (pending)", "id", id, "content", truncateRunes(statement, 80))
+	slog.Info("statement added (pending)", "id", id, "scope", scope, "content", truncateRunes(statement, 80))
 
 	// Notify worker (non-blocking)
 	select {
@@ -128,6 +133,41 @@ func (kb *KnowledgeBase) TouchStatement(id string) error {
 		return fmt.Errorf("statement not found: %s", id)
 	}
 	slog.Info("statement touched", "id", id)
+	return nil
+}
+
+// FlagStatement marks a statement for deletion review.
+func (kb *KnowledgeBase) FlagStatement(id string) error {
+	now := time.Now().Format("2006-01-02T15:04:05Z")
+	result, err := kb.db.Exec(
+		`UPDATE statements SET flagged_at = ? WHERE id = ? AND flagged_at = ''`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("flag statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found or already flagged: %s", id)
+	}
+	slog.Info("statement flagged for deletion", "id", id)
+	return nil
+}
+
+// RestoreStatement clears the flagged_at timestamp.
+func (kb *KnowledgeBase) RestoreStatement(id string) error {
+	result, err := kb.db.Exec(
+		`UPDATE statements SET flagged_at = '' WHERE id = ? AND flagged_at != ''`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("restore statement: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("statement not found or not flagged: %s", id)
+	}
+	slog.Info("statement restored", "id", id)
 	return nil
 }
 

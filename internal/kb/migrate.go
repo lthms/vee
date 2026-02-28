@@ -36,6 +36,18 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// Migrations: add columns to existing tables
+	migrations := []string{
+		`ALTER TABLE statements ADD COLUMN flagged_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE statements ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'`,
+		`ALTER TABLE statements ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	}
+
+	for _, m := range migrations {
+		// Ignore errors — column may already exist
+		db.Exec(m)
+	}
+
 	return nil
 }
 

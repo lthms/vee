@@ -6,6 +6,38 @@ import (
 	"time"
 )
 
+// FlaggedStatement represents a statement flagged for deletion.
+type FlaggedStatement struct {
+	ID        string `json:"id"`
+	Content   string `json:"content"`
+	Source    string `json:"source"`
+	FlaggedAt string `json:"flagged_at"`
+}
+
+// ListFlaggedStatements returns all flagged statements, ordered by flag time descending.
+func (kb *KnowledgeBase) ListFlaggedStatements() ([]FlaggedStatement, error) {
+	rows, err := kb.db.Query(
+		`SELECT id, content, source, flagged_at
+		 FROM statements WHERE flagged_at != ''
+		 ORDER BY flagged_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list flagged statements: %w", err)
+	}
+	defer rows.Close()
+
+	var flagged []FlaggedStatement
+	for rows.Next() {
+		var f FlaggedStatement
+		if err := rows.Scan(&f.ID, &f.Content, &f.Source, &f.FlaggedAt); err != nil {
+			slog.Warn("list flagged: scan row", "error", err)
+			continue
+		}
+		flagged = append(flagged, f)
+	}
+	return flagged, rows.Err()
+}
+
 // Issue represents a detected issue between two statements.
 type Issue struct {
 	ID         string  `json:"id"`

@@ -32,16 +32,31 @@ type resolverIssue struct {
 	SourceB    string  `json:"source_b"`
 }
 
+// resolverFlagged mirrors kb.FlaggedStatement for JSON decoding.
+type resolverFlagged struct {
+	ID        string `json:"id"`
+	Content   string `json:"content"`
+	Source    string `json:"source"`
+	FlaggedAt string `json:"flagged_at"`
+}
+
 const (
 	resolverStateList   = 0
 	resolverStateDetail = 1
+)
+
+const (
+	resolverTabIssues  = 0
+	resolverTabFlagged = 1
 )
 
 type resolverState struct {
 	port int
 
 	state    int // resolverStateList or resolverStateDetail
+	tab      int // resolverTabIssues or resolverTabFlagged
 	issues   []resolverIssue
+	flagged  []resolverFlagged
 	selected int
 	message  string // transient status message
 
@@ -78,6 +93,7 @@ func (cmd *IssueResolverCmd) Run() error {
 	}
 
 	rs.fetchIssues()
+	rs.fetchFlagged()
 	rs.render()
 
 	inputCh := make(chan []byte, 1)
@@ -122,22 +138,44 @@ func (rs *resolverState) handleListInput(input []byte) bool {
 		switch input[0] {
 		case 'q', 27: // q or Esc
 			return true
+		case 9: // Tab — switch tabs
+			rs.switchTab()
 		case 10, 13: // Enter — open detail
-			if len(rs.issues) > 0 && rs.selected >= 0 && rs.selected < len(rs.issues) {
-				rs.openDetail()
+			if rs.tab == resolverTabIssues {
+				if len(rs.issues) > 0 && rs.selected >= 0 && rs.selected < len(rs.issues) {
+					rs.openDetail()
+				}
+			} else {
+				if len(rs.flagged) > 0 && rs.selected >= 0 && rs.selected < len(rs.flagged) {
+					rs.openFlaggedDetail()
+				}
 			}
 		case 'j':
 			rs.moveSelection(1)
 		case 'k':
 			rs.moveSelection(-1)
 		case 'a':
-			rs.resolveSelected("keep_a")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_a")
+			}
 		case 'b':
-			rs.resolveSelected("keep_b")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_b")
+			}
 		case 'K':
-			rs.resolveSelected("keep_both")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_both")
+			}
 		case 'd':
-			rs.resolveSelected("delete_both")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("delete_both")
+			} else {
+				rs.confirmFlagged()
+			}
+		case 'r':
+			if rs.tab == resolverTabFlagged {
+				rs.restoreFlagged()
+			}
 		}
 	} else if len(input) == 3 && input[0] == 27 && input[1] == 91 {
 		switch input[2] {
@@ -145,6 +183,10 @@ func (rs *resolverState) handleListInput(input []byte) bool {
 			rs.moveSelection(-1)
 		case 66: // Down
 			rs.moveSelection(1)
+		case 67: // Right
+			rs.switchTab()
+		case 68: // Left
+			rs.switchTab()
 		}
 	} else if len(input) == 2 && input[0] == 27 {
 		return true
@@ -166,13 +208,27 @@ func (rs *resolverState) handleDetailInput(input []byte) bool {
 		case 'k':
 			rs.scrollDetail(-1)
 		case 'a':
-			rs.resolveSelected("keep_a")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_a")
+			}
 		case 'b':
-			rs.resolveSelected("keep_b")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_b")
+			}
 		case 'K':
-			rs.resolveSelected("keep_both")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("keep_both")
+			}
 		case 'd':
-			rs.resolveSelected("delete_both")
+			if rs.tab == resolverTabIssues {
+				rs.resolveSelected("delete_both")
+			} else {
+				rs.confirmFlagged()
+			}
+		case 'r':
+			if rs.tab == resolverTabFlagged {
+				rs.restoreFlagged()
+			}
 		}
 	} else if len(input) == 3 && input[0] == 27 && input[1] == 91 {
 		switch input[2] {
@@ -188,16 +244,31 @@ func (rs *resolverState) handleDetailInput(input []byte) bool {
 }
 
 func (rs *resolverState) moveSelection(delta int) {
-	if len(rs.issues) == 0 {
+	var maxIdx int
+	if rs.tab == resolverTabIssues {
+		maxIdx = len(rs.issues)
+	} else {
+		maxIdx = len(rs.flagged)
+	}
+	if maxIdx == 0 {
 		return
 	}
 	rs.selected += delta
 	if rs.selected < 0 {
 		rs.selected = 0
 	}
-	if rs.selected >= len(rs.issues) {
-		rs.selected = len(rs.issues) - 1
+	if rs.selected >= maxIdx {
+		rs.selected = maxIdx - 1
 	}
+}
+
+func (rs *resolverState) switchTab() {
+	if rs.tab == resolverTabIssues {
+		rs.tab = resolverTabFlagged
+	} else {
+		rs.tab = resolverTabIssues
+	}
+	rs.selected = 0
 }
 
 func (rs *resolverState) scrollDetail(delta int) {
@@ -229,11 +300,38 @@ func (rs *resolverState) fetchIssues() {
 	}
 
 	rs.issues = issues
-	if rs.selected >= len(rs.issues) {
-		rs.selected = len(rs.issues) - 1
+	if rs.tab == resolverTabIssues {
+		if rs.selected >= len(rs.issues) {
+			rs.selected = len(rs.issues) - 1
+		}
+		if rs.selected < 0 {
+			rs.selected = 0
+		}
 	}
-	if rs.selected < 0 {
-		rs.selected = 0
+}
+
+func (rs *resolverState) fetchFlagged() {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/kb/flagged", rs.port))
+	if err != nil {
+		rs.flagged = nil
+		return
+	}
+	defer resp.Body.Close()
+
+	var flagged []resolverFlagged
+	if err := json.NewDecoder(resp.Body).Decode(&flagged); err != nil {
+		rs.flagged = nil
+		return
+	}
+
+	rs.flagged = flagged
+	if rs.tab == resolverTabFlagged {
+		if rs.selected >= len(rs.flagged) {
+			rs.selected = len(rs.flagged) - 1
+		}
+		if rs.selected < 0 {
+			rs.selected = 0
+		}
 	}
 }
 
@@ -291,6 +389,93 @@ func (rs *resolverState) openDetail() {
 	rs.state = resolverStateDetail
 }
 
+func (rs *resolverState) openFlaggedDetail() {
+	f := rs.flagged[rs.selected]
+
+	contentWidth := rs.termWidth - 8
+
+	var lines []string
+
+	// Flagged statement header
+	lines = append(lines, ansiOrange+ansiBold+"Flagged Statement"+ansiReset)
+	if f.Source != "" {
+		lines = append(lines, ansiMuted+"Source: "+f.Source+ansiReset)
+	}
+	lines = append(lines, ansiMuted+"Flagged: "+f.FlaggedAt+ansiReset)
+	lines = append(lines, "")
+
+	// Content
+	for _, line := range strings.Split(f.Content, "\n") {
+		if len(line) <= contentWidth {
+			lines = append(lines, renderInlineMarkdown(line))
+		} else {
+			for _, wrapped := range wrapLine(line, contentWidth) {
+				lines = append(lines, renderInlineMarkdown(wrapped))
+			}
+		}
+	}
+
+	rs.detailLines = lines
+	rs.detailScroll = 0
+	rs.state = resolverStateDetail
+}
+
+func (rs *resolverState) confirmFlagged() {
+	if len(rs.flagged) == 0 || rs.selected < 0 || rs.selected >= len(rs.flagged) {
+		return
+	}
+
+	f := rs.flagged[rs.selected]
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/kb/flagged/confirm?id=%s", rs.port, f.ID),
+		"application/json",
+		bytes.NewReader([]byte("{}")),
+	)
+	if err != nil {
+		rs.message = "Error: " + err.Error()
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rs.message = fmt.Sprintf("Error: HTTP %d", resp.StatusCode)
+		return
+	}
+
+	rs.message = "Deleted"
+	rs.state = resolverStateList
+	rs.fetchFlagged()
+}
+
+func (rs *resolverState) restoreFlagged() {
+	if len(rs.flagged) == 0 || rs.selected < 0 || rs.selected >= len(rs.flagged) {
+		return
+	}
+
+	f := rs.flagged[rs.selected]
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/kb/flagged/restore?id=%s", rs.port, f.ID),
+		"application/json",
+		bytes.NewReader([]byte("{}")),
+	)
+	if err != nil {
+		rs.message = "Error: " + err.Error()
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rs.message = fmt.Sprintf("Error: HTTP %d", resp.StatusCode)
+		return
+	}
+
+	rs.message = "Restored"
+	rs.state = resolverStateList
+	rs.fetchFlagged()
+}
+
 func (rs *resolverState) resolveSelected(action string) {
 	if len(rs.issues) == 0 || rs.selected < 0 || rs.selected >= len(rs.issues) {
 		return
@@ -337,18 +522,31 @@ func (rs *resolverState) render() {
 func (rs *resolverState) renderList(sb *strings.Builder) {
 	w := rs.termWidth
 
-	// Header
+	// Header with tabs
 	sb.WriteString("\r\n  ")
-	sb.WriteString(ansiAccent)
-	sb.WriteString(ansiBold)
-	sb.WriteString("Issue Resolver")
+
+	// Issues tab
+	if rs.tab == resolverTabIssues {
+		sb.WriteString(ansiAccent)
+		sb.WriteString(ansiBold)
+	} else {
+		sb.WriteString(ansiMuted)
+	}
+	sb.WriteString(fmt.Sprintf("Duplicates (%d)", len(rs.issues)))
 	sb.WriteString(ansiReset)
 
-	if len(rs.issues) > 0 {
+	sb.WriteString("  ")
+
+	// Flagged tab
+	if rs.tab == resolverTabFlagged {
+		sb.WriteString(ansiAccent)
+		sb.WriteString(ansiBold)
+	} else {
 		sb.WriteString(ansiMuted)
-		sb.WriteString(fmt.Sprintf("  %d open", len(rs.issues)))
-		sb.WriteString(ansiReset)
 	}
+	sb.WriteString(fmt.Sprintf("Flagged (%d)", len(rs.flagged)))
+	sb.WriteString(ansiReset)
+
 	sb.WriteString("\r\n\r\n")
 
 	// Status message
@@ -361,11 +559,19 @@ func (rs *resolverState) renderList(sb *strings.Builder) {
 		rs.message = ""
 	}
 
+	if rs.tab == resolverTabIssues {
+		rs.renderIssuesList(sb, w)
+	} else {
+		rs.renderFlaggedList(sb, w)
+	}
+}
+
+func (rs *resolverState) renderIssuesList(sb *strings.Builder, w int) {
 	if len(rs.issues) == 0 {
 		sb.WriteString("  ")
 		sb.WriteString(ansiMuted)
 		sb.WriteString(ansiItalic)
-		sb.WriteString("No open issues")
+		sb.WriteString("No duplicate issues")
 		sb.WriteString(ansiReset)
 		sb.WriteString("\r\n")
 	} else {
@@ -446,6 +652,10 @@ func (rs *resolverState) renderList(sb *strings.Builder) {
 	// Footer
 	sb.WriteString("\r\n  ")
 	sb.WriteString(ansiMuted)
+	sb.WriteString("Tab/←→")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" switch  ")
+	sb.WriteString(ansiMuted)
 	sb.WriteString("↑↓/jk")
 	sb.WriteString(ansiReset)
 	sb.WriteString(" navigate  ")
@@ -464,11 +674,108 @@ func (rs *resolverState) renderList(sb *strings.Builder) {
 	sb.WriteString(ansiMuted)
 	sb.WriteString("K")
 	sb.WriteString(ansiReset)
-	sb.WriteString(" keep both  ")
+	sb.WriteString(" both  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("d")
 	sb.WriteString(ansiReset)
-	sb.WriteString(" delete both  ")
+	sb.WriteString(" delete  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("q")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" quit")
+	sb.WriteString("\r\n")
+}
+
+func (rs *resolverState) renderFlaggedList(sb *strings.Builder, w int) {
+	if len(rs.flagged) == 0 {
+		sb.WriteString("  ")
+		sb.WriteString(ansiMuted)
+		sb.WriteString(ansiItalic)
+		sb.WriteString("No flagged statements")
+		sb.WriteString(ansiReset)
+		sb.WriteString("\r\n")
+	} else {
+		// Calculate visible items
+		maxVisible := (rs.termHeight - 10) / 2
+		if maxVisible < 1 {
+			maxVisible = 1
+		}
+		if maxVisible > len(rs.flagged) {
+			maxVisible = len(rs.flagged)
+		}
+
+		start := 0
+		if rs.selected >= maxVisible {
+			start = rs.selected - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(rs.flagged) {
+			end = len(rs.flagged)
+			start = end - maxVisible
+			if start < 0 {
+				start = 0
+			}
+		}
+
+		for i := start; i < end; i++ {
+			f := rs.flagged[i]
+
+			// Selection indicator
+			if i == rs.selected {
+				sb.WriteString("  ")
+				sb.WriteString(ansiAccent)
+				sb.WriteString("▸")
+				sb.WriteString(ansiReset)
+				sb.WriteString(" ")
+			} else {
+				sb.WriteString("    ")
+			}
+
+			// Type badge
+			sb.WriteString(ansiOrange)
+			sb.WriteString("DEL")
+			sb.WriteString(ansiReset)
+
+			// Preview of content
+			preview := firstLine(f.Content)
+			maxPreview := w - 16
+			if maxPreview > 0 && len(preview) > maxPreview {
+				preview = preview[:maxPreview-3] + "..."
+			}
+			sb.WriteString("  ")
+			if i == rs.selected {
+				sb.WriteString(ansiBold)
+			}
+			sb.WriteString(preview)
+			if i == rs.selected {
+				sb.WriteString(ansiReset)
+			}
+			sb.WriteString("\r\n\r\n")
+		}
+	}
+
+	// Footer
+	sb.WriteString("\r\n  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("Tab/←→")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" switch  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("↑↓/jk")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" navigate  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("Enter")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" detail  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("d")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" confirm delete  ")
+	sb.WriteString(ansiMuted)
+	sb.WriteString("r")
+	sb.WriteString(ansiReset)
+	sb.WriteString(" restore  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("q")
 	sb.WriteString(ansiReset)
@@ -507,28 +814,41 @@ func (rs *resolverState) renderDetail(sb *strings.Builder) {
 		sb.WriteString("\r\n")
 	}
 
-	// Footer
+	// Footer (tab-specific)
 	sb.WriteString("\r\n  ")
 	sb.WriteString(ansiMuted)
 	sb.WriteString("↑↓/jk")
 	sb.WriteString(ansiReset)
 	sb.WriteString(" scroll  ")
-	sb.WriteString(ansiMuted)
-	sb.WriteString("a")
-	sb.WriteString(ansiReset)
-	sb.WriteString(" keep A  ")
-	sb.WriteString(ansiMuted)
-	sb.WriteString("b")
-	sb.WriteString(ansiReset)
-	sb.WriteString(" keep B  ")
-	sb.WriteString(ansiMuted)
-	sb.WriteString("K")
-	sb.WriteString(ansiReset)
-	sb.WriteString(" keep both  ")
-	sb.WriteString(ansiMuted)
-	sb.WriteString("d")
-	sb.WriteString(ansiReset)
-	sb.WriteString(" delete both  ")
+
+	if rs.tab == resolverTabIssues {
+		sb.WriteString(ansiMuted)
+		sb.WriteString("a")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" keep A  ")
+		sb.WriteString(ansiMuted)
+		sb.WriteString("b")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" keep B  ")
+		sb.WriteString(ansiMuted)
+		sb.WriteString("K")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" keep both  ")
+		sb.WriteString(ansiMuted)
+		sb.WriteString("d")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" delete both  ")
+	} else {
+		sb.WriteString(ansiMuted)
+		sb.WriteString("d")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" confirm delete  ")
+		sb.WriteString(ansiMuted)
+		sb.WriteString("r")
+		sb.WriteString(ansiReset)
+		sb.WriteString(" restore  ")
+	}
+
 	sb.WriteString(ansiMuted)
 	sb.WriteString("Esc")
 	sb.WriteString(ansiReset)

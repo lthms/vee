@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -90,11 +91,13 @@ func loadProfilesFromDir(dir string) ([]Profile, error) {
 		}
 		content, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", e.Name(), err)
+			slog.Warn("skipping unreadable profile", "file", e.Name(), "error", err)
+			continue
 		}
 		profile, err := parseProfileFile(e.Name(), content)
 		if err != nil {
-			return nil, err
+			slog.Warn("skipping malformed profile", "file", e.Name(), "error", err)
+			continue
 		}
 		profiles = append(profiles, profile)
 	}
@@ -106,9 +109,10 @@ func loadProfilesFromDir(dir string) ([]Profile, error) {
 // and profileOrder. It is called fresh on every invocation (picker open,
 // new-pane, resume) so edits to profile files take effect without restarting.
 //
-// Profiles are merged from two directories:
+// Profiles are merged from three directories (later wins):
 //  1. veePath/profiles/ — installed defaults
-//  2. ~/.config/vee/profiles/ — user overrides (same name wins, new names added)
+//  2. ~/.config/vee/profiles/ — user overrides
+//  3. .vee/profiles/ — project-local overrides
 func initProfileRegistry(veePath string) error {
 	basePrompt, err := promptFS.ReadFile("prompts/base.md")
 	if err != nil {
@@ -135,8 +139,19 @@ func initProfileRegistry(veePath string) error {
 		}
 	}
 
+	// Merge project-local overrides on top (highest priority).
+	cwd, err := os.Getwd()
+	if err == nil {
+		projectDir := filepath.Join(cwd, ".vee", "profiles")
+		if projectProfiles, err := loadProfilesFromDir(projectDir); err == nil {
+			for _, m := range projectProfiles {
+				byName[m.Name] = m
+			}
+		}
+	}
+
 	if len(byName) == 0 {
-		return fmt.Errorf("no profile files found in %s or ~/.config/vee/profiles/", installedDir)
+		return fmt.Errorf("no profile files found in %s, ~/.config/vee/profiles/, or .vee/profiles/", installedDir)
 	}
 
 	// Compose prompts and collect into a slice for sorting.

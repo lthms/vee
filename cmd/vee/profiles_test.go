@@ -275,9 +275,6 @@ func TestInitProfileRegistryFromInstalledProfiles(t *testing.T) {
 
 	// Verify prompt composition for a regular profile.
 	normal := profileRegistry["normal"]
-	if !strings.Contains(normal.Prompt, "Knowledge base") {
-		t.Error("normal prompt should contain base prompt (Knowledge base rule)")
-	}
 	if !strings.Contains(normal.Prompt, `<script>`) {
 		t.Error("normal prompt should contain wrapped profile body")
 	}
@@ -285,13 +282,10 @@ func TestInitProfileRegistryFromInstalledProfiles(t *testing.T) {
 		t.Error("normal prompt should contain profile body text")
 	}
 
-	// Verify claude profile (empty body) gets base prompt without script wrapper.
+	// Verify claude profile (empty body) has no script wrapper.
 	claude := profileRegistry["claude"]
-	if !strings.Contains(claude.Prompt, "Knowledge base") {
-		t.Error("claude prompt should contain base prompt (Knowledge base rule)")
-	}
-	if strings.Contains(claude.Prompt, "<script>") {
-		t.Error("claude prompt should not contain script wrapper (empty body)")
+	if claude.Prompt != "" {
+		t.Errorf("claude prompt should be empty (no body), got %q", claude.Prompt)
 	}
 }
 

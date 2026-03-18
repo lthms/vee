@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -206,21 +205,28 @@ func composeProjectName(sessionID string) string {
 	return "vee-" + sessionID
 }
 
-// buildEphemeralShellCmd constructs the full shell command for an ephemeral Docker session:
-//
-//	printf '\033[?25h'; docker build -t <tag> -f .vee/Dockerfile . && docker run --rm -it ... ; vee _session-ended ...
-func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Profile, projectConfig, identityRule, platformsRule, feedbackBlock, composeContents, prompt string, port int, veePath, veeBinary string, passthrough []string) (string, error) {
-	tag := ephemeralImageTag()
-	df := dockerfilePath(cfg)
-
-	// Write Docker-specific MCP config and settings to the session temp dir
-	mcpConfigFile, err := writeMCPConfigDocker(port, sessionID)
+// runEphemeral builds the Docker image, starts optional Compose services, and
+// runs Claude inside a container with stdio attached. Cleans up on exit.
+func runEphemeral(sessionID string, profile Profile, systemPrompt string, claudeArgs []string, prompt string, sidecarPort int, veePath string, feedbackEnabled bool) error {
+	cfg, err := readProjectTOML()
 	if err != nil {
-		slog.Error("failed to write docker MCP config", "error", err)
+		return fmt.Errorf("failed to read .vee/config: %w", err)
 	}
-	settingsFile, err := writeEphemeralSettings(sessionID, port)
-	if err != nil {
-		slog.Error("failed to write ephemeral settings", "error", err)
+	if cfg.Ephemeral == nil {
+		return fmt.Errorf("no [ephemeral] section in .vee/config")
+	}
+	ecfg := cfg.Ephemeral
+
+	tag := ephemeralImageTag()
+	df := dockerfilePath(ecfg)
+
+	// Write Docker-specific MCP config to the session temp dir
+	var mcpConfigFile string
+	if sidecarPort > 0 {
+		mcpConfigFile, err = writeMCPConfigDocker(sidecarPort, sessionID)
+		if err != nil {
+			slog.Error("failed to write docker MCP config", "error", err)
+		}
 	}
 
 	// Detect git identity and GPG signing configuration
@@ -234,79 +240,82 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 		}
 	}
 
-	// Build the claude CLI arguments (system prompt + session ID + MCP + settings)
-	var claudeArgs []string
-	fullPrompt := composeSystemPrompt(profile.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, true, composeContents)
-	claudeArgs = buildArgs(passthrough, fullPrompt)
-	claudeArgs = append(claudeArgs, "--session-id", sessionID)
-	if mcpConfigFile != "" {
-		claudeArgs = append(claudeArgs, "--mcp-config", mcpConfigFile)
-	}
-	if settingsFile != "" {
-		claudeArgs = append(claudeArgs, "--settings", settingsFile)
-	}
-	claudeArgs = append(claudeArgs, "--plugin-dir", "/opt/vee/plugins/vee")
-	claudeArgs = append(claudeArgs, "--dangerously-skip-permissions")
+	// Validate compose file if configured
+	var composeProject string
+	if ecfg.Compose != "" {
+		cp := composePath(ecfg)
+		if err := validateComposeFile(cp); err != nil {
+			return fmt.Errorf("compose validation failed: %w", err)
+		}
+		composeProject = composeProjectName(sessionID)
 
-	// Build command
-	buildCmd := fmt.Sprintf("docker build -t %s -f %s .", shelljoin(tag), shelljoin(df))
-
-	// Compose lifecycle prefix
-	var composeUpCmd string
-	project := composeProjectName(sessionID)
-	if cfg.Compose != "" {
-		cp := composePath(cfg)
-		composeUpCmd = fmt.Sprintf("docker compose -f %s -p %s up -d --build",
-			shelljoin(cp), shelljoin(project))
+		// Start compose services
+		slog.Info("starting compose services")
+		composeUp := exec.Command("docker", "compose", "-f", cp, "-p", composeProject, "up", "-d", "--build")
+		composeUp.Stdout = os.Stdout
+		composeUp.Stderr = os.Stderr
+		if err := composeUp.Run(); err != nil {
+			return fmt.Errorf("docker compose up: %w", err)
+		}
 	}
 
-	// Docker run arguments
-	var runParts []string
-	runParts = append(runParts, "docker", "run", "--rm", "-it", "--init")
-	runParts = append(runParts, "--entrypoint", "''")
-	runParts = append(runParts, "--name", shelljoin("vee-"+sessionID))
-	runParts = append(runParts, "--add-host", "host.docker.internal:host-gateway")
+	// Docker build
+	slog.Info("building ephemeral image", "tag", tag)
+	buildCmd := exec.Command("docker", "build", "-t", tag, "-f", df, ".")
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		cleanupCompose(ecfg, composeProject)
+		return fmt.Errorf("docker build: %w", err)
+	}
+
+	// Build docker run args
+	runArgs := []string{"run", "--rm", "-it", "--init"}
+	runArgs = append(runArgs, "--entrypoint", "")
+	runArgs = append(runArgs, "--name", "vee-"+sessionID)
+	runArgs = append(runArgs, "--add-host", "host.docker.internal:host-gateway")
 
 	// Connect to Compose network when compose is configured
-	if cfg.Compose != "" {
-		runParts = append(runParts, "--network", shelljoin(project+"_default"))
+	if ecfg.Compose != "" {
+		runArgs = append(runArgs, "--network", composeProject+"_default")
 	}
 
-	// Mount the session temp dir (MCP config + settings)
+	// Mount the session temp dir (MCP config)
 	tmpDir := sessionTempDir(sessionID)
-	runParts = append(runParts, "-v", shelljoin(tmpDir+":"+tmpDir+":ro"))
+	runArgs = append(runArgs, "-v", tmpDir+":"+tmpDir+":ro")
 
 	// Mount the vee installation directory for plugins
-	runParts = append(runParts, "-v", shelljoin(veePath+":/opt/vee:ro"))
+	runArgs = append(runArgs, "-v", veePath+":/opt/vee:ro")
 
 	// Mount the startup script (if configured)
 	var startupScriptPath string
-	if cfg.StartupScript != "" {
-		startupScriptPath = filepath.Join(".vee", cfg.StartupScript)
+	if ecfg.StartupScript != "" {
+		startupScriptPath = filepath.Join(".vee", ecfg.StartupScript)
 		abs, err := filepath.Abs(startupScriptPath)
 		if err == nil {
 			startupScriptPath = abs
 		}
 		if _, err := os.Stat(startupScriptPath); err != nil {
-			return "", fmt.Errorf("startup script %s: %w", startupScriptPath, err)
+			cleanupCompose(ecfg, composeProject)
+			return fmt.Errorf("startup script %s: %w", startupScriptPath, err)
 		}
-		runParts = append(runParts, "-v", shelljoin(startupScriptPath+":/opt/startup.sh:ro"))
+		runArgs = append(runArgs, "-v", startupScriptPath+":/opt/startup.sh:ro")
 	}
 
 	// Environment variables
-	runParts = append(runParts, "-e", "IS_SANDBOX=1")
-	for _, env := range cfg.Env {
-		runParts = append(runParts, "-e", shelljoin(env))
+	runArgs = append(runArgs, "-e", "IS_SANDBOX=1")
+	for _, env := range ecfg.Env {
+		runArgs = append(runArgs, "-e", env)
 	}
 
 	// Git identity forwarding (when configured)
 	if gitConfigFile != "" {
-		runParts = append(runParts, "-v", shelljoin(gitConfigFile+":/etc/gitconfig:ro"))
+		runArgs = append(runArgs, "-v", gitConfigFile+":/etc/gitconfig:ro")
 	}
 
 	// Extra args (passed verbatim)
-	for _, arg := range cfg.ExtraArgs {
-		runParts = append(runParts, shelljoin(arg))
+	for _, arg := range ecfg.ExtraArgs {
+		runArgs = append(runArgs, arg)
 	}
 
 	// Overlay mounts (user mounts + GPG homedir)
@@ -319,20 +328,19 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 	var overlayMounts []overlayMount
 	overlayIndex := 0
 
-	// GPG signing uses the daemon's /api/gpg/sign endpoint via the wrapper script.
-	// Set the daemon port so the wrapper knows where to connect.
-	if gpgCfg != nil {
-		runParts = append(runParts, "-e", shelljoin(fmt.Sprintf("VEE_DAEMON_PORT=%d", port)))
+	// GPG signing uses the sidecar's /api/gpg/sign endpoint via the wrapper script.
+	if gpgCfg != nil && sidecarPort > 0 {
+		runArgs = append(runArgs, "-e", fmt.Sprintf("VEE_DAEMON_PORT=%d", sidecarPort))
 	}
 
 	// User mounts
-	for _, m := range cfg.Mounts {
+	for _, m := range ecfg.Mounts {
 		src := expandHome(m.Source)
 		switch m.Mount {
 		case "ro":
-			runParts = append(runParts, "-v", shelljoin(src+":"+m.Target+":ro"))
+			runArgs = append(runArgs, "-v", src+":"+m.Target+":ro")
 		case "rw":
-			runParts = append(runParts, "-v", shelljoin(src+":"+m.Target))
+			runArgs = append(runArgs, "-v", src+":"+m.Target)
 		default: // "overlay" or empty
 			base := fmt.Sprintf("/overlay/%d", overlayIndex)
 			lower := base + "/lower"
@@ -344,22 +352,34 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 				upper:  upper,
 				work:   work,
 			})
-			runParts = append(runParts, "-v", shelljoin(src+":"+lower+":ro"))
-			runParts = append(runParts, "--tmpfs", shelljoin(base))
+			runArgs = append(runArgs, "-v", src+":"+lower+":ro")
+			runArgs = append(runArgs, "--tmpfs", base)
 			overlayIndex++
 		}
 	}
 
 	if len(overlayMounts) > 0 {
-		runParts = append(runParts, "--cap-add", "SYS_ADMIN")
+		runArgs = append(runArgs, "--cap-add", "SYS_ADMIN")
 	}
 
 	// Image tag
-	runParts = append(runParts, shelljoin(tag))
+	runArgs = append(runArgs, tag)
+
+	// Build the claude command args for inside the container
+	var containerClaudeArgs []string
+	containerClaudeArgs = append(containerClaudeArgs, claudeArgs...)
+	if mcpConfigFile != "" {
+		// Override MCP config with Docker-specific one
+		containerClaudeArgs = stripFlag(containerClaudeArgs, "--mcp-config")
+		containerClaudeArgs = append(containerClaudeArgs, "--mcp-config", mcpConfigFile)
+	}
+	if feedbackEnabled {
+		containerClaudeArgs = append(containerClaudeArgs, "--plugin-dir", "/opt/vee/plugins/vee")
+	}
+	containerClaudeArgs = append(containerClaudeArgs, "--dangerously-skip-permissions")
 
 	// If overlay mounts or a startup script are present, wrap the command
-	// in sh -c to run setup steps before exec'ing claude. The script runs
-	// inside the container; "$@" forwards all remaining args to claude.
+	// in sh -c to run setup steps before exec'ing claude.
 	needsWrapper := len(overlayMounts) > 0 || startupScriptPath != ""
 	if needsWrapper {
 		var wrapperCmds []string
@@ -373,33 +393,85 @@ func buildEphemeralShellCmd(cfg *EphemeralConfig, sessionID string, profile Prof
 			wrapperCmds = append(wrapperCmds, "sh /opt/startup.sh")
 		}
 		script := strings.Join(wrapperCmds, " && ") + ` && exec "$@"`
-		runParts = append(runParts, "sh", "-c", shelljoin(script), "_")
+		runArgs = append(runArgs, "sh", "-c", script, "_")
 	}
 
 	// Claude command inside container
-	runParts = append(runParts, "claude")
+	runArgs = append(runArgs, "claude")
 	if prompt != "" {
-		runParts = append(runParts, shelljoin(prompt))
+		runArgs = append(runArgs, prompt)
 	}
-	for _, arg := range claudeArgs {
-		runParts = append(runParts, shelljoin(arg))
+	runArgs = append(runArgs, containerClaudeArgs...)
+
+	// Run docker
+	slog.Info("starting ephemeral session", "session", sessionID)
+	dockerRun := exec.Command("docker", runArgs...)
+	dockerRun.Stdin = os.Stdin
+	dockerRun.Stdout = os.Stdout
+	dockerRun.Stderr = os.Stderr
+	runErr := dockerRun.Run()
+
+	// Cleanup
+	cleanupEphemeralSession(sessionID, ecfg, composeProject)
+
+	if runErr != nil {
+		return fmt.Errorf("docker run: %w", runErr)
 	}
+	return nil
+}
 
-	runCmd := strings.Join(runParts, " ")
+// cleanupCompose tears down a Compose stack if one was started.
+func cleanupCompose(cfg *EphemeralConfig, composeProject string) {
+	if cfg.Compose == "" || composeProject == "" {
+		return
+	}
+	cp := composePath(cfg)
+	slog.Debug("ephemeral cleanup: compose down", "path", cp, "project", composeProject)
+	down := exec.Command("docker", "compose", "-f", cp, "-p", composeProject, "down")
+	if err := down.Run(); err != nil {
+		slog.Warn("ephemeral cleanup: compose down failed", "error", err)
+	}
+}
 
-	// Cleanup command — runs on host after Docker exits.
-	// Docker/compose teardown is handled by the daemon via cleanupEphemeralSession.
-	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s --wait-for-user",
-		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
+// cleanupEphemeralSession tears down all resources associated with an ephemeral session:
+// the Docker container (best-effort), the Compose stack (if any), and the per-session temp directory.
+func cleanupEphemeralSession(sessionID string, cfg *EphemeralConfig, composeProject string) {
+	// 1. Kill the container (may already be dead from --rm)
+	dockerKill := exec.Command("docker", "kill", "vee-"+sessionID)
+	dockerKill.Run()
+	slog.Debug("ephemeral cleanup: docker kill", "session", sessionID)
 
-	// Assemble the full command chain
-	var chain string
-	if composeUpCmd != "" {
-		chain = "printf '\\033[?25h'; " + composeUpCmd + " && " + buildCmd + " && " + runCmd + "; " + cleanupCmd
+	// 2. Tear down Compose stack if one was started
+	cleanupCompose(cfg, composeProject)
+
+	// 3. Remove per-session temp directory
+	dir := sessionTempDir(sessionID)
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("ephemeral cleanup: failed to remove temp dir", "session", sessionID, "dir", dir, "error", err)
 	} else {
-		chain = "printf '\\033[?25h'; " + buildCmd + " && " + runCmd + "; " + cleanupCmd
+		slog.Debug("ephemeral cleanup: removed temp dir", "session", sessionID, "dir", dir)
 	}
-	return chain, nil
+}
+
+// stripFlag removes a flag and its value from args.
+func stripFlag(args []string, flag string) []string {
+	var out []string
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == flag && i+1 < len(args) {
+			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // writeMCPConfigDocker writes an MCP config file that uses host.docker.internal
@@ -411,7 +483,7 @@ func writeMCPConfigDocker(port int, sessionID string) (string, error) {
 	}
 
 	path := filepath.Join(dir, "mcp.json")
-	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://host.docker.internal:%d/sse?session=%s"}}}`, port, sessionID)
+	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://host.docker.internal:%d/sse"}}}`, port)
 
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return "", err
@@ -421,102 +493,7 @@ func writeMCPConfigDocker(port int, sessionID string) (string, error) {
 	return path, nil
 }
 
-// writeEphemeralSettings writes a settings file with curl-based hooks suitable
-// for use inside a Docker container (no vee binary required, just curl).
-// Uses a shell pipeline that reads stdin once, enriches it with flags, and
-// POSTs the combined JSON to /api/hook/window-state.
-func writeEphemeralSettings(sessionID string, port int) (string, error) {
-	dir := sessionTempDir(sessionID)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-
-	baseURL := fmt.Sprintf("http://host.docker.internal:%d/api/hook/window-state?session=%s",
-		port, sessionID)
-
-	// UserPromptSubmit: merge working=true, notification=false into the hook JSON, then POST
-	promptSubmitCmd := fmt.Sprintf(
-		`jq -c '. + {"working":true,"notification":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
-		baseURL)
-
-	// Stop: merge working=false into the hook JSON, then POST
-	stopCmd := fmt.Sprintf(
-		`jq -c '. + {"working":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
-		baseURL)
-
-	// PostToolUseFailure: clear working only when is_interrupt is true
-	interruptCmd := fmt.Sprintf(
-		`jq -ce 'select(.is_interrupt == true) | . + {"working":false}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
-		baseURL)
-
-	// Notification: merge notification=true into the hook JSON, then POST
-	notifCmd := fmt.Sprintf(
-		`jq -c '. + {"notification":true}' | curl -sf -X POST '%s' -H 'Content-Type: application/json' -d @-`,
-		baseURL)
-
-	settings := map[string]any{
-		"hooks": map[string]any{
-			"UserPromptSubmit": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": promptSubmitCmd,
-						},
-					},
-				},
-			},
-			"Stop": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": stopCmd,
-						},
-					},
-				},
-			},
-			"PostToolUseFailure": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": interruptCmd,
-						},
-					},
-				},
-			},
-			"Notification": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": notifCmd,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	content, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return "", err
-	}
-
-	path := filepath.Join(dir, "settings.json")
-	if err := os.WriteFile(path, content, 0600); err != nil {
-		return "", err
-	}
-
-	slog.Debug("wrote ephemeral settings", "path", path, "session", sessionID, "hooks", "UserPromptSubmit,Stop,PostToolUseFailure,Notification")
-	return path, nil
-}
-
 // writeGitConfig writes a minimal .gitconfig file to the session temp dir.
-// It always includes user.name and user.email from gitCfg. When gpgCfg is
-// provided, it also adds signing configuration (signingkey, commit.gpgsign,
-// and optionally gpg.program).
 func writeGitConfig(sessionID string, gitCfg *GitConfig, gpgCfg *GPGSigningConfig) (string, error) {
 	dir := sessionTempDir(sessionID)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -532,8 +509,6 @@ func writeGitConfig(sessionID string, gitCfg *GitConfig, gpgCfg *GPGSigningConfi
 		b.WriteString(fmt.Sprintf("\temail = %s\n", gitCfg.UserEmail))
 	}
 
-	// Add GPG signing configuration if available
-	// Uses the wrapper script that delegates to the Vee daemon's /api/gpg/sign endpoint
 	if gpgCfg != nil {
 		if gpgCfg.SigningKey != "" {
 			b.WriteString(fmt.Sprintf("\tsigningkey = %s\n", gpgCfg.SigningKey))

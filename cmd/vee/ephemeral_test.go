@@ -32,66 +32,6 @@ func TestComposeProjectName(t *testing.T) {
 	}
 }
 
-func TestBuildEphemeralShellCmdWithCompose(t *testing.T) {
-	cfg := &EphemeralConfig{
-		Dockerfile: "Dockerfile",
-		Compose:    "docker-compose.yml",
-	}
-	sessionID := "test-session-123"
-	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
-
-	cmd, err := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
-	if err != nil {
-		t.Fatalf("buildEphemeralShellCmd() error = %v", err)
-	}
-
-	// Should contain docker compose up prefix
-	if !strings.Contains(cmd, "docker compose -f .vee/docker-compose.yml -p vee-test-session-123 up -d --build") {
-		t.Errorf("expected compose up command in output, got:\n%s", cmd)
-	}
-
-	// Should contain --network flag
-	if !strings.Contains(cmd, "--network") {
-		t.Errorf("expected --network flag in output, got:\n%s", cmd)
-	}
-	if !strings.Contains(cmd, "vee-test-session-123_default") {
-		t.Errorf("expected compose network name in output, got:\n%s", cmd)
-	}
-
-	// Cleanup tail should NOT contain --compose-path or --compose-project
-	// (teardown is now handled by the daemon via cleanupEphemeralSession)
-	if strings.Contains(cmd, "--compose-path") {
-		t.Errorf("unexpected --compose-path in cleanup tail, got:\n%s", cmd)
-	}
-	if strings.Contains(cmd, "--compose-project") {
-		t.Errorf("unexpected --compose-project in cleanup tail, got:\n%s", cmd)
-	}
-}
-
-func TestBuildEphemeralShellCmdWithoutCompose(t *testing.T) {
-	cfg := &EphemeralConfig{
-		Dockerfile: "Dockerfile",
-	}
-	sessionID := "test-session-456"
-	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
-
-	cmd, err := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
-	if err != nil {
-		t.Fatalf("buildEphemeralShellCmd() error = %v", err)
-	}
-
-	// Should NOT contain docker compose commands
-	if strings.Contains(cmd, "docker compose") {
-		t.Errorf("unexpected compose command in output, got:\n%s", cmd)
-	}
-
-	// Should NOT contain --network flag
-	if strings.Contains(cmd, "--network") {
-		t.Errorf("unexpected --network flag in output, got:\n%s", cmd)
-	}
-
-}
-
 func TestComposeSystemPromptInjection(t *testing.T) {
 	composeContents := `services:
   postgres:
@@ -103,7 +43,7 @@ func TestComposeSystemPromptInjection(t *testing.T) {
     expose:
       - "6379"`
 
-	prompt := composeSystemPrompt("base", "", "", "", "", true, composeContents)
+	prompt := composeSystemPrompt("", "", "", "", "", "", true, composeContents)
 
 	if !strings.Contains(prompt, "Docker Compose services") {
 		t.Errorf("expected compose services description in prompt, got:\n%s", prompt)
@@ -120,7 +60,7 @@ func TestComposeSystemPromptInjection(t *testing.T) {
 }
 
 func TestComposeSystemPromptNoInjectionWithoutCompose(t *testing.T) {
-	prompt := composeSystemPrompt("base", "", "", "", "", true, "")
+	prompt := composeSystemPrompt("", "", "", "", "", "", true, "")
 
 	if strings.Contains(prompt, "Docker Compose services") {
 		t.Errorf("unexpected compose injection in prompt without compose contents, got:\n%s", prompt)
@@ -193,7 +133,6 @@ func TestWriteGitConfigWithGPG(t *testing.T) {
 
 	contentStr := string(content)
 
-	// Check [user] section
 	if !strings.Contains(contentStr, "[user]") {
 		t.Errorf("missing [user] section in gitconfig:\n%s", contentStr)
 	}
@@ -206,24 +145,18 @@ func TestWriteGitConfigWithGPG(t *testing.T) {
 	if !strings.Contains(contentStr, "signingkey = ABCD1234") {
 		t.Errorf("missing user.signingkey in gitconfig:\n%s", contentStr)
 	}
-
-	// Check [commit] section
 	if !strings.Contains(contentStr, "[commit]") {
 		t.Errorf("missing [commit] section in gitconfig:\n%s", contentStr)
 	}
 	if !strings.Contains(contentStr, "gpgsign = true") {
 		t.Errorf("missing commit.gpgsign in gitconfig:\n%s", contentStr)
 	}
-
-	// Check [gpg] section — uses wrapper script instead of host gpg
 	if !strings.Contains(contentStr, "[gpg]") {
 		t.Errorf("missing [gpg] section in gitconfig:\n%s", contentStr)
 	}
 	if !strings.Contains(contentStr, "program = /opt/vee/scripts/gpg-sign-wrapper") {
 		t.Errorf("missing gpg.program wrapper in gitconfig:\n%s", contentStr)
 	}
-
-	// Check [safe] section
 	if !strings.Contains(contentStr, "[safe]") {
 		t.Errorf("missing [safe] section in gitconfig:\n%s", contentStr)
 	}
@@ -257,7 +190,6 @@ func TestWriteGitConfigWithoutGPG(t *testing.T) {
 
 	contentStr := string(content)
 
-	// Should have [user] but no [commit] or [gpg]
 	if !strings.Contains(contentStr, "[user]") {
 		t.Errorf("missing [user] section in gitconfig:\n%s", contentStr)
 	}
@@ -276,8 +208,6 @@ func TestWriteGitConfigWithoutGPG(t *testing.T) {
 	if strings.Contains(contentStr, "signingkey") {
 		t.Errorf("unexpected signingkey in gitconfig (no GPG):\n%s", contentStr)
 	}
-
-	// Should still have [safe] section
 	if !strings.Contains(contentStr, "[safe]") {
 		t.Errorf("missing [safe] section in gitconfig:\n%s", contentStr)
 	}
@@ -286,31 +216,44 @@ func TestWriteGitConfigWithoutGPG(t *testing.T) {
 	}
 }
 
-func TestBuildEphemeralShellCmdWithoutGPGSigning(t *testing.T) {
-	cfg := &EphemeralConfig{
-		Dockerfile: "Dockerfile",
+func TestStripFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		flag string
+		want []string
+	}{
+		{
+			name: "removes flag with separate value",
+			args: []string{"--foo", "bar", "--mcp-config", "/tmp/mcp.json", "--baz"},
+			flag: "--mcp-config",
+			want: []string{"--foo", "bar", "--baz"},
+		},
+		{
+			name: "removes flag=value",
+			args: []string{"--foo", "--mcp-config=/tmp/mcp.json", "--baz"},
+			flag: "--mcp-config",
+			want: []string{"--foo", "--baz"},
+		},
+		{
+			name: "no match",
+			args: []string{"--foo", "bar"},
+			flag: "--mcp-config",
+			want: []string{"--foo", "bar"},
+		},
 	}
-	sessionID := "no-gpg-test"
-	profile := Profile{Name: "vibe", Indicator: "⚡", Prompt: "test prompt"}
 
-	cmd, err := buildEphemeralShellCmd(cfg, sessionID, profile, "", "", "", "", "", "", 2700, "/opt/vee", "/usr/bin/vee", nil)
-	if err != nil {
-		t.Fatalf("buildEphemeralShellCmd() error = %v", err)
-	}
-
-	// On most test environments, GPG signing is not configured
-	// so we should not see GPG-related mounts or env vars.
-	// Note: if the test environment has GPG signing configured, this test may need adjustment.
-	if strings.Contains(cmd, "GNUPGHOME=") && !strings.Contains(cmd, "IS_SANDBOX=1") {
-		// Only fail if GNUPGHOME appears without being part of user config
-		// This is a safety check - the test relies on the environment not having GPG configured
-	}
-
-	// The command should still contain basic Docker run arguments
-	if !strings.Contains(cmd, "docker run") {
-		t.Errorf("missing 'docker run' in command:\n%s", cmd)
-	}
-	if !strings.Contains(cmd, "IS_SANDBOX=1") {
-		t.Errorf("missing IS_SANDBOX=1 in command:\n%s", cmd)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripFlag(tt.args, tt.flag)
+			if len(got) != len(tt.want) {
+				t.Fatalf("stripFlag() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("stripFlag()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

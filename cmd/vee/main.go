@@ -2,19 +2,17 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"embed"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+	"syscall"
 
 	"github.com/alecthomas/kong"
 	"github.com/lthms/vee/internal/feedback"
+	"github.com/lthms/vee/internal/kb"
 )
 
 //go:embed prompts/*.md
@@ -26,66 +24,9 @@ type Profile struct {
 	Indicator         string
 	Description       string
 	Priority          int
-	Prompt            string // composed system prompt content
+	Prompt            string // composed system prompt content (wrapped body, no base.md)
 	DefaultPrompt     string // template for the initial prompt (optional)
 	PromptPlaceholder string // hint text for the picker's prompt field (optional)
-}
-
-// logFilePath returns the log path for this Vee instance.
-func logFilePath() string {
-	return filepath.Join(veeRuntimeDir(), tmuxSocketName+".log")
-}
-
-// instanceSocket computes a unique tmux socket name from the absolute CWD.
-func instanceSocket() string {
-	abs, err := filepath.Abs(".")
-	if err != nil {
-		abs = "."
-	}
-	h := sha256.Sum256([]byte(abs))
-	return fmt.Sprintf("vee-%x", h[:8])
-}
-
-// discoverDaemonPort reads VEE_PORT from the tmux environment.
-func discoverDaemonPort() (int, error) {
-	out, err := tmuxRun("show-environment", "VEE_PORT")
-	if err != nil {
-		return 0, fmt.Errorf("show-environment: %w", err)
-	}
-	// Output format: "VEE_PORT=12345"
-	parts := strings.SplitN(out, "=", 2)
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("unexpected output: %s", out)
-	}
-	var port int
-	if _, err := fmt.Sscanf(parts[1], "%d", &port); err != nil {
-		return 0, fmt.Errorf("parse port: %w", err)
-	}
-	return port, nil
-}
-
-// daemonAlive checks whether the daemon is responding on the given port.
-func daemonAlive(port int) bool {
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", port))
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
-
-// waitForDaemon polls until the daemon is reachable or the timeout expires.
-func waitForDaemon(timeout time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		port, err := discoverDaemonPort()
-		if err == nil && daemonAlive(port) {
-			return port, nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return 0, fmt.Errorf("daemon did not start within %s", timeout)
 }
 
 // profileRegistry holds all known profiles, keyed by name.
@@ -94,847 +35,27 @@ var profileRegistry map[string]Profile
 // profileOrder defines the display order, populated by initProfileRegistry.
 var profileOrder []string
 
-// claudeArgs holds the arguments after "--" that are forwarded to claude.
-type claudeArgs []string
-
 // CLI is the top-level command structure for vee.
 type CLI struct {
-	Debug          bool              `env:"VEE_DEBUG" help:"Enable debug logging."`
-	Start          StartCmd          `cmd:"" help:"Start an interactive Vee session."`
-	Daemon         DaemonCmd         `cmd:"" help:"Run the Vee daemon (MCP server + dashboard)."`
-	NewPane        NewPaneCmd        `cmd:"" name:"_new-pane" hidden:"" help:"Internal: create a new tmux window."`
-	Dashboard      DashboardCmd      `cmd:"" name:"_dashboard" hidden:"" help:"Internal: session dashboard TUI."`
-	SessionPicker  SessionPickerCmd  `cmd:"" name:"_session-picker" hidden:"" help:"Internal: interactive profile picker."`
-	SuspendWindow  SuspendWindowCmd  `cmd:"" name:"_suspend-window" hidden:"" help:"Internal: suspend session by window."`
-	CompleteWindow CompleteWindowCmd `cmd:"" name:"_complete-window" hidden:"" help:"Internal: complete session by window."`
-	ResumeMenu     ResumeMenuCmd     `cmd:"" name:"_resume-menu" hidden:"" help:"Internal: show resume picker."`
-	ResumeSession  ResumeSessionCmd  `cmd:"" name:"_resume-session" hidden:"" help:"Internal: resume a suspended session."`
-	SessionEnded   SessionEndedCmd   `cmd:"" name:"_session-ended" hidden:"" help:"Internal: clean up after Claude exits."`
-	UpdatePreview  UpdatePreviewCmd  `cmd:"" name:"_update-preview" hidden:"" help:"Internal: update session preview from hook."`
-	UpdateWindow   UpdateWindowCmd   `cmd:"" name:"_update-window" hidden:"" help:"Internal: update window state from hook."`
-	LogViewer      LogViewerCmd      `cmd:"" name:"_log-viewer" hidden:"" help:"Internal: tail logs in a popup."`
-	PromptViewer   PromptViewerCmd   `cmd:"" name:"_prompt-viewer" hidden:"" help:"Internal: display session system prompt."`
-	KBExplorer     KBExplorerCmd     `cmd:"" name:"_kb-explorer" hidden:"" help:"Internal: KB explorer TUI."`
-	IssueResolver  IssueResolverCmd  `cmd:"" name:"_issue-resolver" hidden:"" help:"Internal: KB issue resolver TUI."`
-	Shutdown       ShutdownCmd       `cmd:"" name:"_shutdown" hidden:"" help:"Internal: graceful shutdown."`
-	Serve          ServeCmd          `cmd:"" name:"_serve" hidden:"" help:"Internal: daemon + dashboard inside tmux."`
+	Debug     bool      `env:"VEE_DEBUG" help:"Enable debug logging."`
+	Profile   string    `help:"Behavioral profile name." short:"p"`
+	KB        bool      `help:"Enable knowledge base." name:"kb"`
+	Feedback  bool      `help:"Enable feedback system."`
+	Ephemeral bool      `help:"Run in ephemeral Docker container."`
+	VeePath   string    `type:"path" help:"Path to vee installation." name:"vee-path"`
+	Run       RunCmd    `cmd:"" default:"withargs" help:"Run a Claude session."`
+	Resume    ResumeCmd `cmd:"" help:"Resume a previous session."`
 }
 
-// StartCmd runs the in-process server and manages the tmux session.
-type StartCmd struct {
-	VeePath string `type:"path" help:"Path to the vee installation directory." name:"vee-path"`
+// RunCmd is the default command — starts a new Claude session.
+type RunCmd struct {
+	Prompt []string `arg:"" optional:""`
 }
 
-// Run starts (or reattaches to) a Vee instance for the current directory.
-func (cmd *StartCmd) Run(args claudeArgs) error {
-	// Default VeePath to ~/.local/share/vee if not provided
-	if cmd.VeePath == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("cannot determine home directory: %w", err)
-		}
-		cmd.VeePath = filepath.Join(home, ".local", "share", "vee")
-	}
-
-	// Compute instance-specific socket name
-	socketName := instanceSocket()
-	tmuxSocketName = socketName
-
-	// Ensure the tmux socket directory exists
-	if err := ensureRuntimeDir(); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
-	}
-
-	// Resolve own binary path
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
-
-	// If a tmux session already exists for this project, try to reclaim it
-	if tmuxSessionExists() {
-		port, err := discoverDaemonPort()
-		if err == nil && daemonAlive(port) {
-			// Daemon is alive — just reattach
-			err = tmuxAttach()
-			fmt.Print("\033[H\033[2J")
-			return err
-		}
-		// Stale session — clean up
-		tmuxRun("kill-session", "-t", tmuxSessionName)
-	}
-
-	// Clean up stale temp directories from previous runs
-	cleanStaleTempFiles()
-
-	// Build the _serve command for window 0
-	absVeePath, _ := filepath.Abs(cmd.VeePath)
-	serveShellCmd := fmt.Sprintf("%s _serve --vee-path %s --tmux-socket %s",
-		shelljoin(veeBinary), shelljoin(absVeePath), socketName)
-	if len(args) > 0 {
-		serveShellCmd += " --"
-		for _, a := range args {
-			serveShellCmd += " " + shelljoin(a)
-		}
-	}
-
-	// Create tmux session with _serve in window 0
-	if err := tmuxCreateSession(serveShellCmd); err != nil {
-		return fmt.Errorf("failed to create tmux session: %w", err)
-	}
-
-	// Wait for the daemon to come up
-	if _, err := waitForDaemon(10 * time.Second); err != nil {
-		return fmt.Errorf("daemon failed to start: %w", err)
-	}
-
-	// Attach to tmux — blocks until detach or session end
-	err = tmuxAttach()
-	fmt.Print("\033[H\033[2J")
-
-	if err != nil && !tmuxSessionExists() {
-		// Server was killed (e.g. Ctrl-b x shutdown). The _shutdown command
-		// runs inside tmux via run-shell, so it gets killed before it can
-		// clean up the socket file. Do it here instead.
-		os.Remove(tmuxSocketPath())
-		return nil
-	}
-
-	return err
-}
-
-// ServeCmd is the internal command that runs inside tmux window 0.
-// It starts the daemon, configures tmux, and runs the dashboard.
-type ServeCmd struct {
-	VeePath    string `required:"" type:"path" name:"vee-path"`
-	TmuxSocket string `required:"" name:"tmux-socket"`
-}
-
-// Run starts the daemon, publishes the port, configures tmux, and runs the dashboard.
-func (cmd *ServeCmd) Run(args claudeArgs) error {
-	tmuxSocketName = cmd.TmuxSocket
-
-	if err := initProfileRegistry(cmd.VeePath); err != nil {
-		return fmt.Errorf("failed to init profile registry: %w", err)
-	}
-
-	projectConfig, err := readProjectConfig()
-	if err != nil {
-		return fmt.Errorf("failed to read project config: %w", err)
-	}
-
-	setupFileLogger(logFilePath())
-
-	userCfg, err := loadUserConfig()
-	if err != nil {
-		slog.Warn("failed to load user config, using defaults", "error", err)
-		userCfg = hydrateUserConfig(nil)
-	}
-
-	// Resolve identity + platforms from project config
-	var projectIdentity *IdentityConfig
-	var platRule string
-	if projCfg, err := readProjectTOML(); err == nil {
-		projectIdentity = projCfg.Identity
-		platRule = platformsRule(projCfg.Platforms)
-	}
-	resolvedIdentity := resolveIdentity(userCfg.Identity, projectIdentity)
-	if err := validateIdentity(resolvedIdentity); err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
-	idRule := identityRule(resolvedIdentity)
-
-	kbase, err := openKB(userCfg)
-	if err != nil {
-		return fmt.Errorf("failed to open knowledge base: %w", err)
-	}
-	defer kbase.Close()
-
-	// Start the KB background worker for async embedding + duplicate detection
-	workerCtx, workerCancel := context.WithCancel(context.Background())
-	defer workerCancel()
-	go kbase.RunWorker(workerCtx)
-
-	stDir, err := stateDir()
-	if err != nil {
-		return fmt.Errorf("state dir: %w", err)
-	}
-	fstore, err := feedback.Open(filepath.Join(stDir, "feedback.db"))
-	if err != nil {
-		return fmt.Errorf("open feedback store: %w", err)
-	}
-	defer fstore.Close()
-
-	app := newApp()
-
-	srv, port, err := startHTTPServerInBackground(app, kbase, fstore)
-	if err != nil {
-		return fmt.Errorf("failed to start HTTP server: %w", err)
-	}
-	defer srv.Close()
-
-	// Publish port so StartCmd can discover it on reattach
-	tmuxRun("set-environment", "VEE_PORT", fmt.Sprintf("%d", port))
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
-
-	app.SetConfig(&AppConfig{
-		VeePath:       cmd.VeePath,
-		Port:          port,
-		Passthrough:   []string(args),
-		ProjectConfig: projectConfig,
-		IdentityRule:  idRule,
-		PlatformsRule: platRule,
-		MaxExamples:   userCfg.Feedback.MaxExamples,
-	})
-
-	// Resolve project directory for status bar
-	projectDir, _ := filepath.Abs(".")
-
-	// Apply tmux configuration
-	if err := tmuxConfigure(veeBinary, port, cmd.VeePath, []string(args), projectDir); err != nil {
-		return fmt.Errorf("failed to configure tmux: %w", err)
-	}
-
-	// Run dashboard inline — blocks until the session ends
-	return (&DashboardCmd{Port: port}).Run()
-}
-
-// NewPaneCmd is the internal subcommand called by tmux display-menu entries.
-type NewPaneCmd struct {
-	VeePath    string `required:"" type:"path" name:"vee-path"`
-	Port       int    `short:"p" default:"2700" name:"port"`
-	Profile    string `required:"" name:"profile"`
-	Prompt     string `name:"prompt" help:"Initial prompt for the session."`
-	Ephemeral  bool   `name:"ephemeral" help:"Run session in an ephemeral Docker container."`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run creates a new tmux window with a Claude session for the given profile.
-func (cmd *NewPaneCmd) Run(args claudeArgs) error {
-	tmuxSocketName = cmd.TmuxSocket
-	if err := initProfileRegistry(cmd.VeePath); err != nil {
-		return fmt.Errorf("failed to init profile registry: %w", err)
-	}
-
-	profile, ok := profileRegistry[cmd.Profile]
-	if !ok {
-		return fmt.Errorf("unknown profile: %s", cmd.Profile)
-	}
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
-
-	// Fetch config from the running daemon
-	appCfg, err := fetchAppConfig(cmd.Port)
-	if err != nil {
-		slog.Warn("failed to fetch config from daemon, proceeding without", "error", err)
-		appCfg = &AppConfig{}
-	}
-
-	// Generate session ID
-	sessionID := newUUID()
-
-	// Sample feedback for this profile
-	feedbackBlock := fetchFeedbackBlock(cmd.Port, profile.Name, appCfg.MaxExamples)
-
-	// Read compose file contents for prompt injection (if ephemeral + compose configured)
-	isEphemeral := cmd.Ephemeral
-	var composeContents string
-	if isEphemeral {
-		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
-			cp := composePath(cfg.Ephemeral)
-			if data, err := os.ReadFile(cp); err == nil {
-				composeContents = string(data)
-			}
-		}
-	}
-
-	// Compose system prompt (for storage — lets prompt viewer display it later)
-	systemPrompt := composeSystemPrompt(profile.Prompt, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, appCfg.ProjectConfig, isEphemeral, composeContents)
-
-	var shellCmd string
-	if isEphemeral {
-		cfg, err := readProjectTOML()
-		if err != nil {
-			return fmt.Errorf("failed to read .vee/config: %w", err)
-		}
-		if cfg.Ephemeral == nil {
-			return fmt.Errorf("no [ephemeral] section in .vee/config")
-		}
-		if cfg.Ephemeral.Compose != "" {
-			cp := composePath(cfg.Ephemeral)
-			if err := validateComposeFile(cp); err != nil {
-				return fmt.Errorf("compose validation failed: %w", err)
-			}
-		}
-		shellCmd, err = buildEphemeralShellCmd(cfg.Ephemeral, sessionID, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, composeContents, cmd.Prompt, cmd.Port, cmd.VeePath, veeBinary, []string(args))
-		if err != nil {
-			return fmt.Errorf("ephemeral session: %w", err)
-		}
-	} else {
-		sessionArgs := buildSessionArgs(sessionID, false, profile, appCfg.ProjectConfig, appCfg.IdentityRule, appCfg.PlatformsRule, feedbackBlock, cmd.Port, cmd.VeePath, []string(args), veeBinary)
-		shellCmd = buildWindowShellCmd(veeBinary, cmd.Port, sessionID, sessionArgs, cmd.Prompt)
-	}
-
-	windowName := fmt.Sprintf("%s %s", profile.Indicator, profile.Name)
-
-	// Create the tmux window first so we have the window ID
-	windowID, err := tmuxNewWindow(windowName, shellCmd)
-	if err != nil {
-		return fmt.Errorf("failed to create tmux window: %w", err)
-	}
-
-	// Set @vee-ephemeral on the window if this is an ephemeral session
-	if isEphemeral {
-		tmuxSetWindowOption(windowID, "vee-ephemeral", "1")
-	}
-
-	// Derive compose info for daemon-side cleanup
-	var regComposePath, regComposeProject string
-	if isEphemeral {
-		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
-			regComposePath = composePath(cfg.Ephemeral)
-			regComposeProject = composeProjectName(sessionID)
-		}
-	}
-
-	// Register session with daemon, including the window target and system prompt
-	if err := registerSession(cmd.Port, sessionID, profile, windowID, isEphemeral, regComposePath, regComposeProject, systemPrompt); err != nil {
-		slog.Warn("failed to register session with daemon", "error", err)
-	}
-
-	return nil
-}
-
-// registerSession registers a new session with the running daemon.
-func registerSession(port int, sessionID string, profile Profile, windowTarget string, ephemeral bool, composePath, composeProject, systemPrompt string) error {
-	payload, _ := json.Marshal(map[string]any{
-		"id":              sessionID,
-		"profile":         profile.Name,
-		"indicator":       profile.Indicator,
-		"preview":         "",
-		"window_target":   windowTarget,
-		"ephemeral":       ephemeral,
-		"compose_path":    composePath,
-		"compose_project": composeProject,
-		"system_prompt":   systemPrompt,
-	})
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port),
-		"application/json",
-		strings.NewReader(string(payload)),
-	)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-// SuspendWindowCmd suspends the session running in a given tmux window.
-type SuspendWindowCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	WindowID   string `required:"" name:"window-id"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run suspends the session by its tmux window ID.
-func (cmd *SuspendWindowCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
-		"application/json",
-		strings.NewReader(body),
-	)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		// No session in this window (e.g. dashboard) — show a tmux message
-		tmuxRun("display-message", "No session to suspend in this window")
-		return nil
-	}
-
-	return nil
-}
-
-// CompleteWindowCmd marks the session running in a given tmux window as completed.
-type CompleteWindowCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	WindowID   string `required:"" name:"window-id"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run marks the session as completed by its tmux window ID.
-func (cmd *CompleteWindowCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	body := fmt.Sprintf(`{"window_target":%q}`, cmd.WindowID)
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/complete", cmd.Port),
-		"application/json",
-		strings.NewReader(body),
-	)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		tmuxRun("display-message", "No session to complete in this window")
-		return nil
-	}
-
-	return nil
-}
-
-// ResumeMenuCmd shows a tmux display-menu of suspended sessions.
-type ResumeMenuCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run fetches suspended sessions and shows a tmux picker.
-func (cmd *ResumeMenuCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	// Fetch state from daemon
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var state struct {
-		Suspended []*Session `json:"suspended_sessions"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return err
-	}
-
-	if len(state.Suspended) == 0 {
-		tmuxRun("display-message", "No suspended sessions")
-		return nil
-	}
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	// Build display-menu command
-	args := []string{"display-menu", "-T", "Resume Session"}
-
-	for _, sess := range state.Suspended {
-		label := fmt.Sprintf("⏣ ⊙ %s %s", sess.Indicator, sess.Profile)
-		if sess.Preview != "" {
-			preview := sess.Preview
-			if len(preview) > 40 {
-				preview = preview[:40] + "..."
-			}
-			label += "  " + preview
-		}
-
-		resumeCmd := fmt.Sprintf("%s _resume-session --port %d --session-id %s --profile %s --tmux-socket %s",
-			shelljoin(veeBinary), cmd.Port, sess.ID, sess.Profile, tmuxSocketName)
-
-		args = append(args, label, "", "run-shell "+shelljoin(resumeCmd))
-	}
-
-	_, err = tmuxRun(args...)
-	return err
-}
-
-// ResumeSessionCmd resumes a suspended session in a new tmux window.
-type ResumeSessionCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	SessionID  string `required:"" name:"session-id"`
-	Profile    string `required:"" name:"profile"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run resumes a suspended session.
-func (cmd *ResumeSessionCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-
-	veeBinary, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to resolve executable path: %w", err)
-	}
-
-	// Fetch config from daemon (needed for VeePath before loading profiles).
-	cfg, err := fetchAppConfig(cmd.Port)
-	if err != nil {
-		return fmt.Errorf("failed to fetch config from daemon: %w", err)
-	}
-
-	if err := initProfileRegistry(cfg.VeePath); err != nil {
-		return fmt.Errorf("failed to init profile registry: %w", err)
-	}
-
-	profile, ok := profileRegistry[cmd.Profile]
-	if !ok {
-		// Profile file may have been removed since the session was created.
-		// Construct a minimal fallback — --resume strips the system prompt
-		// anyway, so the body isn't needed.
-		profile = Profile{
-			Name:      cmd.Profile,
-			Indicator: "?",
-		}
-		// Try to recover the indicator from the stored session.
-		if sess, err := fetchSession(cmd.Port, cmd.SessionID); err == nil {
-			profile.Indicator = sess.Indicator
-		}
-	}
-
-	// Build claude args with --resume (feedback block is empty — system prompt is stripped on resume)
-	sessionArgs := buildSessionArgs(cmd.SessionID, true, profile, cfg.ProjectConfig, cfg.IdentityRule, cfg.PlatformsRule, "", cfg.Port, cfg.VeePath, cfg.Passthrough, veeBinary)
-
-	shellCmd := buildWindowShellCmd(veeBinary, cfg.Port, cmd.SessionID, sessionArgs, "")
-	windowName := fmt.Sprintf("%s %s", profile.Indicator, profile.Name)
-
-	windowID, err := tmuxNewWindow(windowName, shellCmd)
-	if err != nil {
-		return fmt.Errorf("failed to create tmux window: %w", err)
-	}
-
-	// Activate the session with the new window target
-	activateBody := fmt.Sprintf(`{"session_id":%q,"window_target":%q}`, cmd.SessionID, windowID)
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/activate", cfg.Port),
-		"application/json",
-		strings.NewReader(activateBody),
-	)
-	if err != nil {
-		slog.Warn("failed to activate session", "error", err)
-	} else {
-		resp.Body.Close()
-	}
-
-	return nil
-}
-
-// buildWindowShellCmd constructs the shell command for a tmux window:
-//
-//	claude <args> [prompt]; vee _session-ended --port <port> --session-id <id>
-//
-// The cleanup tail ensures the daemon is notified when Claude exits for any reason.
-func buildWindowShellCmd(veeBinary string, port int, sessionID string, claudeArgs []string, prompt string) string {
-	var cmdParts []string
-	cmdParts = append(cmdParts, "claude")
-	if prompt != "" {
-		cmdParts = append(cmdParts, shelljoin(prompt))
-	}
-	for _, arg := range claudeArgs {
-		cmdParts = append(cmdParts, shelljoin(arg))
-	}
-
-	claudeCmd := strings.Join(cmdParts, " ")
-	cleanupCmd := fmt.Sprintf("%s _session-ended --port %d --tmux-socket %s --session-id %s",
-		shelljoin(veeBinary), port, tmuxSocketName, sessionID)
-
-	return "printf '\\033[?25h'; " + claudeCmd + "; " + cleanupCmd
-}
-
-// SessionEndedCmd is called when Claude exits to clean up stale sessions.
-type SessionEndedCmd struct {
-	Port        int    `short:"p" default:"2700" name:"port"`
-	SessionID   string `required:"" name:"session-id"`
-	WaitForUser bool   `name:"wait-for-user" help:"Pause for user input before closing (used for ephemeral sessions)."`
-	TmuxSocket  string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run notifies the daemon that a Claude process has exited and cleans up temp files.
-func (cmd *SessionEndedCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	setupFileLogger(logFilePath())
-
-	if cmd.WaitForUser {
-		fmt.Print("\n\033[1mPress Enter to close...\033[0m")
-		buf := make([]byte, 1)
-		os.Stdin.Read(buf)
-	}
-
-	// Clean up per-session temp directory
-	dir := sessionTempDir(cmd.SessionID)
-	if err := os.RemoveAll(dir); err != nil {
-		slog.Warn("session-ended: failed to remove temp dir", "dir", dir, "error", err)
-	} else {
-		slog.Debug("session-ended: cleaned up temp dir", "dir", dir)
-	}
-
-	body := fmt.Sprintf(`{"session_id":%q}`, cmd.SessionID)
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/session-ended", cmd.Port),
-		"application/json",
-		strings.NewReader(body),
-	)
-	if err != nil {
-		// Daemon might already be gone (e.g. Ctrl-b q killed everything)
-		return nil
-	}
-	defer resp.Body.Close()
-	return nil
-}
-
-// ShutdownCmd gracefully shuts down the Vee session: suspends all active
-// sessions so they can be resumed later, cleans up temp files, then kills tmux.
-type ShutdownCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-func (cmd *ShutdownCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	setupFileLogger(logFilePath())
-	slog.Debug("shutdown: starting graceful shutdown")
-
-	// Fetch state from the daemon
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/state", cmd.Port))
-	if err == nil {
-		defer resp.Body.Close()
-
-		var state struct {
-			Active   []*Session     `json:"active_sessions"`
-			Indexing []IndexingTask `json:"indexing_tasks"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&state); err == nil {
-			// Warn if indexing is in progress
-			if len(state.Indexing) > 0 {
-				slog.Debug("shutdown: indexing in progress", "count", len(state.Indexing))
-				msg := fmt.Sprintf("%d note(s) are being indexed. Quit anyway?", len(state.Indexing))
-				// Use tmux confirm-before to ask the user
-				out, confirmErr := tmuxRun("confirm-before", "-p", msg+" (y/n)", "run-shell 'exit 0'")
-				if confirmErr != nil {
-					slog.Debug("shutdown: user cancelled due to indexing warning", "output", out)
-					return nil
-				}
-			}
-
-			slog.Debug("shutdown: handling active sessions", "count", len(state.Active))
-			for _, sess := range state.Active {
-				if sess.Ephemeral {
-					// Ephemeral sessions cannot be suspended — the daemon's
-					// /api/complete handler takes care of container + compose cleanup.
-					slog.Debug("shutdown: completing ephemeral session", "id", sess.ID, "profile", sess.Profile)
-					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
-					r, err := http.Post(
-						fmt.Sprintf("http://127.0.0.1:%d/api/complete", cmd.Port),
-						"application/json",
-						strings.NewReader(body),
-					)
-					if err == nil {
-						r.Body.Close()
-					}
-				} else {
-					slog.Debug("shutdown: suspending session", "id", sess.ID, "profile", sess.Profile, "window", sess.WindowTarget)
-					body := fmt.Sprintf(`{"window_target":%q}`, sess.WindowTarget)
-					r, err := http.Post(
-						fmt.Sprintf("http://127.0.0.1:%d/api/suspend", cmd.Port),
-						"application/json",
-						strings.NewReader(body),
-					)
-					if err == nil {
-						r.Body.Close()
-					}
-				}
-			}
-		}
-	} else {
-		slog.Warn("shutdown: failed to fetch state from daemon", "error", err)
-	}
-
-	// Clean up all temp dirs
-	slog.Debug("shutdown: cleaning stale temp files")
-	cleanStaleTempFiles()
-
-	// Kill the entire tmux server for this socket. Each vee instance has
-	// its own socket, so this is safe and also cleans up the background
-	// session ("vee-bg") used by tmuxGracefulClose.
-	slog.Debug("shutdown: killing tmux server")
-	tmuxRun("kill-server")
-	return nil
-}
-
-// UpdatePreviewCmd is the hook handler that reads the user prompt from stdin
-// and updates the session preview via the daemon API.
-type UpdatePreviewCmd struct {
-	Port       int    `short:"p" default:"2700" name:"port"`
-	SessionID  string `required:"" name:"session-id"`
-	TmuxSocket string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run reads the hook JSON from stdin, extracts the prompt, and POSTs it to the daemon.
-func (cmd *UpdatePreviewCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	setupFileLogger(logFilePath())
-	var hookData struct {
-		Prompt string `json:"prompt"`
-	}
-	if err := json.NewDecoder(os.Stdin).Decode(&hookData); err != nil {
-		slog.Debug("update-preview: failed to decode hook stdin", "error", err)
-		return nil
-	}
-
-	if hookData.Prompt == "" {
-		slog.Debug("update-preview: empty prompt, skipping")
-		return nil
-	}
-
-	preview := hookData.Prompt
-	if len(preview) > 200 {
-		preview = preview[:200]
-	}
-
-	slog.Debug("update-preview: posting preview", "session", cmd.SessionID, "preview", preview)
-
-	body, _ := json.Marshal(map[string]string{
-		"session_id": cmd.SessionID,
-		"preview":    preview,
-	})
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/preview", cmd.Port),
-		"application/json",
-		strings.NewReader(string(body)),
-	)
-	if err != nil {
-		slog.Debug("update-preview: failed to post preview", "error", err)
-		return nil
-	}
-	resp.Body.Close()
-	return nil
-}
-
-// UpdateWindowCmd is the hook handler that reads Claude hook JSON from stdin
-// and updates the session's dynamic window state via the daemon API.
-type UpdateWindowCmd struct {
-	Port            int    `short:"p" default:"2700" name:"port"`
-	SessionID       string `required:"" name:"session-id"`
-	Working         bool   `name:"working" help:"Set working=true (Claude is processing)."`
-	NoWorking       bool   `name:"no-working" help:"Set working=false (Claude stopped)."`
-	Notification    bool   `name:"notification" help:"Set notification=true."`
-	NoNotification  bool   `name:"no-notification" help:"Clear notification flag."`
-	OnlyOnInterrupt bool   `name:"only-on-interrupt" help:"Only apply the update when the hook payload contains is_interrupt=true."`
-	TmuxSocket      string `name:"tmux-socket" default:"vee" help:"Tmux socket name."`
-}
-
-// Run reads the hook JSON from stdin, extracts permission_mode and prompt,
-// then POSTs the combined state update to the daemon.
-func (cmd *UpdateWindowCmd) Run() error {
-	tmuxSocketName = cmd.TmuxSocket
-	setupFileLogger(logFilePath())
-
-	var hookData struct {
-		PermissionMode string `json:"permission_mode"`
-		Prompt         string `json:"prompt"`
-		IsInterrupt    bool   `json:"is_interrupt"`
-	}
-	if err := json.NewDecoder(os.Stdin).Decode(&hookData); err != nil {
-		slog.Debug("update-window: failed to decode hook stdin", "error", err)
-		// Continue with flags only — stdin might be empty for some hooks
-	}
-
-	if cmd.OnlyOnInterrupt && !hookData.IsInterrupt {
-		slog.Debug("update-window: skipping (only-on-interrupt set but is_interrupt is false)")
-		return nil
-	}
-
-	// Build the request body
-	body := map[string]any{
-		"session_id": cmd.SessionID,
-	}
-
-	if cmd.Working {
-		body["working"] = true
-	} else if cmd.NoWorking {
-		body["working"] = false
-	}
-
-	if cmd.Notification {
-		body["notification"] = true
-	} else if cmd.NoNotification {
-		body["notification"] = false
-	}
-
-	if hookData.PermissionMode != "" {
-		body["permission_mode"] = hookData.PermissionMode
-	}
-
-	if hookData.Prompt != "" {
-		preview := hookData.Prompt
-		if len(preview) > 200 {
-			preview = preview[:200]
-		}
-		body["preview"] = preview
-	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-
-	slog.Debug("update-window: posting state", "session", cmd.SessionID, "body", string(payload))
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/window-state", cmd.Port),
-		"application/json",
-		strings.NewReader(string(payload)),
-	)
-	if err != nil {
-		slog.Debug("update-window: failed to post state", "error", err)
-		return nil
-	}
-	resp.Body.Close()
-	return nil
-}
-
-// sessionTempDir returns the per-session temp directory path.
-func sessionTempDir(sessionID string) string {
-	return filepath.Join(veeRuntimeDir(), "session-"+sessionID)
-}
-
-// cleanStaleTempFiles removes leftover session temp dirs from the runtime directory.
-func cleanStaleTempFiles() {
-	rtDir := veeRuntimeDir()
-	entries, _ := os.ReadDir(rtDir)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		if strings.HasPrefix(e.Name(), "session-") {
-			path := filepath.Join(rtDir, e.Name())
-			slog.Debug("cleanup: removing stale session dir", "path", path)
-			os.RemoveAll(path)
-		}
-	}
-}
-
-// splitAtDashDash splits args at the first "--".
-// Returns (before, after). The "--" itself is consumed.
-func splitAtDashDash(args []string) (before, after []string) {
-	for i, arg := range args {
-		if arg == "--" {
-			return args[:i], args[i+1:]
-		}
-	}
-	return args, nil
+// ResumeCmd resumes a previous Claude session.
+// Flags --kb, --feedback, and --profile are inherited from the parent CLI struct.
+type ResumeCmd struct {
+	SessionID string `arg:"" required:"" help:"Session ID to resume."`
 }
 
 func main() {
@@ -943,8 +64,9 @@ func main() {
 	cli := CLI{}
 	parser, err := kong.New(&cli,
 		kong.Name("vee"),
-		kong.Description("A session orchestrator for Claude Code."),
+		kong.Description("A Claude Code wrapper with behavioral profiles."),
 		kong.UsageOnError(),
+		kong.DefaultEnvars("VEE"),
 		kong.Exit(func(code int) {
 			os.Exit(code)
 		}),
@@ -958,70 +80,406 @@ func main() {
 
 	setupLogger(cli.Debug)
 
-	ctx.Bind(claudeArgs(claudePassthrough))
-
-	err = ctx.Run()
-	ctx.FatalIfErrorf(err)
-}
-
-func setupLogger(debug bool) {
-	level := slog.LevelInfo
-	if debug {
-		level = slog.LevelDebug
+	switch ctx.Command() {
+	case "resume <session-id>":
+		err = runResume(&cli, claudePassthrough)
+	case "run", "run <prompt>":
+		err = runDefault(&cli, claudePassthrough)
+	default:
+		err = runDefault(&cli, claudePassthrough)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: level,
-	}))
-	slog.SetDefault(logger)
-}
-
-// setupFileLogger redirects slog to a file at debug level.
-func setupFileLogger(path string) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		slog.Warn("failed to open log file, keeping stderr", "path", path, "error", err)
-		return
+		fmt.Fprintf(os.Stderr, "vee: %v\n", err)
+		os.Exit(1)
 	}
-	logger := slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-	slog.SetDefault(logger)
 }
 
-func readProjectConfig() (string, error) {
-	content, err := os.ReadFile(".vee/config.md")
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
+// runDefault implements the default (no subcommand) flow.
+func runDefault(cli *CLI, passthrough []string) error {
+	// Validate: --feedback requires --profile
+	if cli.Feedback && cli.Profile == "" {
+		return fmt.Errorf("--feedback requires --profile (feedback is recorded per-profile)")
+	}
+
+	// Default VeePath
+	veePath := cli.VeePath
+	if veePath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot determine home directory: %w", err)
 		}
-		return "", fmt.Errorf("failed to read .vee/config.md: %w", err)
+		veePath = filepath.Join(home, ".local", "share", "vee")
+	}
+	veePath, _ = filepath.Abs(veePath)
+
+	// Load configs
+	userCfg, err := loadUserConfig()
+	if err != nil {
+		slog.Warn("failed to load user config, using defaults", "error", err)
+		userCfg = hydrateUserConfig(nil)
 	}
 
-	return string(content), nil
+	// Resolve identity + platforms rules
+	var projectIdentity *IdentityConfig
+	var platRule string
+	if projCfg, err := readProjectTOML(); err == nil {
+		projectIdentity = projCfg.Identity
+		platRule = platformsRule(projCfg.Platforms)
+	}
+	resolvedIdentity := resolveIdentity(userCfg.Identity, projectIdentity)
+	if err := validateIdentity(resolvedIdentity); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	idRule := identityRule(resolvedIdentity)
+
+	// Resolve profile (if requested)
+	var profile Profile
+	if cli.Profile != "" {
+		if err := initProfileRegistry(veePath); err != nil {
+			return fmt.Errorf("failed to init profile registry: %w", err)
+		}
+		var ok bool
+		profile, ok = profileRegistry[cli.Profile]
+		if !ok {
+			return profileNotFoundError(cli.Profile)
+		}
+	}
+
+	// Read KB prompt (if requested)
+	var kbPrompt string
+	if cli.KB {
+		if data, err := promptFS.ReadFile("prompts/base.md"); err == nil {
+			kbPrompt = string(data)
+		} else {
+			return fmt.Errorf("read KB prompt: %w", err)
+		}
+	}
+
+	// Sample feedback (if requested)
+	var feedbackBlock string
+	if cli.Feedback {
+		fblock, fstore, err := sampleFeedback(userCfg, profile.Name)
+		if err != nil {
+			slog.Warn("failed to sample feedback", "error", err)
+		} else {
+			feedbackBlock = fblock
+			if fstore != nil {
+				fstore.Close()
+			}
+		}
+	}
+
+	// Read project config
+	projectConfig, err := readProjectConfig()
+	if err != nil {
+		return fmt.Errorf("failed to read project config: %w", err)
+	}
+
+	// Read compose file contents for prompt injection (if ephemeral + compose configured)
+	isEphemeral := cli.Ephemeral
+	var composeContents string
+	if isEphemeral {
+		if cfg, err := readProjectTOML(); err == nil && cfg.Ephemeral != nil && cfg.Ephemeral.Compose != "" {
+			cp := composePath(cfg.Ephemeral)
+			if data, err := os.ReadFile(cp); err == nil {
+				composeContents = string(data)
+			}
+		}
+	}
+
+	// Compose system prompt
+	systemPrompt := composeSystemPrompt(idRule, platRule, kbPrompt, profile.Prompt, feedbackBlock, projectConfig, isEphemeral, composeContents)
+
+	// Generate session ID
+	sessionID := newUUID()
+
+	// Start MCP sidecar if KB or feedback is enabled
+	var sidecarPort int
+	sidecarCtx, sidecarCancel := context.WithCancel(context.Background())
+	defer sidecarCancel()
+
+	if cli.KB || cli.Feedback {
+		var kbase *kb.KnowledgeBase
+		var fstore *feedback.Store
+
+		if cli.KB {
+			kbase, err = openKB(userCfg)
+			if err != nil {
+				return fmt.Errorf("open knowledge base: %w", err)
+			}
+			defer kbase.Close()
+			go kbase.RunWorker(sidecarCtx)
+		}
+
+		if cli.Feedback {
+			stDir, err := stateDir()
+			if err != nil {
+				return fmt.Errorf("state dir: %w", err)
+			}
+			fstore, err = feedback.Open(filepath.Join(stDir, "feedback.db"))
+			if err != nil {
+				return fmt.Errorf("open feedback store: %w", err)
+			}
+			defer fstore.Close()
+		}
+
+		sidecarPort, err = startMCPSidecar(sidecarCtx, kbase, fstore, profile.Name, isEphemeral)
+		if err != nil {
+			return fmt.Errorf("start MCP sidecar: %w", err)
+		}
+	}
+
+	// Build claude args
+	claudeArgs := buildArgs(passthrough, systemPrompt)
+	claudeArgs = append(claudeArgs, "--session-id", sessionID)
+
+	if sidecarPort > 0 {
+		mcpConfigFile, err := writeMCPConfig(sidecarPort, sessionID)
+		if err != nil {
+			slog.Error("failed to write MCP config", "error", err)
+		} else {
+			claudeArgs = append(claudeArgs, "--mcp-config", mcpConfigFile)
+		}
+	}
+
+	if cli.Feedback {
+		claudeArgs = append(claudeArgs, "--plugin-dir", filepath.Join(veePath, "plugins", "vee"))
+	}
+
+	// Clean up stale temp files from previous runs
+	cleanStaleTempFiles()
+
+	// Build prompt string from positional args
+	prompt := strings.Join(cli.Run.Prompt, " ")
+
+	if isEphemeral {
+		return runEphemeral(sessionID, profile, systemPrompt, claudeArgs, prompt, sidecarPort, veePath, cli.Feedback)
+	}
+
+	// Exec into claude
+	return execClaude(claudeArgs, prompt)
 }
 
-func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, projectConfig string, ephemeral bool, composeContents string) string {
+// runResume implements the "resume" subcommand flow.
+func runResume(cli *CLI, passthrough []string) error {
+	// Validate: --feedback requires --profile
+	if cli.Feedback && cli.Profile == "" {
+		return fmt.Errorf("--feedback requires --profile on resume (feedback is recorded per-profile)")
+	}
+
+	sessionID := cli.Resume.SessionID
+
+	// Start MCP sidecar if KB or feedback is enabled
+	var sidecarPort int
+	sidecarCtx, sidecarCancel := context.WithCancel(context.Background())
+	defer sidecarCancel()
+
+	if cli.KB || cli.Feedback {
+		userCfg, err := loadUserConfig()
+		if err != nil {
+			slog.Warn("failed to load user config, using defaults", "error", err)
+			userCfg = hydrateUserConfig(nil)
+		}
+
+		var kbase *kb.KnowledgeBase
+		var fstore *feedback.Store
+
+		if cli.KB {
+			kbase, err = openKB(userCfg)
+			if err != nil {
+				return fmt.Errorf("open knowledge base: %w", err)
+			}
+			defer kbase.Close()
+			go kbase.RunWorker(sidecarCtx)
+		}
+
+		if cli.Feedback {
+			stDir, err := stateDir()
+			if err != nil {
+				return fmt.Errorf("state dir: %w", err)
+			}
+			fstore, err = feedback.Open(filepath.Join(stDir, "feedback.db"))
+			if err != nil {
+				return fmt.Errorf("open feedback store: %w", err)
+			}
+			defer fstore.Close()
+		}
+
+		sidecarPort, err = startMCPSidecar(sidecarCtx, kbase, fstore, cli.Profile, false)
+		if err != nil {
+			return fmt.Errorf("start MCP sidecar: %w", err)
+		}
+	}
+
+	// Build args: claude --resume <session-id>
+	var claudeArgs []string
+	claudeArgs = append(claudeArgs, passthrough...)
+	claudeArgs = append(claudeArgs, "--resume", sessionID)
+
+	if sidecarPort > 0 {
+		mcpConfigFile, err := writeMCPConfig(sidecarPort, sessionID)
+		if err != nil {
+			slog.Error("failed to write MCP config", "error", err)
+		} else {
+			claudeArgs = append(claudeArgs, "--mcp-config", mcpConfigFile)
+		}
+	}
+
+	if cli.Feedback {
+		home, _ := os.UserHomeDir()
+		veePath := filepath.Join(home, ".local", "share", "vee")
+		claudeArgs = append(claudeArgs, "--plugin-dir", filepath.Join(veePath, "plugins", "vee"))
+	}
+
+	return execClaude(claudeArgs, "")
+}
+
+// execClaude replaces the current process with claude.
+func execClaude(args []string, prompt string) error {
+	claudePath, err := findClaude()
+	if err != nil {
+		return err
+	}
+
+	var execArgs []string
+	execArgs = append(execArgs, "claude")
+	if prompt != "" {
+		execArgs = append(execArgs, prompt)
+	}
+	execArgs = append(execArgs, args...)
+
+	return syscall.Exec(claudePath, execArgs, os.Environ())
+}
+
+// findClaude locates the claude binary on PATH.
+func findClaude() (string, error) {
+	path, err := findExecutable("claude")
+	if err != nil {
+		return "", fmt.Errorf("claude not found on PATH: %w", err)
+	}
+	return path, nil
+}
+
+// findExecutable searches PATH for a named executable, skipping the current binary
+// to avoid self-referencing loops.
+func findExecutable(name string) (string, error) {
+	pathDirs := filepath.SplitList(os.Getenv("PATH"))
+	self, _ := os.Executable()
+	selfResolved, _ := filepath.EvalSymlinks(self)
+
+	for _, dir := range pathDirs {
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+			resolved, _ := filepath.EvalSymlinks(candidate)
+			if resolved == selfResolved {
+				continue
+			}
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found in PATH", name)
+}
+
+// profileNotFoundError returns a helpful error when a profile is not found.
+func profileNotFoundError(name string) error {
 	var sb strings.Builder
-	sb.WriteString(base)
+	sb.WriteString(fmt.Sprintf("unknown profile: %s", name))
+
+	if len(profileOrder) > 0 {
+		sb.WriteString("\n\nAvailable profiles:")
+		for _, p := range profileOrder {
+			prof := profileRegistry[p]
+			sb.WriteString(fmt.Sprintf("\n  %s %s — %s", prof.Indicator, prof.Name, prof.Description))
+		}
+
+		// Suggest close matches
+		var suggestions []string
+		for _, p := range profileOrder {
+			if strings.Contains(p, name) || strings.Contains(name, p) {
+				suggestions = append(suggestions, p)
+			}
+		}
+		if len(suggestions) > 0 {
+			sb.WriteString(fmt.Sprintf("\n\nDid you mean: %s?", strings.Join(suggestions, ", ")))
+		}
+	}
+
+	return fmt.Errorf("%s", sb.String())
+}
+
+// sampleFeedback opens the feedback store, samples entries, and returns the
+// formatted block. The caller must close the returned store.
+func sampleFeedback(userCfg *UserConfig, profile string) (string, *feedback.Store, error) {
+	maxExamples := userCfg.Feedback.MaxExamples
+	if maxExamples <= 0 {
+		return "", nil, nil
+	}
+
+	stDir, err := stateDir()
+	if err != nil {
+		return "", nil, err
+	}
+	fstore, err := feedback.Open(filepath.Join(stDir, "feedback.db"))
+	if err != nil {
+		return "", nil, err
+	}
+
+	project, _ := filepath.Abs(".")
+	entries, err := fstore.Sample(profile, project, maxExamples)
+	if err != nil {
+		fstore.Close()
+		return "", nil, err
+	}
+
+	return formatFeedbackBlock(entries), fstore, nil
+}
+
+// composeSystemPrompt assembles the full system prompt from its parts.
+func composeSystemPrompt(identityRule, platformsRule, kbPrompt, profileBody, feedbackBlock, projectConfig string, ephemeral bool, composeContents string) string {
+	var sb strings.Builder
 
 	if identityRule != "" {
-		sb.WriteString("\n\n")
 		sb.WriteString(identityRule)
 	}
 
 	if platformsRule != "" {
-		sb.WriteString("\n\n")
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
 		sb.WriteString(platformsRule)
 	}
 
+	if kbPrompt != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(kbPrompt)
+	}
+
+	if profileBody != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(profileBody)
+	}
+
 	if feedbackBlock != "" {
-		sb.WriteString("\n\n")
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
 		sb.WriteString(feedbackBlock)
 	}
 
 	if ephemeral {
-		sb.WriteString("\n\n<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.")
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("<environment type=\"ephemeral\">\nThis session is ephemeral. Your context will not survive past its end.")
 		if composeContents != "" {
 			sb.WriteString("\n\nThe following Docker Compose services are available on the container network. You can reach them by service name (e.g., `postgres:5432`).\n\n```yaml\n")
 			sb.WriteString(composeContents)
@@ -1029,7 +487,10 @@ func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, proje
 		}
 		sb.WriteString("\n</environment>")
 	} else {
-		sb.WriteString("\n\n<environment type=\"host\">\nThis session is run directly on the user's host.\n</environment>")
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("<environment type=\"host\">\nThis session is run directly on the user's host.\n</environment>")
 	}
 
 	if projectConfig != "" {
@@ -1039,96 +500,6 @@ func composeSystemPrompt(base, identityRule, platformsRule, feedbackBlock, proje
 	}
 
 	return sb.String()
-}
-
-func writeMCPConfig(port int, sessionID string) (string, error) {
-	dir := sessionTempDir(sessionID)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-
-	path := filepath.Join(dir, "mcp.json")
-	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse?session=%s"}}}`, port, sessionID)
-
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		return "", err
-	}
-
-	slog.Debug("wrote mcp config", "path", path, "session", sessionID)
-	return path, nil
-}
-
-func writeSettings(sessionID string, port int, veeBinary string) (string, error) {
-	dir := sessionTempDir(sessionID)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-
-	updateBase := fmt.Sprintf("%s _update-window --port %d --tmux-socket %s --session-id %s",
-		veeBinary, port, tmuxSocketName, sessionID)
-
-	promptSubmitCmd := updateBase + " --working --no-notification"
-	stopCmd := updateBase + " --no-working"
-	interruptCmd := updateBase + " --no-working --only-on-interrupt"
-	notifCmd := updateBase + " --notification"
-
-	settings := map[string]any{
-		"hooks": map[string]any{
-			"UserPromptSubmit": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": promptSubmitCmd,
-						},
-					},
-				},
-			},
-			"Stop": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": stopCmd,
-						},
-					},
-				},
-			},
-			"PostToolUseFailure": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": interruptCmd,
-						},
-					},
-				},
-			},
-			"Notification": []map[string]any{
-				{
-					"hooks": []map[string]any{
-						{
-							"type":    "command",
-							"command": notifCmd,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	content, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return "", err
-	}
-
-	path := filepath.Join(dir, "settings.json")
-	if err := os.WriteFile(path, content, 0600); err != nil {
-		return "", err
-	}
-
-	slog.Debug("wrote settings", "path", path, "session", sessionID, "hooks", "SessionStart,UserPromptSubmit,Stop,Notification")
-	return path, nil
 }
 
 func buildArgs(originalArgs []string, systemPromptContent string) []string {
@@ -1165,108 +536,9 @@ func buildArgs(originalArgs []string, systemPromptContent string) []string {
 	return args
 }
 
-// fetchAppConfig fetches the full AppConfig from the running daemon.
-func fetchAppConfig(port int) (*AppConfig, error) {
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/config", port))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-
-	var cfg AppConfig
-	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
-		return nil, err
-	}
-
-	return &cfg, nil
-}
-
-// fetchSession fetches a single session's state from the running daemon.
-func fetchSession(port int, sessionID string) (*Session, error) {
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/session?id=%s", port, sessionID))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-
-	var sess Session
-	if err := json.NewDecoder(resp.Body).Decode(&sess); err != nil {
-		return nil, err
-	}
-
-	return &sess, nil
-}
-
-// stripSystemPrompt removes --append-system-prompt and its value from args.
-func stripSystemPrompt(args []string) []string {
-	var out []string
-	skipNext := false
-	for i, arg := range args {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-		if arg == "--append-system-prompt" && i+1 < len(args) {
-			skipNext = true
-			continue
-		}
-		if strings.HasPrefix(arg, "--append-system-prompt=") {
-			continue
-		}
-		out = append(out, arg)
-	}
-	return out
-}
-
-// fetchFeedbackBlock calls the daemon's /api/feedback/sample endpoint and
-// formats the result as a prompt block. Returns "" if no entries are sampled.
-func fetchFeedbackBlock(port int, profile string, maxExamples int) string {
-	if maxExamples <= 0 {
-		return ""
-	}
-
-	project, _ := filepath.Abs(".")
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/feedback/sample?profile=%s&project=%s&n=%d",
-		port, profile, project, maxExamples)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		slog.Debug("failed to fetch feedback samples", "error", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-
-	var entries []struct {
-		Kind      string `json:"kind"`
-		Statement string `json:"statement"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		slog.Debug("failed to decode feedback samples", "error", err)
-		return ""
-	}
-
-	return formatFeedbackBlock(entries)
-}
-
 // formatFeedbackBlock renders a list of feedback entries as a <rule> block
 // for injection into the system prompt. Returns "" if entries is empty.
-func formatFeedbackBlock(entries []struct {
-	Kind      string `json:"kind"`
-	Statement string `json:"statement"`
-}) string {
+func formatFeedbackBlock(entries []feedback.Entry) string {
 	if len(entries) == 0 {
 		return ""
 	}
@@ -1284,37 +556,75 @@ func formatFeedbackBlock(entries []struct {
 	return sb.String()
 }
 
-// buildSessionArgs constructs the claude CLI arguments for a session.
-func buildSessionArgs(sessionID string, resume bool, profile Profile, projectConfig, identityRule, platformsRule, feedbackBlock string, port int, veePath string, passthrough []string, veeBinary string) []string {
-	var args []string
-
-	if resume {
-		args = append(args, stripSystemPrompt(passthrough)...)
-		args = append(args, "--resume", sessionID)
-	} else {
-		fullPrompt := composeSystemPrompt(profile.Prompt, identityRule, platformsRule, feedbackBlock, projectConfig, false, "")
-		args = buildArgs(passthrough, fullPrompt)
-		args = append(args, "--session-id", sessionID)
+func writeMCPConfig(port int, sessionID string) (string, error) {
+	dir := sessionTempDir(sessionID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
 	}
 
-	// MCP config — always provided (needed for request_suspend and KB tools)
-	mcpConfigFile, err := writeMCPConfig(port, sessionID)
+	path := filepath.Join(dir, "mcp.json")
+	content := fmt.Sprintf(`{"mcpServers":{"vee-daemon":{"type":"sse","url":"http://127.0.0.1:%d/sse"}}}`, port)
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return "", err
+	}
+
+	slog.Debug("wrote mcp config", "path", path, "session", sessionID)
+	return path, nil
+}
+
+// sessionTempDir returns the per-session temp directory path.
+func sessionTempDir(sessionID string) string {
+	return filepath.Join(veeRuntimeDir(), "session-"+sessionID)
+}
+
+// cleanStaleTempFiles removes leftover session temp dirs from the runtime directory.
+func cleanStaleTempFiles() {
+	rtDir := veeRuntimeDir()
+	entries, _ := os.ReadDir(rtDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "session-") {
+			path := filepath.Join(rtDir, e.Name())
+			slog.Debug("cleanup: removing stale session dir", "path", path)
+			os.RemoveAll(path)
+		}
+	}
+}
+
+// splitAtDashDash splits args at the first "--".
+// Returns (before, after). The "--" itself is consumed.
+func splitAtDashDash(args []string) (before, after []string) {
+	for i, arg := range args {
+		if arg == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
+}
+
+func setupLogger(debug bool) {
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
+}
+
+func readProjectConfig() (string, error) {
+	content, err := os.ReadFile(".vee/config.md")
 	if err != nil {
-		slog.Error("failed to write MCP config", "error", err)
-	} else {
-		args = append(args, "--mcp-config", mcpConfigFile)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read .vee/config.md: %w", err)
 	}
 
-	// Settings (includes per-session UserPromptSubmit hook)
-	settingsFile, err := writeSettings(sessionID, port, veeBinary)
-	if err != nil {
-		slog.Error("failed to write settings", "error", err)
-	} else {
-		args = append(args, "--settings", settingsFile)
-	}
-
-	// Always include plugins/vee for the suspend command
-	args = append(args, "--plugin-dir", filepath.Join(veePath, "plugins", "vee"))
-
-	return args
+	return string(content), nil
 }

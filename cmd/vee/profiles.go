@@ -114,11 +114,6 @@ func loadProfilesFromDir(dir string) ([]Profile, error) {
 //  2. ~/.config/vee/profiles/ — user overrides
 //  3. .vee/profiles/ — project-local overrides
 func initProfileRegistry(veePath string) error {
-	basePrompt, err := promptFS.ReadFile("prompts/base.md")
-	if err != nil {
-		return fmt.Errorf("read base prompt: %w", err)
-	}
-
 	// Start with installed defaults.
 	byName := make(map[string]Profile)
 	installedDir := filepath.Join(veePath, "profiles")
@@ -154,13 +149,11 @@ func initProfileRegistry(veePath string) error {
 		return fmt.Errorf("no profile files found in %s, ~/.config/vee/profiles/, or .vee/profiles/", installedDir)
 	}
 
-	// Compose prompts and collect into a slice for sorting.
+	// Compose prompts (wrap non-empty bodies) and collect into a slice for sorting.
 	profiles := make([]Profile, 0, len(byName))
 	for _, m := range byName {
 		if m.Prompt != "" {
-			m.Prompt = string(basePrompt) + "\n\n" + wrapProfileBody(m.Indicator, m.Prompt)
-		} else {
-			m.Prompt = string(basePrompt)
+			m.Prompt = wrapProfileBody(m.Indicator, m.Prompt)
 		}
 		profiles = append(profiles, m)
 	}

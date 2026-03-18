@@ -236,6 +236,9 @@ Devil's advocate mode. ALWAYS challenge the user's position.`), 0644)
 func TestInitProfileRegistryFromInstalledProfiles(t *testing.T) {
 	veePath := writeTestProfiles(t)
 
+	// Isolate from user profiles in ~/.config/vee/profiles/.
+	t.Setenv("HOME", t.TempDir())
+
 	origRegistry := profileRegistry
 	origOrder := profileOrder
 	defer func() {
@@ -404,6 +407,9 @@ description: "Project-only profile"
 priority: 25
 ---
 Project-only body.`), 0644)
+
+	// Isolate from user profiles in ~/.config/vee/profiles/.
+	t.Setenv("HOME", t.TempDir())
 
 	// Change to project directory so initProfileRegistry picks it up.
 	origWd, _ := os.Getwd()
